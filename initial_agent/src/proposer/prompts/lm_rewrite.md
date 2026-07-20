@@ -1,0 +1,25 @@
+# LM Rewrite: Function Reimplementation
+
+You are a software developer and you have been asked to implement a function.
+
+You will be given the contents of an entire file, with one or more functions defined in it.
+Please implement the function(s) that are missing.
+Do NOT modify the function signature, including the function name, parameters, return types, or docstring if provided.
+Do NOT change any other code in the file.
+You should not use any external libraries.
+
+Please implement the function `{func_signature}` in the following code:
+
+```
+{file_src_code}
+```
+
+Remember, you should not modify the function signature, including the function name, parameters, return types, or docstring if provided.
+Do NOT change any other code in the file.
+Format your output as:
+
+<explanation>
+
+```
+{func_to_write}
+```

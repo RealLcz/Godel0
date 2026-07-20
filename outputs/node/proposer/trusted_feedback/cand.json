@@ -1,0 +1,26 @@
+{
+  "candidate_id": "cand",
+  "accepted": false,
+  "reason": "expected_rejection",
+  "notes": {
+    "candidate_id": "cand",
+    "passed": false,
+    "patch_applied": false,
+    "source_only": false,
+    "clean_passed_tests": [],
+    "bugged_failed_tests": [],
+    "bugged_passed_tests": [],
+    "f2p_tests": [],
+    "p2p_tests": [],
+    "reverse_restored": false,
+    "syntax_valid": false,
+    "import_valid": false,
+    "timeout_valid": false,
+    "safety_valid": false,
+    "duplicate_valid": false,
+    "relevance_valid": false,
+    "rejection_reasons": [
+      "expected_rejection"
+    ]
+  }
+}

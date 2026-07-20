@@ -1,0 +1,3 @@
+- name: Parent role from group one
+  debug:
+    msg: PARENT_ONE

@@ -1,0 +1,13 @@
+diff --git a/lib/ansible/playbook/role/__init__.py b/lib/ansible/playbook/role/__init__.py
+--- a/lib/ansible/playbook/role/__init__.py
++++ b/lib/ansible/playbook/role/__init__.py
+@@ -166,6 +166,9 @@ class Role(Base, Conditional, Taggable, CollectionSearch):
+             if role_include.get_name() in play.ROLE_CACHE:
+                 for (entry, role_obj) in play.ROLE_CACHE[role_include.get_name()].items():
+                     if hashed_params == entry:
++                        # Clear any accumulated parents to ensure each invocation has its own
++                        # dependency chain for variable inheritance.
++                        role_obj._parents = []
+                         if parent_role:
+                             role_obj.add_parent(parent_role)
+                         return role_obj

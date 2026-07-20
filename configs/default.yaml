@@ -1,0 +1,87 @@
+run:
+  seed: 42
+  run_name: null
+  max_nodes: 200
+  max_expansions: 200
+  resume_from: null
+
+models:
+  agent_model: "deepseek/deepseek-chat"
+  diagnose_model: "deepseek/deepseek-chat"
+  temperature: 0.0
+  max_tokens: 32768
+
+agent:
+  max_steps: 100
+  max_tool_errors: 5
+  trajectory_format: "jsonl"
+  self_evolve_timeout_sec: 3600
+
+tasks:
+  batch_size: 10
+  max_generation_candidates: 50
+  candidates_per_signature: 5
+  allow_same_repo_transfer: true
+  allow_cross_repo_transfer: true
+
+scoring:
+  regression_threshold: 0.8
+  regression_weight: 0.5
+  proposer_target_accuracy: 0.5
+  min_parent_solved_tasks: 3
+
+diagnosis:
+  one_primary_root_cause: true
+  max_solver_trajectories: 4
+  max_proposer_candidates: 4
+  max_tool_incidents: 2
+  max_raw_chars_per_item: 20000
+  max_total_evidence_chars: 120000
+  include_success_contrast: true
+  prioritize_special_alerts: true
+  special_alert_override_requires_reason: true
+
+special_cases:
+  solver_empty_patch_ratio: 0.10
+  solver_stochasticity_min_rollouts: 3
+  solver_context_error_count: 1
+  proposer_empty_batch_ratio: 0.50
+  proposer_min_valid_yield: 0.20
+  proposer_duplicate_ratio: 0.25
+  proposer_leakage_ratio: 0.10
+  difficulty_low: 0.40
+  difficulty_high: 0.60
+
+evaluation:
+  solver_rollouts: 1
+  deterministic: true
+  level1_timeout_sec: 3600
+  level2_timeout_sec: 3600
+  max_workers: 8
+
+proposer:
+  strategies:
+    lm_modify: 0.30
+    lm_rewrite: 0.15
+    procedural: 0.40
+    combine: 0.10
+    pr_mirror: 0.05
+  candidate_timeout_sec: 120
+  max_patch_lines: 80
+  forbid_test_file_edits: true
+  require_f2p: true
+
+execution:
+  backend: "subprocess"
+  apptainer_bin: "apptainer"
+  agent_image: null
+  repo_image_dir: null
+  scratch_root: "./scratch"
+  clean_env: true
+  network_disabled: true
+
+paths:
+  agent_repo: "./agent_repo"
+  repo_pool: "./repo_pool"
+  runs: "./runs"
+  task_store: "./task_store"

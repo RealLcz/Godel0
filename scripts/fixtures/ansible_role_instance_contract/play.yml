@@ -1,0 +1,6 @@
+- name: Distinct nested roles with the same short name
+  hosts: testhost
+  gather_facts: false
+  roles:
+    - role: "{{ playbook_dir }}/roles/group_one/parent"
+    - role: "{{ playbook_dir }}/roles/group_two/parent"

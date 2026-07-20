@@ -1,0 +1,10 @@
+{
+  "trajectory_id": "evolve20_failure_seed",
+  "task_id": "repo_chain_seed",
+  "success": false,
+  "resolved": false,
+  "fail_to_pass": ["hidden_end_to_end_contract"],
+  "pass_to_pass": ["public_control"],
+  "model_patch": "diff --git a/producer.py b/producer.py\n--- a/producer.py\n+++ b/producer.py\n@@ -1 +1 @@\n-old\n+local_fix",
+  "error_stage": "patch_generation"
+}

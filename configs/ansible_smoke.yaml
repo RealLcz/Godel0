@@ -1,0 +1,57 @@
+run:
+  seed: 42
+  run_name: "ansible_smoke"
+  max_nodes: 3
+  max_expansions: 3
+
+models:
+  agent_model: "deepseek/deepseek-chat"
+  diagnose_model: "deepseek/deepseek-chat"
+  temperature: 0.0
+  max_tokens: 8192
+
+agent:
+  max_steps: 20
+  max_tool_errors: 3
+  trajectory_format: "jsonl"
+  self_evolve_timeout_sec: 300
+
+tasks:
+  batch_size: 2
+  max_generation_candidates: 10
+  candidates_per_signature: 3
+
+scoring:
+  regression_threshold: 0.5
+  regression_weight: 0.5
+  proposer_target_accuracy: 0.5
+  min_parent_solved_tasks: 1
+
+evaluation:
+  solver_rollouts: 1
+  deterministic: true
+  level1_timeout_sec: 300
+  level2_timeout_sec: 300
+  max_workers: 1
+
+proposer:
+  strategies:
+    lm_modify: 0.30
+    lm_rewrite: 0.15
+    procedural: 0.40
+    combine: 0.10
+    pr_mirror: 0.05
+  candidate_timeout_sec: 120
+  max_patch_lines: 80
+  forbid_test_file_edits: true
+  require_f2p: true
+
+execution:
+  backend: "subprocess"
+  scratch_root: "./scratch_ansible"
+
+paths:
+  agent_repo: "./agent_repo"
+  repo_pool: "./repo_pool"
+  runs: "./runs_ansible"
+  task_store: "./task_store_ansible"

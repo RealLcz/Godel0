@@ -1,0 +1,10 @@
+{
+  "extension_version": "0.1",
+  "paths": [
+    "proposer",
+    "swesmith"
+  ],
+  "entrypoints": {
+    "proposer": "proposer/proposer_main.py"
+  }
+}
