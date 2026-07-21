@@ -1,0 +1,14 @@
+[Sat Jul 18 04:45:27 PM UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 172.33.1.9:8000 with TP=8
+[Sat Jul 18 04:50:26 PM UTC 2026] vLLM ready after 285s
+Starting evolution run: ansible_evolve20_205980
+Budget: max_nodes=20, max_expansions=20
+
+Expanding parent: root (score=0.75)
+Child created: node_08c1aa738b4b
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Proposer batch failed
+
+Expanding parent: root (score=0.75)
+Child created: node_a17194d1d30b

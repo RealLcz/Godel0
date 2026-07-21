@@ -1,0 +1,17 @@
+[Sat Jul 18 12:34:47 UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 172.33.1.23:8000 with TP=8
+[Sat Jul 18 12:40:09 UTC 2026] vLLM ready after 305s
+{
+  "base_commit": "6bc5267292bd3ce4d13cfc21faa2a01b02b64b25",
+  "strategy": "repo_chain",
+  "scenario_profile": "handler_notification",
+  "failure_signature": {
+    "error_type": "premature_local_fix",
+    "error_message": "The prior solver found one conspicuous local defect and stopped after repeated public checks (11 observed test invocations, 38 tool calls, 1 apparent edit target). It did not verify every producer, carrier, identity boundary, and consumer participating in the stated invariant. Transfer this reasoning weakness only; do not transfer repository nouns or the original behavior.",
+    "pattern": "premature single-site repair of a multi-layer invariant"
+  },
+  "generated": 0,
+  "generator_rejection": "invalid_chain_plan:generated test patch lacks behavioral assertions or uses forbidden source inspection",
+  "generation_runtime_sec": 492.147,
+  "task": null,
+  "solver_result": null
+}

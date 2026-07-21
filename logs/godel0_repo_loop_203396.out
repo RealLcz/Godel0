@@ -1,0 +1,9 @@
+Python 3.10.20
+[Wed Jul 15 13:46:24 UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 172.33.1.2:8000 with TP=8
+[Wed Jul 15 13:52:17 UTC 2026] vLLM ready after 335s
+
+=== Stage 0: real PR replay preflight ===
+PR replay preflight skipped by request.
+
+=== Stage 1A: bootstrap generation without trajectories ===
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.

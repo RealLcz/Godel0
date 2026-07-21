@@ -1,0 +1,12 @@
+Python 3.10.20
+[Wed Jul 15 09:57:56 UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 172.33.1.19:8000 with TP=8
+[Wed Jul 15 10:03:05 UTC 2026] vLLM ready after 295s
+
+=== Stage 0: real PR replay preflight ===
+PR replay broken_conditionals: {'case_id': 'broken_conditionals', 'reference_commit': '56a1402a7f209b1bd963e07896a2983219348982', 'generated': 1, 'candidate_id': 'cand_3dd8f158dd73', 'modified_files': ['lib/ansible/executor/task_executor.py', 'lib/ansible/playbook/conditional.py'], 'validation_passed': True, 'strict_repo_level': False, 'selected_for_bootstrap': False}
+PR replay variable_load_errors: {'case_id': 'variable_load_errors', 'reference_commit': 'd797c3150d79b1d5bc5ac6f5c9333d95b1323db3', 'generated': 1, 'candidate_id': 'cand_edfe2b67a4d8', 'modified_files': ['lib/ansible/plugins/vars/host_group_vars.py', 'lib/ansible/utils/vars.py', 'lib/ansible/vars/manager.py'], 'validation_passed': False, 'strict_repo_level': False, 'selected_for_bootstrap': False}
+PR replay plugin_option_origin: {'case_id': 'plugin_option_origin', 'reference_commit': '784598005e8eb752f23054a850099b35073c5a69', 'generated': 0}
+PR replay collection_path_scanning: {'case_id': 'collection_path_scanning', 'reference_commit': 'e5116634479dbfe285555e6ffdecec116f1c86b0', 'generated': 0}
+
+=== Stage 1A: bootstrap generation without trajectories ===
+Bootstrap repo-agent attempt 1: {'attempt': 1, 'phase': 'bootstrap', 'domain': 'template_vars', 'generated': 0, 'generation_runtime_sec': 1072.484, 'source_trajectory_ids': [], 'result': 'generator_rejected', 'raw_modified_files': [], 'raw_patch_chars': 0}

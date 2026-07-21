@@ -1,0 +1,23 @@
+Python 3.10.20
+[Wed Jul 15 14:04:54 UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 172.33.1.2:8000 with TP=8
+[Wed Jul 15 14:09:48 UTC 2026] vLLM ready after 280s
+
+=== Stage 0: real PR replay preflight ===
+PR replay preflight skipped by request.
+
+=== Stage 1A: bootstrap generation without trajectories ===
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 1: {'attempt': 1, 'phase': 'bootstrap', 'domain': 'template_vars', 'generated': 0, 'generation_runtime_sec': 493.444, 'source_trajectory_ids': [], 'result': 'generator_rejected', 'raw_modified_files': [], 'raw_patch_chars': 0}
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 2: {'attempt': 2, 'phase': 'bootstrap', 'domain': 'variable_merge', 'generated': 0, 'generation_runtime_sec': 387.488, 'source_trajectory_ids': [], 'result': 'generator_rejected', 'raw_modified_files': [], 'raw_patch_chars': 0}
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 3: {'attempt': 3, 'phase': 'bootstrap', 'domain': 'yaml_loading', 'generated': 0, 'generation_runtime_sec': 667.37, 'source_trajectory_ids': [], 'result': 'generator_rejected', 'raw_modified_files': [], 'raw_patch_chars': 0}
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 4: {'attempt': 4, 'phase': 'bootstrap', 'domain': 'plugin_config', 'generated': 0, 'generation_runtime_sec': 674.452, 'source_trajectory_ids': [], 'result': 'generator_rejected', 'raw_modified_files': [], 'raw_patch_chars': 0}
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 5: {'attempt': 5, 'phase': 'bootstrap', 'domain': 'template_vars', 'generated': 0, 'generation_runtime_sec': 483.839, 'source_trajectory_ids': [], 'result': 'generator_rejected', 'raw_modified_files': [], 'raw_patch_chars': 0}
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 6: {'attempt': 6, 'phase': 'bootstrap', 'domain': 'variable_merge', 'generated': 0, 'generation_runtime_sec': 407.492, 'source_trajectory_ids': [], 'result': 'generator_rejected', 'raw_modified_files': [], 'raw_patch_chars': 0}
+
+=== Stage 1B: solver attempts bootstrap tasks ===
+No strict bootstrap task reached the solver; stopping.

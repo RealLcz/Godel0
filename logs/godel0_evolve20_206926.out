@@ -1,0 +1,5 @@
+[Sun Jul 19 06:31:52 UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 172.33.1.20:8000 with TP=8
+[Sun Jul 19 06:36:40 UTC 2026] vLLM ready after 275s
+Starting evolution run: ansible_root_bootstrap_smoke_v5_206926
+Budget: target_successful_epochs=0, max_attempts=1
+Bootstrapping root with 1 trusted-valid tasks before any self-edit

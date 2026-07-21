@@ -1,0 +1,23 @@
+Python 3.10.20
+[Wed Jul 15 11:47:04 UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 10.158.1.24:8000 with TP=8
+[Wed Jul 15 11:53:17 UTC 2026] vLLM ready after 355s
+
+=== Stage 0: real PR replay preflight ===
+PR replay preflight skipped by request.
+
+=== Stage 1A: bootstrap generation without trajectories ===
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 1: {'attempt': 1, 'phase': 'bootstrap', 'domain': 'template_vars', 'generated': 1, 'generation_runtime_sec': 275.15, 'source_trajectory_ids': [], 'candidate_id': 'cand_eb7a0788028f', 'modified_files': ['lib/ansible/template/__init__.py', 'lib/ansible/template/vars.py'], 'modified_lines': 14, 'validation_passed': True, 'strict_repo_level': False, 'result': 'cross_file_ablation_rejected'}
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 2: {'attempt': 2, 'phase': 'bootstrap', 'domain': 'variable_merge', 'generated': 0, 'generation_runtime_sec': 193.573, 'source_trajectory_ids': [], 'result': 'generator_rejected', 'raw_modified_files': [], 'raw_patch_chars': 0}
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 3: {'attempt': 3, 'phase': 'bootstrap', 'domain': 'yaml_loading', 'generated': 1, 'generation_runtime_sec': 239.842, 'source_trajectory_ids': [], 'candidate_id': 'cand_5d9d0049a726', 'modified_files': ['lib/ansible/parsing/dataloader.py', 'lib/ansible/parsing/yaml/constructor.py', 'lib/ansible/parsing/yaml/loader.py'], 'modified_lines': 19, 'validation_passed': True, 'strict_repo_level': False, 'result': 'cross_file_ablation_rejected'}
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 4: {'attempt': 4, 'phase': 'bootstrap', 'domain': 'plugin_config', 'generated': 1, 'generation_runtime_sec': 245.305, 'source_trajectory_ids': [], 'candidate_id': 'cand_2af6a04276b1', 'modified_files': ['lib/ansible/config/manager.py', 'lib/ansible/plugins/callback/__init__.py'], 'modified_lines': 18, 'validation_passed': False, 'strict_repo_level': False, 'result': 'validation_rejected'}
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 5: {'attempt': 5, 'phase': 'bootstrap', 'domain': 'template_vars', 'generated': 0, 'generation_runtime_sec': 390.343, 'source_trajectory_ids': [], 'result': 'generator_rejected', 'raw_modified_files': [], 'raw_patch_chars': 0}
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 6: {'attempt': 6, 'phase': 'bootstrap', 'domain': 'variable_merge', 'generated': 1, 'generation_runtime_sec': 261.549, 'source_trajectory_ids': [], 'candidate_id': 'cand_49e2cb95a6c7', 'modified_files': ['lib/ansible/plugins/vars/host_group_vars.py', 'lib/ansible/utils/vars.py', 'lib/ansible/vars/manager.py'], 'modified_lines': 6, 'validation_passed': True, 'strict_repo_level': False, 'result': 'cross_file_ablation_rejected'}
+
+=== Stage 1B: solver attempts bootstrap tasks ===
+No strict bootstrap task reached the solver; stopping.

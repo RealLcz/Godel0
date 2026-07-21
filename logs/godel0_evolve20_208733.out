@@ -1,0 +1,5 @@
+[Mon Jul 20 04:35:26 PM UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 172.33.1.12:8000 with TP=8
+[Mon Jul 20 04:40:21 PM UTC 2026] vLLM ready after 280s
+Starting evolution run: ansible_joint_epoch1_preflight_208733
+Budget: target_successful_epochs=1, max_attempts=20
+Bootstrapping root with 10 trusted-valid tasks before any self-edit

@@ -1,0 +1,74 @@
+[Tue Jul 14 09:49:22 UTC 2026] Activating HGM conda environment...
+Python 3.10.20
+[Tue Jul 14 09:49:29 UTC 2026] GPUs: 4, Tensor parallel: 4
+[Tue Jul 14 09:49:29 UTC 2026] CUDA_HOME=/usr/local/cuda
+[Tue Jul 14 09:49:29 UTC 2026] Starting vLLM server: Qwen/Qwen3.6-35B-A3B on 172.33.1.33:8000
+[Tue Jul 14 09:49:29 UTC 2026] Waiting for vLLM to be ready...
+[Tue Jul 14 09:54:35 UTC 2026] vLLM ready (~290s).
+[Tue Jul 14 09:54:35 UTC 2026] Running PR Mirror probe on Ansible repo...
+
+[1/3] PR Mirror lib/ansible/utils/helpers.py::object_to_dict
+  generated cand_d4dc6947af6f: 512 chars
+diff --git a/lib/ansible/utils/helpers.py b/lib/ansible/utils/helpers.py
+--- a/lib/ansible/utils/helpers.py
++++ b/lib/ansible/utils/helpers.py
+@@ -38,7 +38,7 @@
+     """
+     if exclude is None or not isinstance(exclude, list):
+         exclude = []
+-    return dict((key, getattr(obj, key)) for key in dir(obj) if not (key.startswith('_') or key in exclude))
++    return dict((getattr(obj, key), key) for key in dir(obj) if not (key.startswith('_') or key in exclude))
+ 
+ 
+ def deduplicate_list(original_list):
+
+  validation passed=True f2p=1 p2p=7 reasons=[]
+
+[2/3] PR Mirror lib/ansible/module_utils/common/dict_transformations.py::dict_merge
+  generated cand_48d1c6c71755: 998 chars
+diff --git a/lib/ansible/module_utils/common/dict_transformations.py b/lib/ansible/module_utils/common/dict_transformations.py
+--- a/lib/ansible/module_utils/common/dict_transformations.py
++++ b/lib/ansible/module_utils/common/dict_transformations.py
+@@ -112,14 +112,12 @@
+     '''recursively merges dicts. not just simple a['key'] = b['key'], if
+     both a and b have a key whose value is a dict then dict_merge is called
+     on both values and the result stored in the returned dictionary.'''
+-    if not isinstance(b, dict):
+-        return b
+     result = deepcopy(a)
+-    for k, v in b.items():
+-        if k in result and isinstance(result[k], dict):
+-            result[k] = dict_merge(result[k], v)
++    for key, value in b.items():
++        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
++            result[key] = dict_merge(result[key], value)
+         else:
+-            result[k] = deepcopy(v)
++            result[key] = value
+     return result
+ 
+ 
+
+  validation passed=True f2p=1 p2p=13 reasons=[]
+
+[3/3] PR Mirror lib/ansible/utils/listify.py::listify_lookup_plugin_terms
+  generated cand_199d7cd7727c: 445 chars
+diff --git a/lib/ansible/utils/listify.py b/lib/ansible/utils/listify.py
+--- a/lib/ansible/utils/listify.py
++++ b/lib/ansible/utils/listify.py
+@@ -34,7 +34,7 @@
+     else:
+         terms = templar.template(terms, fail_on_undefined=fail_on_undefined)
+ 
+-    if isinstance(terms, string_types) or not isinstance(terms, Iterable):
++    if isinstance(terms, string_types) or isinstance(terms, Iterable):
+         terms = [terms]
+ 
+     return terms
+
+  validation passed=True f2p=2 p2p=2 reasons=[]
+
+Report: /mnt/vast/workspaces/cot_pixel_prediction/jinhe/godel0/output_pr_mirror_probe_201233/pr_mirror_probe_report.json
+[Tue Jul 14 10:02:47 UTC 2026] PR Mirror probe complete.
+[Tue Jul 14 10:02:47 UTC 2026] Outputs: /mnt/vast/workspaces/cot_pixel_prediction/jinhe/godel0/output_pr_mirror_probe_201233
+[cleanup] Killing vLLM (pid=17037)...

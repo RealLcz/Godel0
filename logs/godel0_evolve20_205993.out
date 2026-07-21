@@ -1,0 +1,113 @@
+[Sat Jul 18 05:06:24 PM UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 172.33.1.9:8000 with TP=8
+[Sat Jul 18 05:11:13 PM UTC 2026] vLLM ready after 275s
+Starting evolution run: ansible_evolve20_205993
+Budget: max_nodes=20, max_expansions=20
+
+Expanding parent: root (score=0.75)
+Child created: node_d0271102ffda
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Proposer batch failed
+
+Expanding parent: root (score=0.75)
+Child created: node_7528b6c6999c
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Proposer batch failed
+
+Expanding parent: root (score=0.75)
+Child build failed: ['Patch guard: Empty patch']
+
+Expanding parent: root (score=0.75)
+Child build failed: ['Patch guard: Empty patch']
+
+Expanding parent: root (score=0.75)
+Child build failed: ['Patch guard: Empty patch']
+
+Expanding parent: root (score=0.75)
+Child build failed: ['Patch guard: Empty patch']
+
+Expanding parent: root (score=0.75)
+Child created: node_d16ac6de141a
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Proposer batch failed
+
+Expanding parent: root (score=0.75)
+Child build failed: ['Patch guard: Empty patch']
+
+Expanding parent: root (score=0.75)
+Child created: node_a9a4098dfb3c
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Proposer batch failed
+
+Expanding parent: root (score=0.75)
+Child build failed: ['Patch guard: Empty patch']
+
+Expanding parent: root (score=0.75)
+Child build failed: ['Patch guard: Empty patch']
+
+Expanding parent: root (score=0.75)
+Child build failed: ['Patch guard: Empty patch']
+
+Expanding parent: root (score=0.75)
+Child created: node_4dfe940de5d3
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Proposer batch failed
+
+Expanding parent: root (score=0.75)
+Child created: node_9561d55c80b2
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Proposer batch failed
+
+Expanding parent: root (score=0.75)
+Child build failed: ['Patch guard: Empty patch']
+
+Expanding parent: root (score=0.75)
+Child created: node_d45b99d32d27
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Proposer batch failed
+
+Expanding parent: root (score=0.75)
+Child created: node_bc4257474782
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Proposer batch failed
+
+Expanding parent: root (score=0.75)
+Child created: node_1cf310e616c8
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Proposer batch failed
+
+Expanding parent: root (score=0.75)
+Child created: node_c09bfce5dbed
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Proposer batch failed
+
+Expanding parent: root (score=0.75)
+Child created: node_bbe5b6064747
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Proposer batch failed
+
+Evolution complete. Nodes created: 0
+[Sat Jul 18 07:43:52 PM UTC 2026] Evolve-20 complete

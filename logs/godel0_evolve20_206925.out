@@ -1,0 +1,81 @@
+[Sun Jul 19 06:27:50 UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 172.33.1.20:8000 with TP=8
+  warnings.warn(
+/mnt/vast/home/ym56kacy/.local/lib/python3.10/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.4.3)/charset_normalizer (3.4.6) doesn't match a supported version!
+  warnings.warn(
+/mnt/vast/home/ym56kacy/.local/lib/python3.10/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.4.3)/charset_normalizer (3.4.6) doesn't match a supported version!
+  warnings.warn(
+/mnt/vast/home/ym56kacy/.local/lib/python3.10/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.4.3)/charset_normalizer (3.4.6) doesn't match a supported version!
+  warnings.warn(
+/mnt/vast/home/ym56kacy/.local/lib/python3.10/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.4.3)/charset_normalizer (3.4.6) doesn't match a supported version!
+  warnings.warn(
+/mnt/vast/home/ym56kacy/.local/lib/python3.10/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.4.3)/charset_normalizer (3.4.6) doesn't match a supported version!
+  warnings.warn(
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+`Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+(Worker pid=2558021) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(Worker pid=2558021) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(Worker pid=2558022) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(Worker pid=2558022) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(Worker pid=2558017) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(Worker pid=2558017) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(Worker pid=2558019) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(Worker pid=2558019) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(Worker pid=2558015) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(Worker pid=2558015) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(Worker pid=2558020) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(Worker pid=2558020) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(Worker pid=2558016) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(Worker pid=2558016) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(Worker pid=2558018) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(Worker pid=2558018) <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(Worker pid=2558018) The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+(Worker pid=2558020) The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+(Worker pid=2558022) The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+(Worker pid=2558017) The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+(Worker pid=2558015) The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+(Worker pid=2558019) The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+(Worker pid=2558021) The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+(Worker pid=2558016) The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:   0% Completed | 0/26 [00:00<?, ?it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:   4% Completed | 1/26 [00:00<00:04,  5.04it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:   8% Completed | 2/26 [00:00<00:04,  5.65it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  12% Completed | 3/26 [00:00<00:05,  4.33it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  15% Completed | 4/26 [00:00<00:05,  3.70it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  19% Completed | 5/26 [00:01<00:05,  3.60it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  23% Completed | 6/26 [00:01<00:05,  3.34it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  27% Completed | 7/26 [00:01<00:04,  4.24it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  31% Completed | 8/26 [00:01<00:04,  4.37it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  35% Completed | 9/26 [00:02<00:03,  4.55it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  38% Completed | 10/26 [00:02<00:03,  4.39it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  42% Completed | 11/26 [00:02<00:03,  4.58it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  46% Completed | 12/26 [00:02<00:03,  4.17it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  50% Completed | 13/26 [00:03<00:02,  4.63it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  54% Completed | 14/26 [00:03<00:02,  4.48it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  58% Completed | 15/26 [00:03<00:02,  5.01it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  62% Completed | 16/26 [00:03<00:02,  4.29it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  65% Completed | 17/26 [00:03<00:01,  5.17it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  69% Completed | 18/26 [00:04<00:01,  5.19it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  73% Completed | 19/26 [00:04<00:01,  5.20it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  77% Completed | 20/26 [00:04<00:01,  4.82it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  81% Completed | 21/26 [00:04<00:00,  5.31it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  85% Completed | 22/26 [00:04<00:00,  4.93it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  88% Completed | 23/26 [00:05<00:00,  4.57it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  92% Completed | 24/26 [00:05<00:00,  4.35it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards:  96% Completed | 25/26 [00:05<00:00,  4.54it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards: 100% Completed | 26/26 [00:05<00:00,  5.21it/s]
+(Worker_TP0 pid=2558015) Loading safetensors checkpoint shards: 100% Completed | 26/26 [00:05<00:00,  4.59it/s]
+(Worker_TP0 pid=2558015) 

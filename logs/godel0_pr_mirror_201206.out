@@ -1,0 +1,38 @@
+[Tue Jul 14 09:43:16 UTC 2026] Activating HGM conda environment...
+Python 3.10.20
+[Tue Jul 14 09:43:22 UTC 2026] GPUs: 8, Tensor parallel: 8
+[Tue Jul 14 09:43:22 UTC 2026] CUDA_HOME=/usr/local/cuda
+[Tue Jul 14 09:43:22 UTC 2026] Starting vLLM server: Qwen/Qwen3.6-35B-A3B on 172.33.1.34:8000
+[Tue Jul 14 09:43:22 UTC 2026] Waiting for vLLM to be ready...
+[ERROR] vLLM process died. Check logs/vllm_pr_mirror_201206.stderr.log
+(APIServer pid=1894023)     async with build_async_engine_client(
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/contextlib.py", line 199, in __aenter__
+(APIServer pid=1894023)     return await anext(self.gen)
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 100, in build_async_engine_client
+(APIServer pid=1894023)     async with build_async_engine_client_from_engine_args(
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/contextlib.py", line 199, in __aenter__
+(APIServer pid=1894023)     return await anext(self.gen)
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 136, in build_async_engine_client_from_engine_args
+(APIServer pid=1894023)     async_llm = AsyncLLM.from_vllm_config(
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/site-packages/vllm/v1/engine/async_llm.py", line 225, in from_vllm_config
+(APIServer pid=1894023)     return cls(
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/site-packages/vllm/v1/engine/async_llm.py", line 154, in __init__
+(APIServer pid=1894023)     self.engine_core = EngineCoreClient.make_async_mp_client(
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(APIServer pid=1894023)     return func(*args, **kwargs)
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/site-packages/vllm/v1/engine/core_client.py", line 130, in make_async_mp_client
+(APIServer pid=1894023)     return AsyncMPClient(*client_args)
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(APIServer pid=1894023)     return func(*args, **kwargs)
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/site-packages/vllm/v1/engine/core_client.py", line 887, in __init__
+(APIServer pid=1894023)     super().__init__(
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/site-packages/vllm/v1/engine/core_client.py", line 535, in __init__
+(APIServer pid=1894023)     with launch_core_engines(
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/contextlib.py", line 142, in __exit__
+(APIServer pid=1894023)     next(self.gen)
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/site-packages/vllm/v1/engine/utils.py", line 998, in launch_core_engines
+(APIServer pid=1894023)     wait_for_engine_startup(
+(APIServer pid=1894023)   File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/site-packages/vllm/v1/engine/utils.py", line 1057, in wait_for_engine_startup
+(APIServer pid=1894023)     raise RuntimeError(
+(APIServer pid=1894023) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+[cleanup] Killing vLLM (pid=1894023)...

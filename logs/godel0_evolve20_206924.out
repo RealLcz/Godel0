@@ -1,0 +1,19 @@
+[Sun Jul 19 06:11:49 UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 172.33.1.20:8000 with TP=8
+[Sun Jul 19 06:16:32 UTC 2026] vLLM ready after 270s
+Starting evolution run: ansible_root_bootstrap_smoke_v3_206924
+Budget: target_successful_epochs=20, max_attempts=1
+Bootstrapping root with 1 trusted-valid tasks before any self-edit
+Traceback (most recent call last):
+  File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/mnt/vast/home/ym56kacy/miniconda3/envs/HGM/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/mnt/vast/workspaces/cot_pixel_prediction/jinhe/godel0/src/godel0/cli.py", line 108, in <module>
+    sys.exit(main())
+  File "/mnt/vast/workspaces/cot_pixel_prediction/jinhe/godel0/src/godel0/cli.py", line 104, in main
+    return args.func(args)
+  File "/mnt/vast/workspaces/cot_pixel_prediction/jinhe/godel0/src/godel0/cli.py", line 25, in _cmd_run
+    orchestrator.run()
+  File "/mnt/vast/workspaces/cot_pixel_prediction/jinhe/godel0/src/godel0/controller/orchestrator.py", line 294, in run
+    raise RuntimeError(
+RuntimeError: Root bootstrap failed: no complete K-task proposer/solver cycle; evolution was not started

@@ -1,0 +1,13 @@
+Python 3.10.20
+[Wed Jul 15 15:04:48 UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 172.33.1.8:8000 with TP=8
+[Wed Jul 15 15:10:25 UTC 2026] vLLM ready after 320s
+
+=== Stage 0: real PR replay preflight ===
+PR replay preflight skipped by request.
+
+=== Stage 1A: bootstrap generation without trajectories ===
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 1: {'attempt': 1, 'phase': 'bootstrap', 'domain': 'template_vars', 'generated': 0, 'generation_runtime_sec': 445.93, 'source_trajectory_ids': [], 'result': 'generator_rejected', 'raw_modified_files': [], 'raw_patch_chars': 0}
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+Bootstrap repo-agent attempt 2: {'attempt': 2, 'phase': 'bootstrap', 'domain': 'variable_merge', 'generated': 0, 'generation_runtime_sec': 495.163, 'source_trajectory_ids': [], 'result': 'generator_rejected', 'raw_modified_files': [], 'raw_patch_chars': 0}
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.

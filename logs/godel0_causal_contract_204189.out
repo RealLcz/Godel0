@@ -1,0 +1,8 @@
+Python 3.10.20
+[Thu Jul 16 12:18:07 UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 172.33.1.18:8000 with TP=8
+[Thu Jul 16 12:23:21 UTC 2026] vLLM ready after 300s
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+attempt=1 seed=7300 result=generator_rejected searched=None files=[]
+Using vLLM for Qwen model Qwen/Qwen3.6-35B-A3B.
+attempt=2 seed=7301 result=generator_rejected searched=None files=[]
+report=/mnt/vast/workspaces/cot_pixel_prediction/jinhe/godel0/output_causal_repo_agent_204189/causal_contract_report.json

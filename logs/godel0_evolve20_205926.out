@@ -1,0 +1,6 @@
+[Sat Jul 18 03:10:28 PM UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 10.158.1.16:8000 with TP=8
+[Sat Jul 18 03:15:46 PM UTC 2026] vLLM ready after 300s
+Starting evolution run: repo_chain_evolve20_205926
+Budget: max_nodes=20, max_expansions=20
+
+Expanding parent: root (score=0.75)

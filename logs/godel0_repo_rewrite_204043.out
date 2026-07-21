@@ -1,0 +1,9 @@
+Python 3.10.20
+[Thu Jul 16 06:05:00 UTC 2026] Starting Qwen/Qwen3.6-35B-A3B on 172.33.1.12:8000 with TP=8
+[Thu Jul 16 06:10:38 UTC 2026] vLLM ready after 320s
+
+[1/1] rewriting 6 files with target ratio 60%
+generation complete=False files=5 actual_ratio_gate=False patch_chars=33214
+
+Report: /mnt/vast/workspaces/cot_pixel_prediction/jinhe/godel0/output_repo_lm_rewrite_204043/repo_lm_rewrite_report.json
+[Thu Jul 16 06:20:27 UTC 2026] Repository LM Rewrite probe complete: /mnt/vast/workspaces/cot_pixel_prediction/jinhe/godel0/output_repo_lm_rewrite_204043
