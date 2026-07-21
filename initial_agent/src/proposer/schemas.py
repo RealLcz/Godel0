@@ -61,6 +61,7 @@ class BugGenerationPlan(BaseModel):
         "combine",
         "pr_mirror",
         "pr_replay",
+        "repo_chain",
     ] = "procedural"
     operator: Optional[str] = None
     constraints: BugConstraints = Field(default_factory=BugConstraints)

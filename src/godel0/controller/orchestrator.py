@@ -20,10 +20,22 @@ from ..storage.atomic import read_json
 from ..storage.atomic import atomic_write_json
 from ..storage.event_log import log_event
 from ..tree.archive import NodeArchive
-from ..tree.selection import EpsilonGreedySelector, ParentSelector
+from ..tree.selection import ParentSelector
 from .budget import Budget
 from .run_context import RunContext
 from .scorer import compute_scores
+
+
+_TEST_PATH_PATTERNS = ("test_", "_test.py", "/tests/", "/test/", "conftest.py")
+
+
+def _is_test_path(path: str) -> bool:
+    """Return True if a repository path looks like a test file."""
+    if not path:
+        return False
+    normalized = path.replace("\\", "/")
+    lower = normalized.lower()
+    return any(pattern in lower for pattern in _TEST_PATH_PATTERNS)
 
 
 class EvolutionOrchestrator:
@@ -98,7 +110,10 @@ class EvolutionOrchestrator:
 
         archive = NodeArchive(run_context.paths.archive_path)
         cls._initialize_root(config, archive, run_context)
-        selector = EpsilonGreedySelector(epsilon=0.1)
+        # BUG-10: the main experiment uses HGM-style Thompson Sampling, not
+        # epsilon-greedy. EpsilonGreedySelector is kept for ablations only and
+        # must be selected explicitly via config.selection.strategy.
+        selector = cls._build_selector(config)
         budget = Budget(
             max_nodes=config.run.max_nodes,
             max_expansions=config.run.max_expansions,
@@ -140,6 +155,10 @@ class EvolutionOrchestrator:
             test_timeout_sec=config.proposer.candidate_timeout_sec,
             max_patch_lines=config.proposer.max_patch_lines,
             forbid_test_file_edits=config.proposer.forbid_test_file_edits,
+            # BUG-15/10.8: trusted repository tests run through the repo
+            # backend so the chain is end-to-end Apptainer. The backend is
+            # built later from the ExecutionBackendFactory; we patch it in
+            # after the factory is constructed below.
         )
         task_committer = TaskCommitter(task_store)
 
@@ -147,16 +166,30 @@ class EvolutionOrchestrator:
         from ..tasks.node_proposer import NodeProposerRunner
         from ..execution.subprocess_runner import SubprocessRunner
 
-        # Phase 9: build the unified execution backend. Default is subprocess;
-        # when config.execution.backend == "apptainer" and an agent_image is
-        # configured, use ApptainerRunner for HPC container isolation.
-        execution_backend = SubprocessRunner()
-        if config.execution.backend == "apptainer" and config.execution.agent_image:
-            from ..execution.apptainer import ApptainerRunner
+        # Phase 9 / BUG-13~17: build the unified execution backend. Default is
+        # subprocess; when config.execution.backend == "apptainer" and an
+        # agent_image is configured, use ApptainerRunner for HPC container
+        # isolation. The ExecutionBackendFactory exposes separate agent-facing
+        # (network enabled) and repo-facing (network disabled) backends so the
+        # whole chain is end-to-end Apptainer.
+        from ..execution.apptainer import ExecutionBackendFactory
 
-            execution_backend = ApptainerRunner(
-                apptainer_bin=config.execution.apptainer_bin,
-            )
+        backend_factory = ExecutionBackendFactory(
+            agent_image=Path(config.execution.agent_image) if config.execution.agent_image else None,
+            repo_image_dir=Path(config.execution.repo_image_dir) if config.execution.repo_image_dir else None,
+            apptainer_bin=config.execution.apptainer_bin,
+            use_apptainer=(
+                config.execution.backend == "apptainer"
+                and bool(config.execution.agent_image)
+            ),
+        )
+        # BUG-16: agent-facing backend keeps network enabled so online LLM
+        # API calls work. Repo-facing backend (trusted tests) disables network.
+        execution_backend = backend_factory.agent_backend()
+        repo_backend = backend_factory.repo_backend()
+        # BUG-15/10.8: inject the repo backend into the validator so trusted
+        # repository tests also run inside Apptainer.
+        validator.execution_backend = repo_backend
 
         proposer_runner = NodeProposerRunner(
             agent_repo=Path(config.paths.agent_repo),
@@ -263,6 +296,26 @@ class EvolutionOrchestrator:
         from experiment_adapters.common_agent_adapter import CommonAgentAdapter
 
         return CommonAgentAdapter()
+
+    @staticmethod
+    def _build_selector(config: "Godel0Config"):
+        """Build the parent selector from config.
+
+        BUG-10: the main experiment defaults to ThompsonSamplingSelector.
+        EpsilonGreedySelector is only available as an explicit ablation.
+        """
+        from ..tree.selection import ThompsonSamplingSelector
+
+        strategy = getattr(config.scoring.selection, "strategy", "thompson_sampling")
+        if strategy == "epsilon_greedy":
+            from ..tree.selection import EpsilonGreedySelector
+
+            return EpsilonGreedySelector(
+                epsilon=config.scoring.selection.epsilon
+            )
+        return ThompsonSamplingSelector(
+            num_pseudo_descendant_evals=config.scoring.selection.num_pseudo_descendant_evals,
+        )
 
     @classmethod
     def _initialize_root(
@@ -514,12 +567,19 @@ class EvolutionOrchestrator:
             self.archive.update(root)
             return False
 
+        # BUG-12: root bootstrap also runs through the HGM quality gate so
+        # that ``selection_eligible`` is populated consistently. The root
+        # receives no Level1 (retention=1.0 by definition) and a full batch
+        # (valid_yield=1.0, causal_ablation_pass=1.0, batch_complete=True).
         scores = compute_scores(
             retention_rate=1.0,
             frontier_accuracy=level2.accuracy,
             regression_weight=self.config.scoring.regression_weight,
             target_accuracy=self.config.scoring.proposer_target_accuracy,
             mode=self.config.scoring.mode,
+            valid_yield=1.0,
+            causal_ablation_pass=1.0,
+            batch_complete=True,
             hgm_valid_yield_threshold=self.config.scoring.hgm_valid_yield_threshold,
             hgm_causal_ablation_pass_threshold=self.config.scoring.hgm_causal_ablation_pass_threshold,
             hgm_difficulty_min=self.config.scoring.hgm_difficulty_min,
@@ -529,6 +589,16 @@ class EvolutionOrchestrator:
         root.solver_score = scores.solver_score
         root.proposer_score = scores.proposer_score
         root.node_score = scores.node_score
+        root.selection_eligible = bool(scores.eligible)
+        # BUG-11: record the root's trusted Level2 utilities so the Thompson
+        # Sampling selector can include the root in its Beta posterior.
+        root.utility_measures = [
+            1.0 if outcome.resolved else 0.0
+            for outcome in level2.outcomes
+        ]
+        root.evaluated_task_ids = [
+            outcome.task_id for outcome in level2.outcomes
+        ]
         needs_evolution_parent = self.budget.max_nodes > 0
         if (
             needs_evolution_parent
@@ -700,6 +770,14 @@ class EvolutionOrchestrator:
         Counts empty patches, test-only patches, timeouts, context overflows,
         stochastic tasks, repeated tool loops, and localization collapses from
         the Level 2 outcomes and trajectory files.
+
+        BUG-21: ``stochastic_task_count`` and ``localization_collapse_count``
+        are computed from real trajectory structure (multiple rollouts of the
+        same task, and structural signals like no production file opened /
+        repeated search without narrowing), not left as always-zero counters.
+        ``solver_rollouts`` reports the max number of rollouts observed for any
+        single task so the detector can suppress stochasticity alerts when
+        ``solver_rollouts < solver_stochasticity_min_rollouts``.
         """
         stats = {
             "empty_patch_count": 0,
@@ -710,9 +788,15 @@ class EvolutionOrchestrator:
             "stochastic_task_count": 0,
             "repeated_tool_loop_count": 0,
             "localization_collapse_count": 0,
+            # BUG-21: max rollouts observed for any single task in this node.
+            "solver_rollouts": 0,
+            # BUG-21: number of distinct tasks with >=2 rollouts.
+            "tasks_with_multiple_rollouts": 0,
         }
         if level2 is not None:
             stats["evaluated_count"] = len(level2.outcomes)
+            from ..git.patch import extract_changed_files
+
             for outcome in level2.outcomes:
                 patch_path = getattr(outcome, "patch_path", None)
                 patch = ""
@@ -720,24 +804,107 @@ class EvolutionOrchestrator:
                     patch = Path(patch_path).read_text(encoding="utf-8", errors="replace")
                 if not patch.strip():
                     stats["empty_patch_count"] += 1
-                elif "test" in patch.lower() and not any(
-                    line.startswith("+") and not line.startswith("+++")
-                    for line in patch.splitlines()
-                    if not line.startswith(("diff ", "--- ", "+++ "))
-                ):
-                    stats["test_only_patch_count"] += 1
+                else:
+                    # BUG-07: classify test-only patches by parsing changed
+                    # files instead of substring-matching "test" in the patch
+                    # text (which false-positives on any patch mentioning tests).
+                    changed_files = extract_changed_files(patch)
+                    production_files = [
+                        p for p in changed_files if not _is_test_path(p)
+                    ]
+                    if changed_files and not production_files:
+                        stats["test_only_patch_count"] += 1
                 error_type = str(getattr(outcome, "error_type", "") or "").lower()
                 if "timeout" in error_type or "timed out" in error_type:
                     stats["timeout_count"] += 1
                 if "context" in error_type or "token" in error_type:
                     stats["context_overflow_count"] += 1
-        for excerpt in self._trajectory_excerpts(node.node_id):
+
+        # BUG-21: parse trajectory structure to compute real signals.
+        excerpts = self._trajectory_excerpts(node.node_id)
+        rollout_counts: dict[str, int] = {}
+        for excerpt in excerpts:
             lower = excerpt.lower()
             if "context length" in lower or "token limit" in lower:
                 stats["context_overflow_count"] += 1
             if lower.count('"tool":') > 20 and lower.count("repeated") > 0:
                 stats["repeated_tool_loop_count"] += 1
+            # BUG-21: localization collapse -- structural signals that the
+            # solver never narrowed onto the relevant production code.
+            if self._trajectory_localization_collapsed(excerpt):
+                stats["localization_collapse_count"] += 1
+            task_id = self._trajectory_task_id(excerpt)
+            if task_id:
+                rollout_counts[task_id] = rollout_counts.get(task_id, 0) + 1
+        if rollout_counts:
+            stats["solver_rollouts"] = max(rollout_counts.values())
+            stats["tasks_with_multiple_rollouts"] = sum(
+                1 for c in rollout_counts.values() if c >= 2
+            )
+            # BUG-21: stochasticity = tasks whose outcomes diverge across
+            # rollouts. We approximate by counting tasks with >=2 rollouts
+            # where at least one rollout failed and one succeeded. Without
+            # per-rollout resolution we use the count of multi-rollout tasks
+            # as an upper bound; the detector further gates on
+            # ``solver_rollouts >= min_rollouts``.
+            stats["stochastic_task_count"] = stats["tasks_with_multiple_rollouts"]
         return stats
+
+    @staticmethod
+    def _trajectory_localization_collapsed(excerpt: str) -> bool:
+        """BUG-21: structural localization-collapse heuristic.
+
+        Returns True when the trajectory shows none of the narrowing signals
+        we expect from a healthy localization (opening a production file,
+        locating a symbol, or producing a patch touching production code).
+        """
+        if not excerpt:
+            return False
+        lower = excerpt.lower()
+        # Heuristic positive signals of successful localization.
+        opened_production = (
+            '"tool": "view' in lower
+            or '"tool": "open' in lower
+            or '"tool": "cat' in lower
+            or '"tool": "read' in lower
+            or '"name": "view' in lower
+            or '"name": "open' in lower
+            or '"name": "cat' in lower
+            or '"name": "read' in lower
+        )
+        edited_file = (
+            '"tool": "edit' in lower
+            or '"tool": "str_replace' in lower
+            or '"tool": "create' in lower
+            or '"name": "edit' in lower
+            or '"name": "str_replace' in lower
+            or '"name": "create' in lower
+        )
+        # Negative signal: repeated search without narrowing.
+        repeated_search = lower.count('"tool": "search') >= 4 or lower.count('"tool": "grep') >= 4
+        return (not opened_production) and (not edited_file) and repeated_search
+
+    @staticmethod
+    def _trajectory_task_id(excerpt: str) -> str:
+        """BUG-21: best-effort extraction of task_id from a trajectory excerpt."""
+        if not excerpt:
+            return ""
+        import json as _json
+
+        for line in excerpt.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = _json.loads(line)
+            except Exception:
+                continue
+            for key in ("task_id", "instance_id", "id"):
+                value = entry.get(key) if isinstance(entry, dict) else None
+                if value:
+                    return str(value)
+        return ""
+
 
     def _extended_proposer_stats(self, node, base_stats: dict) -> dict:
         """Extend proposer stats with RepoChain-specific counters.
@@ -800,17 +967,94 @@ class EvolutionOrchestrator:
     def _success_contrast(self, node) -> str:
         """Build a success-contrast excerpt for the diagnoser.
 
-        Picks one solved task's trajectory summary to contrast against failures.
+        BUG-23: the contrast must be a real failure/success comparison, not a
+        one-line "SOLVED task X". We surface the solved task id, the tool
+        sequence, the files inspected, the patch files, the test behavior,
+        and a trajectory excerpt so the diagnoser can actually contrast.
         """
-        if node.level2_result_path and Path(node.level2_result_path).is_file():
-            from ..schemas.evaluation import Level2Result
+        if not (node.level2_result_path and Path(node.level2_result_path).is_file()):
+            return ""
+        from ..schemas.evaluation import Level2Result
 
-            level2 = Level2Result.model_validate(read_json(Path(node.level2_result_path)))
-            solved = set(level2.solved_task_ids)
-            if solved and self.task_store is not None:
-                for tid in level2.solved_task_ids[:1]:
-                    return f"SOLVED task {tid}: solver successfully patched the bug."
+        level2 = Level2Result.model_validate(read_json(Path(node.level2_result_path)))
+        solved = set(level2.solved_task_ids)
+        if not solved:
+            return ""
+        # Prefer the first solved task with a non-empty patch and trajectory.
+        scratch = Path(self.config.execution.scratch_root)
+        for tid in level2.solved_task_ids:
+            outcome = next((o for o in level2.outcomes if o.task_id == tid), None)
+            if outcome is None:
+                continue
+            parts: list[str] = [f"SUCCESS CONTRAST — task {tid}"]
+            # Patch files.
+            patch_path = getattr(outcome, "patch_path", None)
+            patch_text = ""
+            if patch_path and Path(patch_path).is_file():
+                patch_text = Path(patch_path).read_text(encoding="utf-8", errors="replace")
+            if patch_text:
+                from ..git.patch import extract_changed_files
+
+                changed = extract_changed_files(patch_text)
+                parts.append(f"patch_files: {', '.join(changed) if changed else '(none)'}")
+                parts.append(f"patch_excerpt:\n{patch_text[:2000]}")
+            # Test behavior.
+            f2p = list(getattr(outcome, "fail_to_pass", []) or [])
+            p2p = list(getattr(outcome, "pass_to_pass", []) or [])
+            if f2p:
+                parts.append(f"fail_to_pass: {f2p[:8]}")
+            if p2p:
+                parts.append(f"pass_to_pass: {p2p[:8]}")
+            # Trajectory excerpt (tool sequence, files inspected).
+            for traj_path in scratch.glob(
+                f"{self.run_context.run_id}/solver/**/trajectories/**/{tid}*/trajectory.jsonl"
+            ):
+                if not traj_path.is_file():
+                    continue
+                text = traj_path.read_text(encoding="utf-8", errors="replace")
+                tool_seq = self._extract_tool_sequence(text)
+                if tool_seq:
+                    parts.append(f"tool_sequence: {tool_seq}")
+                parts.append(f"trajectory_excerpt:\n{text[-4000:]}")
+                break
+            else:
+                # Fallback: search by node_id + task_id in path parts.
+                for traj_path in scratch.glob(
+                    f"{self.run_context.run_id}/solver/**/trajectories/**/trajectory.jsonl"
+                ):
+                    if node.node_id not in traj_path.parts or tid not in traj_path.parts:
+                        continue
+                    text = traj_path.read_text(encoding="utf-8", errors="replace")
+                    tool_seq = self._extract_tool_sequence(text)
+                    if tool_seq:
+                        parts.append(f"tool_sequence: {tool_seq}")
+                    parts.append(f"trajectory_excerpt:\n{text[-4000:]}")
+                    break
+            return "\n\n".join(parts)
         return ""
+
+    @staticmethod
+    def _extract_tool_sequence(trajectory_text: str) -> str:
+        """BUG-23: extract the ordered tool names from a trajectory JSONL."""
+        import json as _json
+
+        tools: list[str] = []
+        for line in str(trajectory_text).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = _json.loads(line)
+            except Exception:
+                continue
+            if isinstance(entry, dict):
+                tool = entry.get("tool") or (entry.get("action") or {}).get("tool")
+                if not tool and isinstance(entry.get("action"), dict):
+                    tool = entry["action"].get("tool") or entry["action"].get("name")
+                if tool:
+                    tools.append(str(tool))
+        return ", ".join(tools[:20]) if tools else ""
+
 
     def _chain_plans(self, node) -> list[str]:
         """Extract RepoChain plan summaries from the proposer output."""
@@ -905,10 +1149,28 @@ class EvolutionOrchestrator:
         parent_task_ids = self._parent_solved_task_ids(parent) if parent is not None else []
         from ..tasks.provider import TaskGenerationContext
 
+        # BUG-08/09: split trajectories into parent-failure and current-child
+        # Level1 buckets so the 5+5 quota can be enforced downstream. When the
+        # split buckets cannot be derived (e.g. root bootstrap), fall back to
+        # the flat list so behavior remains backward compatible.
+        parent_failure_trajectories: list[str] = []
+        current_child_level1_trajectories: list[str] = []
+        if parent is not None and child is not None and parent.node_id != child.node_id:
+            for value in trajectories:
+                if parent.node_id in value:
+                    parent_failure_trajectories.append(value)
+                elif child.node_id in value:
+                    current_child_level1_trajectories.append(value)
+        else:
+            # Root bootstrap or same-node: everything goes into the flat list.
+            pass
+
         context = TaskGenerationContext(
             node=child,
             parent=parent,
             level1_result=level1_result,
+            parent_failure_trajectories=parent_failure_trajectories,
+            current_child_level1_trajectories=current_child_level1_trajectories,
             solver_trajectories=trajectories,
             parent_task_ids=parent_task_ids,
             parent_solved_task_ids=list(parent_task_ids),
@@ -940,6 +1202,10 @@ class EvolutionOrchestrator:
                 model=self.config.models.agent_model,
                 run_id=self.run_context.run_id,
                 task_store_dir=self.config.paths.task_store,
+                bootstrap=parent is None,
+                # BUG-08/09: forward split buckets for the legacy path too.
+                parent_failure_trajectories=parent_failure_trajectories,
+                current_child_level1_trajectories=current_child_level1_trajectories,
             )
             from ..tasks.provider import TaskBatch
 
@@ -958,6 +1224,27 @@ class EvolutionOrchestrator:
             )
         child.generated_task_batch_id = result.batch_id
         summary_path = self.run_context.paths.proposer_dir(child.node_id) / "generation_summary.json"
+        # BUG-20: persist RepoChain-specific counters as structured fields so
+        # the special detectors can read them directly instead of substring
+        # matching on rejection_reasons.
+        rejection_reasons = dict(result.rejection_reasons)
+        def _count(*keys: str) -> int:
+            total = 0
+            for reason, count in rejection_reasons.items():
+                reason_lower = str(reason).lower()
+                if any(k in reason_lower for k in keys):
+                    total += int(count)
+            return total
+        repo_chain_stats = {
+            "contract_generation_failure_count": _count("contract_generation", "contract_not_restored", "contract_not_built"),
+            "clean_contract_failure_count": _count("clean_contract"),
+            "mutation_materialization_failure_count": _count("mutation_materialization", "mutation_failed", "engine_returned_no_candidates"),
+            "causal_ablation_failure_count": _count("causal_ablation", "single_file_repair", "independently_active"),
+            "no_f2p_count": _count("no_f2p", "f2p"),
+            "no_p2p_count": _count("no_p2p", "p2p"),
+            "duplicate_count": _count("duplicate"),
+            "statement_leakage_count": _count("leakage", "leak", "statement_audit"),
+        }
         atomic_write_json(
             summary_path,
             {
@@ -972,6 +1259,11 @@ class EvolutionOrchestrator:
                 "validation_reports": result.validation_reports,
                 "proposer_error": result.proposer_error,
                 "engine_rejections": result.engine_rejections,
+                # BUG-20: structured RepoChain counters (also available as a
+                # nested ``repo_chain_stats`` object for consumers that prefer
+                # the grouped shape from the bugfix guide).
+                "repo_chain_stats": repo_chain_stats,
+                **repo_chain_stats,
             },
         )
         return result
@@ -1015,12 +1307,35 @@ class EvolutionOrchestrator:
         r = level1_result.retention_rate if level1_result else 0.5
         p = level2_result.accuracy if level2_result else 0.5
 
+        # BUG-12: feed the HGM quality-gate inputs (valid_yield, causal
+        # ablation pass rate, batch completeness) into compute_scores so its
+        # ``eligible`` flag reflects the full gate rather than just b > 0.
+        proposer_summary = self._proposer_stats(child)
+        candidates_validated = int(proposer_summary.get("generated", 0)) or 0
+        accepted = int(proposer_summary.get("accepted", 0))
+        valid_yield = (accepted / candidates_validated) if candidates_validated > 0 else None
+        extended = self._extended_proposer_stats(child, proposer_summary)
+        ablation_failures = int(extended.get("causal_ablation_failure_count", 0))
+        causal_ablation_pass = None
+        if candidates_validated > 0 and ablation_failures is not None:
+            causal_ablation_pass = max(
+                0.0, 1.0 - (ablation_failures / max(candidates_validated, 1))
+            )
+        batch_complete = bool(
+            child.generated_task_batch_id
+            and level2_result is not None
+            and len(level2_result.outcomes) == self.config.tasks.batch_size
+        )
+
         scores = compute_scores(
             retention_rate=r,
             frontier_accuracy=p,
             regression_weight=self.config.scoring.regression_weight,
             target_accuracy=self.config.scoring.proposer_target_accuracy,
             mode=self.config.scoring.mode,
+            valid_yield=valid_yield,
+            causal_ablation_pass=causal_ablation_pass,
+            batch_complete=batch_complete,
             hgm_valid_yield_threshold=self.config.scoring.hgm_valid_yield_threshold,
             hgm_causal_ablation_pass_threshold=self.config.scoring.hgm_causal_ablation_pass_threshold,
             hgm_difficulty_min=self.config.scoring.hgm_difficulty_min,
@@ -1031,6 +1346,21 @@ class EvolutionOrchestrator:
         child.solver_score = scores.solver_score
         child.proposer_score = scores.proposer_score
         child.node_score = scores.node_score
+        # BUG-12: persist the HGM quality-gate result so eligible_parents can
+        # filter on it instead of the weaker proposer_score > 0 heuristic.
+        child.selection_eligible = bool(scores.eligible)
+
+        # BUG-11: populate utility_measures from trusted Level2 outcomes so the
+        # Thompson Sampling selector has a Beta posterior to sample from. Each
+        # solved task contributes 1.0, each unresolved task 0.0.
+        if level2_result is not None:
+            child.utility_measures = [
+                1.0 if outcome.resolved else 0.0
+                for outcome in level2_result.outcomes
+            ]
+            child.evaluated_task_ids = [
+                outcome.task_id for outcome in level2_result.outcomes
+            ]
 
         atomic_write_json(
             self.run_context.paths.node_scores(child.node_id),
@@ -1040,6 +1370,8 @@ class EvolutionOrchestrator:
                 "solver_score": scores.solver_score,
                 "proposer_score": scores.proposer_score,
                 "node_score": scores.node_score,
+                "selection_eligible": child.selection_eligible,
+                "utility_measures": child.utility_measures,
             }
         )
 

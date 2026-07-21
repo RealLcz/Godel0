@@ -29,6 +29,13 @@ FORBIDDEN_PATCH_PATTERNS = (
     "../",
     "/.git",
     "symlink",
+    # BUG-25: the proposer transport schema must not be self-edited. The
+    # trusted controller-side schema lives in src/godel0/schemas/ which is
+    # outside the agent repo, but the evolvable proposer/request.py carries
+    # the wire format the child process reads. Protect it from self-edit so
+    # a child node cannot drift the protocol.
+    "proposer/request.py",
+    "proposer/schemas.py",
 )
 
 MAX_PATCH_LINES = 80

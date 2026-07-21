@@ -82,6 +82,10 @@ class ProposerTaskProvider:
             run_id=context.run_id,
             task_store_dir=self.task_store_dir,
             bootstrap=context.bootstrap,
+            # BUG-08/09: forward the split trajectory buckets so the builder
+            # can enforce the 5+5 quota and record provenance.
+            parent_failure_trajectories=list(context.parent_failure_trajectories),
+            current_child_level1_trajectories=list(context.current_child_level1_trajectories),
         )
         return _result_to_batch(result)
 

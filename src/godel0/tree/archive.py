@@ -54,9 +54,9 @@ class NodeArchive:
     def eligible_parents(self, min_solved: int = 3, scoring_mode: str = "joint") -> List[NodeRecord]:
         """Get all nodes eligible to be parents.
 
-        In "hgm" scoring mode, additionally enforce the proposer quality gate:
-        proposer_score must be > 0 (b > 0 means tasks were at the right
-        difficulty, not trivially easy or impossibly hard).
+        In "hgm" scoring mode, additionally enforce the HGM-style proposer
+        quality gate via ``NodeRecord.selection_eligible`` (BUG-12). Legacy
+        behavior in "joint" mode keeps the old score-based check.
         """
         self._ensure_loaded()
         eligible = []
@@ -64,11 +64,28 @@ class NodeArchive:
             if not r.is_eligible_parent(min_solved):
                 continue
             if scoring_mode == "hgm":
-                # HGM gate: proposer quality must be non-zero.
-                if r.proposer_score is None or r.proposer_score <= 0:
+                # BUG-12: the authoritative HGM quality gate is the explicit
+                # selection_eligible flag set by compute_scores().eligible.
+                # Do not substitute ``proposer_score > 0`` for the full gate.
+                if not getattr(r, "selection_eligible", True):
                     continue
             eligible.append(r)
         return eligible
+
+    def descendants_of(self, node_id: str) -> List[NodeRecord]:
+        """Get all descendants (children, grandchildren, ...) of a node."""
+        self._ensure_loaded()
+        descendants: List[NodeRecord] = []
+        pending = list(self.children_of(node_id))
+        seen: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current.node_id in seen:
+                continue
+            seen.add(current.node_id)
+            descendants.append(current)
+            pending.extend(self.children_of(current.node_id))
+        return descendants
 
     def all_nodes(self) -> List[NodeRecord]:
         """Get all nodes."""

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Protocol, runtime_checkable
+from typing import Any, List, Optional, Protocol, runtime_checkable
 
 from ..schemas.node import NodeRecord
 from ..schemas.task import TaskRecord
@@ -28,10 +28,22 @@ class TaskGenerationContext:
 
     node: NodeRecord
     parent: Optional[NodeRecord] = None
-    level1_result=None
+    level1_result: Optional[Any] = None
+
+    # Phase 6 / BUG-08/09: trajectory sources are split so the 5+5 quota can be
+    # enforced. parent_failure_trajectories holds the parent's Level2 unresolved
+    # trajectories; current_child_level1_trajectories holds the current child's
+    # Level1 unresolved/forgotten trajectories.
+    parent_failure_trajectories: List[str] = field(default_factory=list)
+    current_child_level1_trajectories: List[str] = field(default_factory=list)
+
+    # Backwards-compatible flat trajectory list. Kept so legacy callers that
+    # only have a single bucket still work; the provider prefers the split
+    # buckets when they are populated.
     solver_trajectories: List[str] = field(default_factory=list)
     parent_task_ids: List[str] = field(default_factory=list)
     parent_solved_task_ids: List[str] = field(default_factory=list)
+
     run_id: str = "run"
     output_dir: Optional[Path] = None
     model: str = "deepseek/deepseek-chat"

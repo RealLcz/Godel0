@@ -86,6 +86,10 @@ class EvidenceItem(BaseModel):
     ]
     source_stage: str = ""
     summary: str = ""
+    # BUG-22: raw representative text (up to ~8k chars for primary failures,
+    # ~2-4k for supporting/contrast). The diagnoser reads this directly
+    # instead of only the 500-char ``summary``.
+    raw_text: Optional[str] = None
     raw_excerpt_path: Optional[str] = None
     token_estimate: int = 0
     importance: float = 0.0

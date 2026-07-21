@@ -54,6 +54,11 @@ class ProposerRequest:
     target_batch_size: int = 10
     max_candidates: int = 50
     solver_trajectories: List[str] = field(default_factory=list)
+    # BUG-08/09: split trajectory buckets so the proposer can tag each plan
+    # with its source type (parent_failure vs current_child_level1) for
+    # provenance. When empty, the proposer falls back to ``solver_trajectories``.
+    parent_failure_trajectories: List[str] = field(default_factory=list)
+    current_child_level1_trajectories: List[str] = field(default_factory=list)
     parent_task_ids: List[str] = field(default_factory=list)
     model: str = "deepseek/deepseek-chat"
     generation_attempt: int = 0

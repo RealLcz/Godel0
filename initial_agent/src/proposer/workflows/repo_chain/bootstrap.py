@@ -26,6 +26,14 @@ def build_bootstrap_plans(capability_prior: List[str], repo_spec) -> List:
 
     Each capability becomes a plan with a FailureSignature stub so the
     RepoChainGenerator can run stages 2-8 without real solver trajectories.
+
+    BUG-04: when ``capability_prior`` is empty the root produced zero plans.
+    Callers that want the default prior should pass ``BOOTSTRAP_CAPABILITY_PRIOR``
+    explicitly; this function no longer silently substitutes it so that an
+    empty prior is a visible programming error rather than a 0-candidate batch.
+    BUG-05: the plan strategy is now ``repo_chain`` (not ``lm_modify``) so the
+    root T_0 actually enters the RepoChain workflow instead of degrading to a
+    single-file LM modify.
     """
     try:
         from proposer.schemas import BugGenerationPlan, FailureSignature
@@ -46,8 +54,8 @@ def build_bootstrap_plans(capability_prior: List[str], repo_spec) -> List:
             failure_signature=signature,
             target_repo_id=getattr(repo_spec, "repo_id", ""),
             target_base_commit=getattr(repo_spec, "base_commit", ""),
-            strategy="lm_modify",
-            operator="lm_introduce_bug",
+            strategy="repo_chain",
+            operator="",
             rationale=f"bootstrap plan for capability {capability}",
             task_blueprint={
                 "capability_gap": capability,

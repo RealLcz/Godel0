@@ -43,11 +43,27 @@ class NodeRecord(BaseModel):
     node_score: Optional[float] = None
     solved_task_count: Optional[int] = None
 
+    # BUG-11: HGM-style Thompson Sampling utility measurements. Each value is
+    # 1.0 for a solved Level2 task and 0.0 for an unresolved Level2 task. The
+    # Beta(alpha=1+successes, beta=1+failures) posterior over these outcomes
+    # drives parent selection. Only trusted Level2 outcomes should be appended.
+    utility_measures: List[float] = Field(default_factory=list)
+    evaluated_task_ids: List[str] = Field(default_factory=list)
+    # BUG-12: HGM-style quality gate. When False the node completed but its
+    # proposer batch failed the quality gate (valid yield / causal ablation /
+    # difficulty / batch completeness) and it must not be selected as a parent.
+    selection_eligible: bool = True
+
     created_at: datetime = Field(default_factory=utc_now)
     completed_at: Optional[datetime] = None
 
     def is_eligible_parent(self, min_solved: int = 3) -> bool:
         if self.status != NodeStatus.COMPLETE:
+            return False
+        # BUG-12: honor the explicit HGM quality gate when set. Legacy nodes
+        # without selection_eligible default to True and fall through to the
+        # score-based checks below.
+        if not self.selection_eligible:
             return False
         if self.node_score is None or self.node_score <= 0:
             return False

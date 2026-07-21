@@ -24,10 +24,25 @@ class RunConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    agent_model: str = "deepseek/deepseek-chat"
+    # BUG-24: every chat() call must use an explicit model. Even when all
+    # roles share the same model, each is recorded explicitly so experiments
+    # are reproducible. ``agent_model`` remains as an alias of ``solver_model``
+    # for backward compatibility with existing config files.
+    solver_model: str = "deepseek/deepseek-chat"
+    proposer_model: str = "deepseek/deepseek-chat"
     diagnose_model: str = "deepseek/deepseek-chat"
+    self_improve_model: str = "deepseek/deepseek-chat"
     temperature: float = 0.0
     max_tokens: int = 32768
+
+    @property
+    def agent_model(self) -> str:
+        """Backward-compatible alias for ``solver_model``."""
+        return self.solver_model
+
+    @property
+    def agent_model_set(self) -> bool:
+        return True
 
 
 @dataclass(frozen=True)
@@ -72,6 +87,20 @@ class TaskSourceQuota:
 
 
 @dataclass(frozen=True)
+class SelectionConfig:
+    """Parent selection strategy configuration.
+
+    strategy: "thompson_sampling" (default, main experiment) or
+        "epsilon_greedy" (ablation only).
+    num_pseudo_descendant_evals: HGM-style pseudo-descendant count used to
+        stabilize the Beta posterior when a node has many measurements.
+    """
+    strategy: str = "thompson_sampling"
+    num_pseudo_descendant_evals: int = 10
+    epsilon: float = 0.1
+
+
+@dataclass(frozen=True)
 class ScoringConfig:
     regression_threshold: float = 0.8
     regression_weight: float = 0.5
@@ -85,6 +114,7 @@ class ScoringConfig:
     hgm_valid_yield_threshold: float = 0.20
     hgm_causal_ablation_pass_threshold: float = 0.50
     hgm_difficulty_min: float = 0.30
+    selection: SelectionConfig = field(default_factory=SelectionConfig)
 
 
 @dataclass(frozen=True)
@@ -233,6 +263,28 @@ def _build_subconfig(key: str, data: Any) -> Any:
             src = TaskSourceConfig(parent_failure=pf, current_child_level1=cc)
         data = {k: v for k, v in data.items() if k != "sources"}
         data["sources"] = src
+    if key == "scoring":
+        sel_data = data.get("selection", {})
+        if sel_data is not None and not isinstance(sel_data, dict):
+            raise ConfigError("scoring.selection must be a mapping")
+        valid_sel_keys = {f.name for f in fields(SelectionConfig)}
+        filtered_sel = {k: v for k, v in (sel_data or {}).items() if k in valid_sel_keys}
+        data = {k: v for k, v in data.items() if k != "selection"}
+        data["selection"] = SelectionConfig(**filtered_sel)
+    if key == "models":
+        # BUG-24: backward compatibility -- legacy configs may still specify
+        # ``agent_model``. Map it onto ``solver_model`` (and, when the new
+        # explicit fields are absent, propagate to proposer / self_improve so
+        # every chat() call still has an explicit model).
+        if "agent_model" in data and "solver_model" not in data:
+            data["solver_model"] = data.pop("agent_model")
+        else:
+            data.pop("agent_model", None)
+        solver = data.get("solver_model")
+        if solver:
+            data.setdefault("proposer_model", solver)
+            data.setdefault("diagnose_model", solver)
+            data.setdefault("self_improve_model", solver)
     valid_keys = {f.name for f in fields(cls)}
     filtered = {k: v for k, v in data.items() if k in valid_keys}
     return cls(**filtered)

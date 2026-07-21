@@ -86,12 +86,41 @@ class NodeProposerRunner:
             if self.execution_backend is not None:
                 # Phase 9: run via the unified ExecutionBackend (subprocess or
                 # apptainer). The backend handles cwd/env/timeout uniformly.
-                result = self.execution_backend.run(
-                    command=command,
-                    cwd=Path(node_code),
-                    env=env,
-                    timeout_sec=self.timeout_sec,
-                )
+                # BUG-14/15: under Apptainer, pass the standard mount layout
+                # as binds so the proposer child process sees /agent, /outputs,
+                # /control inside the container.
+                from ..execution.apptainer import ApptainerRunner
+
+                if isinstance(self.execution_backend, ApptainerRunner):
+                    binds = {
+                        Path(node_code): "/agent",
+                        Path(request.output_dir): "/outputs",
+                    }
+                    request_arg = "/outputs/proposer_request.json"
+                    output_arg = "/outputs"
+                    container_command = [
+                        "python",
+                        "-m",
+                        "proposer.proposer_main",
+                        "--request",
+                        request_arg,
+                        "--output_dir",
+                        output_arg,
+                    ]
+                    result = self.execution_backend.run(
+                        command=container_command,
+                        cwd=Path(node_code),
+                        env=env,
+                        timeout_sec=self.timeout_sec,
+                        binds=binds,
+                    )
+                else:
+                    result = self.execution_backend.run(
+                        command=command,
+                        cwd=Path(node_code),
+                        env=env,
+                        timeout_sec=self.timeout_sec,
+                    )
                 stdout_path.write_text(result.stdout, encoding="utf-8")
                 stderr_path.write_text(result.stderr, encoding="utf-8")
             else:
@@ -128,12 +157,16 @@ class NodeProposerRunner:
                     f"exit={result.returncode}; stderr={stderr_tail}"
                 )
 
-            # Importing this schema in the controller is safe: it is only a
-            # transport type. All intelligent policy ran in the child process.
-            from initial_agent.src.proposer.request import ProposerResult
+            # BUG-25: parse the proposer result with the TRUSTED transport
+            # schema, not the evolvable ``initial_agent.src.proposer.request``
+            # ProposerResult. A child node can self-edit
+            # ``proposer/request.py``; the trusted schema in
+            # ``src/godel0/schemas/proposer_transport.py`` is protected by
+            # PatchGuard and cannot be self-edited.
+            from ..schemas.proposer_transport import ProposerResultV1
 
             data = json.loads(result_path.read_text(encoding="utf-8"))
-            result_obj = ProposerResult.from_dict(data)
+            result_obj = ProposerResultV1.from_dict(data)
             if result.returncode not in (0, 1) and not result_obj.error:
                 result_obj.error = stderr_path.read_text(
                     encoding="utf-8", errors="replace"

@@ -142,6 +142,14 @@ class SolverEvaluationRunner:
             outcome.task_id,
             outcome.level,
         )
+        # BUG-07: persist the solver patch as a real file and record its path on
+        # the outcome so downstream stats (empty_patch / test_only) can read it.
+        # Previously the patch only lived inside trajectory_eval.json and
+        # outcome.patch_path was always "", so every task looked empty.
+        if solver_patch.strip():
+            patch_file = artifact_dir / "model_patch.diff"
+            patch_file.write_text(solver_patch, encoding="utf-8")
+            outcome.patch_path = str(patch_file)
         data = outcome.model_dump(mode="json")
         data.update(
             {

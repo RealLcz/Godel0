@@ -74,14 +74,40 @@ class ProposerRunner:
         self,
         agent_adapter: Optional[AgentAdapter] = None,
         engine: Optional[EngineLike] = None,
+        workflow: Any = None,
     ) -> None:
         self.agent_adapter = agent_adapter
         self.engine = engine
+        # BUG-02/03: route every non-bootstrap plan through RepoChainWorkflow
+        # so the runtime actually exercises the RepoChain stages instead of
+        # going straight to SWESmithEngine.generate(). When ``workflow`` is
+        # None we lazily build a default RepoChainWorkflow wrapping the engine.
+        self._workflow = workflow
         self.trajectory_analyzer = TrajectoryAnalyzer()
         self.code_locator = CodeLocator()
         self.planner = ProposerPlanner(code_locator=self.code_locator)
         self.feedback_processor = CandidateFeedbackProcessor()
         self.statement_generator = StatementGenerator()
+
+    @property
+    def workflow(self):
+        """Lazily instantiate the default RepoChainWorkflow."""
+        if self._workflow is None:
+            try:
+                from proposer.workflows.repo_chain import RepoChainWorkflow
+
+                self._workflow = RepoChainWorkflow(
+                    agent_adapter=self.agent_adapter,
+                    engine=self.engine,
+                    trajectory_analyzer=self.trajectory_analyzer,
+                    code_locator=self.code_locator,
+                )
+            except Exception:
+                # If RepoChainWorkflow cannot be built, fall back to calling
+                # the engine directly so the proposer remains usable in tests
+                # that inject a stub engine.
+                self._workflow = None
+        return self._workflow
 
     def generate_batch(self, request: ProposerRequest) -> ProposerResult:
         result = ProposerResult.new_for(request)
@@ -189,10 +215,18 @@ class ProposerRunner:
         """Generate bootstrap candidates from a capability prior.
 
         Used when ``request.bootstrap`` is True and there are no solver
-        trajectories (root node). Delegates to RepoChainWorkflow.bootstrap.
+        trajectories (root node). Routes through RepoChainWorkflow.bootstrap so
+        the root T_0 is produced by the RepoChain workflow (stages 2-8), not by
+        a raw lm_modify plan. BUG-04/05: previously this called
+        ``build_bootstrap_plans([], repo_spec)`` (empty prior -> 0 plans) and
+        then ran each plan through ``engine.generate`` (lm_modify backend),
+        bypassing RepoChain entirely.
         """
         try:
-            from proposer.workflows.repo_chain.bootstrap import build_bootstrap_plans
+            from proposer.workflows.repo_chain import RepoChainWorkflow
+            from proposer.workflows.repo_chain.bootstrap import (
+                BOOTSTRAP_CAPABILITY_PRIOR,
+            )
         except Exception:
             return []
         if not request.repo_specs:
@@ -202,21 +236,31 @@ class ProposerRunner:
             repo_id=spec.repo_id,
             repo_dir=spec.path,
             base_commit=spec.base_commit,
+            test_command=spec.test_command,
         )
-        plans = build_bootstrap_plans([], repo_spec)
-        candidates: List[CandidateArtifact] = []
+        workflow = RepoChainWorkflow(
+            agent_adapter=self.agent_adapter,
+            engine=self.engine,
+            trajectory_analyzer=self.trajectory_analyzer,
+            code_locator=self.code_locator,
+        )
         cand_dir = os.path.join(request.output_dir, "proposer_candidates", "bootstrap")
         os.makedirs(cand_dir, exist_ok=True)
-        for plan in plans:
-            plan.model = request.model
-            plan.seed = request.generation_attempt * 1000 + len(candidates) + 1
-            produced = self.engine.generate(
-                plan=plan,
-                node_code_dir=request.agent_code_dir,
-                repo_spec=repo_spec,
-                output_dir=cand_dir,
-            )
-            candidates.extend(produced)
+        candidates = workflow.bootstrap(
+            repo_spec=repo_spec,
+            output_dir=cand_dir,
+            capability_prior=BOOTSTRAP_CAPABILITY_PRIOR,
+        )
+        # Stamp each candidate with the request model / plan id metadata so the
+        # downstream commit step has the provenance it expects.
+        for index, cand in enumerate(candidates):
+            if hasattr(cand, "plan_id") and not cand.plan_id:
+                cand.plan_id = f"bootstrap-{index}"
+            if hasattr(cand, "generation_metadata") and isinstance(
+                cand.generation_metadata, dict
+            ):
+                cand.generation_metadata.setdefault("bootstrap", True)
+                cand.generation_metadata.setdefault("source_type", "bootstrap")
         return candidates
 
     def _build_repo_index(self, request: ProposerRequest) -> RepoIndex:
@@ -272,6 +316,7 @@ class ProposerRunner:
         if self.engine is None:
             return candidates
         repo_spec = RepoSpec.from_index(repo_index)
+        workflow = self.workflow
         for plan in plans:
             if len(candidates) >= request.max_candidates:
                 break
@@ -295,12 +340,26 @@ class ProposerRunner:
             os.makedirs(cand_dir, exist_ok=True)
             self._write_plan(cand_dir, plan)
             try:
-                produced = self.engine.generate(
-                    plan=plan,
-                    node_code_dir=request.agent_code_dir,
-                    repo_spec=repo_spec,
-                    output_dir=cand_dir,
-                )
+                # BUG-02/03: route through RepoChainWorkflow so the stages
+                # (weakness -> transfer -> chain discovery -> contract ->
+                # mutation -> ablation) actually run. The workflow delegates
+                # the heavy lifting to its backing RepoChainGenerator. When no
+                # workflow is available (e.g. stub engines in unit tests) we
+                # fall back to the raw engine so the contract is preserved.
+                if workflow is not None:
+                    produced = workflow.generate(
+                        plan=plan,
+                        node_code_dir=request.agent_code_dir,
+                        repo_spec=repo_spec,
+                        output_dir=cand_dir,
+                    )
+                else:
+                    produced = self.engine.generate(
+                        plan=plan,
+                        node_code_dir=request.agent_code_dir,
+                        repo_spec=repo_spec,
+                        output_dir=cand_dir,
+                    )
             except Exception as exc:
                 rejection = str(
                     getattr(getattr(self.engine, "repo_chain", None), "last_rejection", "")
@@ -383,9 +442,25 @@ class ProposerRunner:
             generation_trajectory=list(data.get("generation_trajectory") or []),
             modified_files=modified_files,
             modified_entities=modified_entities,
-            generation_metadata=dict(data.get("generation_metadata") or {}),
+            generation_metadata=self._stamp_provenance(data, plan),
             status=str(data.get("status") or "pending_validation"),
         )
+
+    def _stamp_provenance(self, data: dict, plan: BugGenerationPlan) -> dict:
+        """BUG-09: stamp source_trajectory_ids / source_type onto metadata.
+
+        The plan already carries ``source_trajectory_ids`` (from the
+        trajectory analyzer). We copy them onto the candidate's
+        ``generation_metadata`` so the trusted ``TaskBatchBuilder`` can
+        classify the source without re-reading the plan.
+        """
+        metadata = dict(data.get("generation_metadata") or {})
+        ids = list(plan.source_trajectory_ids or [])
+        if ids:
+            metadata.setdefault("source_trajectory_ids", ids)
+        metadata.setdefault("source_node", getattr(plan, "reference_parent", "") or "")
+        metadata.setdefault("plan_id", plan.plan_id)
+        return metadata
 
     def _write_plan(self, cand_dir: str, plan: BugGenerationPlan) -> None:
         path = os.path.join(cand_dir, "plan.json")

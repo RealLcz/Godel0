@@ -44,11 +44,17 @@ class SolverSpecialDetector:
         stochastic_task_count: int = 0,
         repeated_tool_loop_count: int = 0,
         localization_collapse_count: int = 0,
+        solver_rollouts: int = 0,
+        tasks_with_multiple_rollouts: int = 0,
         config: dict = None,
     ) -> List[SpecialAlert]:
         alerts: List[SpecialAlert] = []
         config = config or {}
         empty_ratio_threshold = config.get("solver_empty_patch_ratio", 0.10)
+        # BUG-21: stochasticity alert only fires when we actually have enough
+        # rollouts to measure stability. ``solver_stochasticity_min_rollouts``
+        # defaults to 3 in SpecialCaseConfig.
+        min_rollouts = int(config.get("solver_stochasticity_min_rollouts", 3))
         solver_stats = summary.solver_special_stats or {}
 
         if evaluated_count > 0 and empty_patch_count / evaluated_count >= empty_ratio_threshold:
@@ -109,7 +115,13 @@ class SolverSpecialDetector:
                 recommended_attention="Solver hits context window limits",
             ))
 
-        if evaluated_count > 0 and stochastic_task_count / evaluated_count >= 0.3:
+        if (
+            evaluated_count > 0
+            and stochastic_task_count / evaluated_count >= 0.3
+            # BUG-21: suppress stochasticity alert when we don't have enough
+            # rollouts to actually measure stability.
+            and solver_rollouts >= min_rollouts
+        ):
             alerts.append(SpecialAlert(
                 alert_id="solver_stochasticity",
                 alert_type="solver_stochasticity",

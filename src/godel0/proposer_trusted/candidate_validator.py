@@ -44,6 +44,7 @@ class CandidateValidator:
         max_patch_lines: int = 80,
         forbid_test_file_edits: bool = True,
         duplicate_detector: Optional[DuplicateDetector] = None,
+        execution_backend=None,
     ):
         self.workspace_root = Path(workspace_root)
         self.workspace_root.mkdir(parents=True, exist_ok=True)
@@ -51,6 +52,11 @@ class CandidateValidator:
         self.max_patch_lines = max_patch_lines
         self.forbid_test_file_edits = forbid_test_file_edits
         self.duplicate_detector = duplicate_detector or DuplicateDetector()
+        # BUG-15/10.8: trusted repository tests (clean, bugged, reverse, F2P,
+        # P2P, causal ablation) run through the same ExecutionBackend so the
+        # whole chain is end-to-end Apptainer. When None, fall back to direct
+        # subprocess (backward compatible).
+        self.execution_backend = execution_backend
 
     def validate(
         self,
@@ -422,7 +428,38 @@ class CandidateValidator:
         return " ".join(filtered + ["-v"])
 
     def _run_tests(self, repo_path: Path, test_command: str) -> dict:
-        """Run a test command and return results."""
+        """Run a test command and return results.
+
+        BUG-15/10.8: route through the ExecutionBackend when one is configured
+        so trusted repository tests also run inside Apptainer (end-to-end
+        chain). Falls back to direct subprocess for backward compatibility.
+        """
+        if self.execution_backend is not None:
+            try:
+                import shlex as _shlex
+
+                parts = _shlex.split(test_command) if isinstance(test_command, str) else list(test_command)
+                binds = {Path(repo_path): "/workspace"}
+                result = self.execution_backend.run(
+                    command=parts,
+                    cwd=Path(repo_path),
+                    env={},
+                    timeout_sec=self.test_timeout_sec,
+                    binds=binds,
+                )
+                return {
+                    "returncode": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "timed_out": result.timed_out,
+                }
+            except Exception as e:
+                return {
+                    "returncode": -1,
+                    "stdout": "",
+                    "stderr": str(e),
+                    "timed_out": False,
+                }
         try:
             result = subprocess.run(
                 test_command,

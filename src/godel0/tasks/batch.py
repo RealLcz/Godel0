@@ -80,6 +80,8 @@ class TaskBatchBuilder:
         run_id: str = "run",
         task_store_dir: str = "./task_store",
         bootstrap: bool = False,
+        parent_failure_trajectories: Optional[List[str]] = None,
+        current_child_level1_trajectories: Optional[List[str]] = None,
     ) -> TaskBatchResult:
         """Build a task batch from the repo pool through validation.
 
@@ -96,12 +98,40 @@ class TaskBatchBuilder:
             model: LLM model to use.
             run_id: Run ID.
             task_store_dir: Path to the task store.
+            parent_failure_trajectories: BUG-08/09 parent Level2 unresolved
+                trajectories. When populated, the builder enforces the
+                ``parent_failure`` quota against this bucket.
+            current_child_level1_trajectories: BUG-08/09 current-child Level1
+                unresolved/forgotten trajectories. When populated, the builder
+                enforces the ``current_child_level1`` quota against this bucket.
 
         Returns:
             TaskBatchResult with committed tasks and statistics.
         """
         batch_id = f"batch_{uuid.uuid4().hex[:8]}"
         result = TaskBatchResult(batch_id=batch_id, node_id=node_id)
+
+        # BUG-08/09: 5+5 quota with dynamic fallback. Prefer the split
+        # trajectory buckets when available; otherwise fall back to the flat
+        # list. ``source_counts`` tracks how many accepted tasks come from
+        # each source so we can stop accepting a source once it is full and
+        # reallocate the remainder to the other source (5+5 -> 4+6 -> ...).
+        parent_failure_trajectories = list(parent_failure_trajectories or [])
+        current_child_level1_trajectories = list(current_child_level1_trajectories or [])
+        if not parent_failure_trajectories and not current_child_level1_trajectories:
+            parent_failure_trajectories = list(solver_trajectories or [])
+
+        quotas = {
+            "parent_failure": int(self.source_quotas.get("parent_failure", 0) or 0),
+            "current_child_level1": int(self.source_quotas.get("current_child_level1", 0) or 0),
+        }
+        # When quotas are not configured, fall back to an even split.
+        if sum(quotas.values()) == 0:
+            half = max(1, self.batch_size // 2)
+            quotas = {"parent_failure": half, "current_child_level1": self.batch_size - half}
+        source_counts = {"parent_failure": 0, "current_child_level1": 0, "bootstrap": 0}
+        quota_fallback_log: list[dict] = []
+
 
         if repo_pool is None or proposer_runner is None:
             # Without a repo pool or proposer, return empty batch
@@ -130,6 +160,14 @@ class TaskBatchBuilder:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         from initial_agent.src.proposer.request import ProposerRequest, RepoSpecInfo
+        # BUG-08/09: pass the split trajectory buckets so the proposer can tag
+        # each plan with its source type. ``solver_trajectories`` remains the
+        # union for backward compatibility with proposer code that still reads
+        # only that field.
+        combined_trajectories = list(solver_trajectories or [])
+        for value in parent_failure_trajectories + current_child_level1_trajectories:
+            if value not in combined_trajectories:
+                combined_trajectories.append(value)
         request = ProposerRequest(
             node_id=node_id,
             run_id=run_id,
@@ -140,7 +178,13 @@ class TaskBatchBuilder:
             target_batch_size=self.batch_size,
             max_candidates=self.max_candidates,
             solver_trajectories=[
-                str(Path(value).resolve()) for value in (solver_trajectories or [])
+                str(Path(value).resolve()) for value in combined_trajectories
+            ],
+            parent_failure_trajectories=[
+                str(Path(value).resolve()) for value in parent_failure_trajectories
+            ],
+            current_child_level1_trajectories=[
+                str(Path(value).resolve()) for value in current_child_level1_trajectories
             ],
             parent_task_ids=parent_task_ids or [],
             model=model,
@@ -294,11 +338,41 @@ class TaskBatchBuilder:
                 )
 
                 if report.passed and task_committer:
-                    # Phase 6: tag the task with its source type based on
-                    # which trajectory it was conditioned on.
-                    source_type = self._classify_source(
-                        cand, solver_trajectories or [], parent_task_ids or []
+                    # BUG-08/09: classify the candidate against the split
+                    # trajectory buckets and enforce the 5+5 quota with
+                    # dynamic fallback (5+5 -> 4+6 -> ...).
+                    source_type, source_trajectory = self._classify_source_v2(
+                        cand,
+                        parent_failure_trajectories,
+                        current_child_level1_trajectories,
+                        parent_task_ids or [],
+                        bootstrap=bootstrap,
                     )
+                    if not self._accepts_source(
+                        source_type, source_counts, quotas, self.batch_size
+                    ):
+                        # Quota for this source is full and the other source
+                        # has not yet donated its fallback surplus. Skip but
+                        # record the candidate so a later fallback can accept
+                        # it if the other source underfills.
+                        result.rejected_candidates += 1
+                        result.rejection_reasons[
+                            f"quota_full:{source_type}"
+                        ] = result.rejection_reasons.get(
+                            f"quota_full:{source_type}", 0
+                        ) + 1
+                        continue
+                    # Record fallback whenever we accept a source past its
+                    # nominal quota.
+                    nominal = quotas.get(source_type, 0)
+                    if nominal and source_counts[source_type] >= nominal:
+                        quota_fallback_log.append({
+                            "candidate_id": cand.candidate_id,
+                            "source_type": source_type,
+                            "nominal_quota": nominal,
+                            "accepted_so_far": source_counts[source_type] + 1,
+                            "reason": "other_source_underfilled",
+                        })
                     task = task_committer.commit_task(
                         batch_id=batch_id,
                         proposer_node_id=node_id,
@@ -315,10 +389,12 @@ class TaskBatchBuilder:
                         validation_report=report_data,
                         setup_patch=setup_patch,
                         source_node=node_id,
-                        source_trajectory="",
+                        # BUG-09: persist the real trajectory id instead of "".
+                        source_trajectory=source_trajectory,
                         source_type=source_type,
                     )
                     result.tasks.append(task)
+                    source_counts[source_type] = source_counts.get(source_type, 0) + 1
                 else:
                     result.rejected_candidates += 1
                     for reason in report.rejection_reasons:
@@ -331,6 +407,18 @@ class TaskBatchBuilder:
                 break
 
         result.complete = len(result.tasks) >= self.batch_size
+        # BUG-08/09: persist quota fallback metadata so the run is auditable.
+        try:
+            atomic_write_json(
+                output_dir / "quota_summary.json",
+                {
+                    "quotas": quotas,
+                    "source_counts": source_counts,
+                    "fallback_events": quota_fallback_log,
+                },
+            )
+        except Exception:
+            pass
         return result
 
     def _normalize_candidate(
@@ -444,6 +532,91 @@ class TaskBatchBuilder:
         if solver_trajectories:
             return "parent_failure"
         return "current_child_level1"
+
+    def _classify_source_v2(
+        self,
+        candidate: Any,
+        parent_failure_trajectories: List[str],
+        current_child_level1_trajectories: List[str],
+        parent_task_ids: List[str],
+        bootstrap: bool = False,
+    ) -> tuple[str, str]:
+        """BUG-09: classify a candidate against the split trajectory buckets.
+
+        Returns ``(source_type, source_trajectory)`` where ``source_type`` is
+        one of ``parent_failure``, ``current_child_level1``, or ``bootstrap``,
+        and ``source_trajectory`` is the concrete trajectory id/path the
+        candidate was conditioned on (empty only for bootstrap).
+        """
+        cand_dict = self._candidate_dict(candidate)
+        source_traj_ids: list[str] = []
+        if isinstance(cand_dict.get("generation_metadata"), dict):
+            source_traj_ids = list(
+                cand_dict["generation_metadata"].get("source_trajectory_ids") or []
+            )
+
+        if bootstrap and not parent_failure_trajectories and not current_child_level1_trajectories:
+            return "bootstrap", ""
+
+        def _match(traj_id: str, bucket: List[str]) -> bool:
+            for path in bucket:
+                if traj_id and (traj_id in path or path in traj_id or traj_id == path):
+                    return True
+            return False
+
+        if source_traj_ids:
+            for traj_id in source_traj_ids:
+                if _match(traj_id, parent_failure_trajectories):
+                    return "parent_failure", str(traj_id)
+            for traj_id in source_traj_ids:
+                if _match(traj_id, current_child_level1_trajectories):
+                    return "current_child_level1", str(traj_id)
+            # Unknown trajectory id; default by which bucket is non-empty.
+            if parent_failure_trajectories:
+                return "parent_failure", str(source_traj_ids[0])
+            if current_child_level1_trajectories:
+                return "current_child_level1", str(source_traj_ids[0])
+            return "bootstrap", str(source_traj_ids[0])
+
+        # No explicit trajectory id; infer from non-empty buckets.
+        if parent_failure_trajectories:
+            return "parent_failure", str(parent_failure_trajectories[0])
+        if current_child_level1_trajectories:
+            return "current_child_level1", str(current_child_level1_trajectories[0])
+        return "bootstrap", ""
+
+    @staticmethod
+    def _accepts_source(
+        source_type: str,
+        source_counts: dict,
+        quotas: dict,
+        batch_size: int,
+    ) -> bool:
+        """BUG-08: 5+5 quota with dynamic fallback.
+
+        A source is accepted when either:
+        - Its count is below its nominal quota, OR
+        - The other source has already filled its nominal quota and the
+          batch is still not full (dynamic fallback 5+5 -> 4+6 -> ...).
+        """
+        if source_type == "bootstrap":
+            return True
+        nominal = int(quotas.get(source_type, 0) or 0)
+        if nominal and source_counts.get(source_type, 0) < nominal:
+            return True
+        # Fallback: only accept past quota if the other source is full and
+        # the batch still has room.
+        total = sum(v for k, v in source_counts.items() if k != "bootstrap")
+        if total >= batch_size:
+            return False
+        other = "current_child_level1" if source_type == "parent_failure" else "parent_failure"
+        other_nominal = int(quotas.get(other, 0) or 0)
+        other_count = source_counts.get(other, 0)
+        if other_nominal and other_count >= other_nominal:
+            return True
+        # If the other source has no trajectory bucket at all, allow fallback.
+        return False
+
 
     def _trusted_test_command(
         self,

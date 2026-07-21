@@ -70,17 +70,44 @@ class CommonAgentAdapter:
         request.outdir.mkdir(parents=True, exist_ok=True)
         request.chat_history_file.parent.mkdir(parents=True, exist_ok=True)
 
-        command = [
-            sys.executable,
-            str(coding_agent),
-            "--problem_statement", request.problem_statement,
-            "--git_dir", str(request.git_dir),
-            "--base_commit", request.base_commit,
-            "--chat_history_file", str(request.chat_history_file),
-            "--outdir", str(request.outdir),
-            "--model", request.model,
-            "--timeout", str(request.timeout_sec),
-        ]
+        # BUG-14/15: build the command with container paths when running under
+        # Apptainer, host paths when running under SubprocessRunner. The
+        # ``isinstance`` branch is gone; the backend's ``run()`` is polymorphic.
+        from godel0.execution.apptainer import ApptainerRunner
+
+        is_apptainer = isinstance(self.execution_backend, ApptainerRunner)
+        if is_apptainer:
+            # BUG-14: only reference container paths inside the container.
+            git_dir_arg = "/workspace"
+            outdir_arg = "/outputs"
+            chat_history_arg = "/logs/" + Path(request.chat_history_file).name
+            coding_agent_arg = "/agent/coding_agent.py"
+            # Under apptainer we must use the container's python interpreter.
+            command = [
+                "python",
+                coding_agent_arg,
+                "--problem_statement", request.problem_statement,
+                "--git_dir", git_dir_arg,
+                "--base_commit", request.base_commit,
+                "--chat_history_file", chat_history_arg,
+                "--outdir", outdir_arg,
+                "--model", request.model,
+                "--timeout", str(request.timeout_sec),
+            ]
+            cwd = agent_src
+        else:
+            command = [
+                sys.executable,
+                str(coding_agent),
+                "--problem_statement", request.problem_statement,
+                "--git_dir", str(request.git_dir),
+                "--base_commit", request.base_commit,
+                "--chat_history_file", str(request.chat_history_file),
+                "--outdir", str(request.outdir),
+                "--model", request.model,
+                "--timeout", str(request.timeout_sec),
+            ]
+            cwd = Path(request.git_dir)
 
         if request.test_description:
             command.extend(["--test_description", request.test_description])
@@ -102,14 +129,9 @@ class CommonAgentAdapter:
         )
         env.update(request.extra_env)
 
-        if isinstance(self.execution_backend, SubprocessRunner):
-            result = self.execution_backend.run(
-                command=command,
-                cwd=request.git_dir,
-                env=env,
-                timeout_sec=request.timeout_sec + 60,
-            )
-        else:
+        if is_apptainer:
+            # BUG-14: standard mount layout. Host paths are bound to their
+            # container mount points; the runner rewrites cwd automatically.
             binds = {
                 agent_src: "/agent:ro",
                 request.git_dir: "/workspace",
@@ -119,10 +141,17 @@ class CommonAgentAdapter:
                 binds[request.chat_history_file.parent] = "/logs"
             result = self.execution_backend.run(
                 command=command,
-                cwd=agent_src,
+                cwd=cwd,
                 env=env,
                 timeout_sec=request.timeout_sec + 60,
                 binds=binds,
+            )
+        else:
+            result = self.execution_backend.run(
+                command=command,
+                cwd=cwd,
+                env=env,
+                timeout_sec=request.timeout_sec + 60,
             )
 
         patch_path = request.outdir / "model_patch.diff"
