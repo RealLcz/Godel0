@@ -37,6 +37,9 @@ class TaskCommitter:
         oracle_patch: str = "",
         setup_patch: str = "",
         solver_test_command: str = "",
+        source_node: str = "",
+        source_trajectory: str = "",
+        source_type: str = "",
     ) -> TaskRecord:
         """Create and commit a new task."""
         task_id = f"task_{uuid.uuid4().hex[:12]}"
@@ -71,6 +74,9 @@ class TaskCommitter:
             safety_valid=True,
             duplicate_valid=True,
             content_hash=hashlib.sha256(bug_patch.encode()).hexdigest(),
+            source_node=source_node,
+            source_trajectory=source_trajectory,
+            source_type=source_type,
         )
 
         artifacts = TaskArtifacts(

@@ -21,7 +21,7 @@ class TestSolverSpecialDetector:
             empty_patch_count=3,
             evaluated_count=10,
         )
-        empty_alerts = [a for a in alerts if a.alert_type == "solver_empty_patches"]
+        empty_alerts = [a for a in alerts if a.alert_type == "solver_empty_patch"]
         assert len(empty_alerts) == 1
         assert empty_alerts[0].priority == AlertPriority.HIGH
 
@@ -70,7 +70,7 @@ class TestProposerSpecialDetector:
             proposer_requested_tasks=10,
         )
         alerts = detector.detect(summary)
-        yield_alerts = [a for a in alerts if a.alert_type == "proposer_low_valid_yield"]
+        yield_alerts = [a for a in alerts if a.alert_type == "low_valid_yield"]
         assert len(yield_alerts) == 1
 
     def test_difficulty_mismatch(self):
@@ -82,8 +82,63 @@ class TestProposerSpecialDetector:
             proposer_accepted_tasks=10,
         )
         alerts = detector.detect(summary)
-        diff_alerts = [a for a in alerts if a.alert_type == "proposer_difficulty_mismatch"]
+        diff_alerts = [a for a in alerts if a.alert_type == "difficulty_too_easy"]
         assert len(diff_alerts) >= 1
+
+    def test_causal_ablation_failure(self):
+        detector = ProposerSpecialDetector()
+        summary = NodeCycleSummary(node_id="test")
+        alerts = detector.detect(
+            summary,
+            proposer_stats={"causal_ablation_failure_count": 5},
+        )
+        causal_alerts = [a for a in alerts if a.alert_type == "causal_ablation_failure"]
+        assert len(causal_alerts) == 1
+        assert causal_alerts[0].priority == AlertPriority.CRITICAL
+
+    def test_no_f2p_dominant(self):
+        detector = ProposerSpecialDetector()
+        summary = NodeCycleSummary(
+            node_id="test",
+            proposer_rejection_distribution={"no_f2p": 31, "empty_patch": 5},
+        )
+        alerts = detector.detect(summary)
+        no_f2p_alerts = [a for a in alerts if a.alert_type == "no_f2p_dominant"]
+        assert len(no_f2p_alerts) == 1
+
+    def test_statement_leakage(self):
+        detector = ProposerSpecialDetector()
+        summary = NodeCycleSummary(node_id="test")
+        alerts = detector.detect(
+            summary,
+            proposer_stats={"statement_leakage_count": 3},
+        )
+        leakage_alerts = [a for a in alerts if a.alert_type == "statement_leakage"]
+        assert len(leakage_alerts) == 1
+
+
+class TestSolverSpecialDetectorExtended:
+    def test_timeout_detection(self):
+        detector = SolverSpecialDetector()
+        summary = NodeCycleSummary(node_id="test")
+        alerts = detector.detect(
+            summary,
+            timeout_count=5,
+            evaluated_count=10,
+        )
+        timeout_alerts = [a for a in alerts if a.alert_type == "solver_timeout"]
+        assert len(timeout_alerts) == 1
+
+    def test_test_only_patch_detection(self):
+        detector = SolverSpecialDetector()
+        summary = NodeCycleSummary(node_id="test")
+        alerts = detector.detect(
+            summary,
+            test_only_patch_count=4,
+            evaluated_count=10,
+        )
+        test_only_alerts = [a for a in alerts if a.alert_type == "solver_test_only_patch"]
+        assert len(test_only_alerts) == 1
 
 
 class TestCompositeDetector:

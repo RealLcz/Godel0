@@ -92,6 +92,16 @@ class ProposerRunner:
             result.failure_signatures = [s.model_dump() for s in signatures]
 
             if not signatures:
+                if getattr(request, "bootstrap", False):
+                    # Root bootstrap: no solver trajectories yet. Generate T_0
+                    # from a capability prior via RepoChainWorkflow.bootstrap.
+                    candidates = self._bootstrap_candidates(request)
+                    self._write_candidates(request, candidates, [])
+                    for cand in candidates:
+                        result.add_candidate(cand, accepted=True)
+                        result.add_pending_candidate(cand)
+                    result.completed = len(candidates) > 0
+                    return result
                 result.completed = True
                 return result
 
@@ -175,6 +185,40 @@ class ProposerRunner:
                 outcomes.append(EvaluationOutcomeView(trajectory_id=traj.trajectory_id))
         return outcomes
 
+    def _bootstrap_candidates(self, request: ProposerRequest) -> List[CandidateArtifact]:
+        """Generate bootstrap candidates from a capability prior.
+
+        Used when ``request.bootstrap`` is True and there are no solver
+        trajectories (root node). Delegates to RepoChainWorkflow.bootstrap.
+        """
+        try:
+            from proposer.workflows.repo_chain.bootstrap import build_bootstrap_plans
+        except Exception:
+            return []
+        if not request.repo_specs:
+            return []
+        spec = request.repo_specs[0]
+        repo_spec = RepoSpec(
+            repo_id=spec.repo_id,
+            repo_dir=spec.path,
+            base_commit=spec.base_commit,
+        )
+        plans = build_bootstrap_plans([], repo_spec)
+        candidates: List[CandidateArtifact] = []
+        cand_dir = os.path.join(request.output_dir, "proposer_candidates", "bootstrap")
+        os.makedirs(cand_dir, exist_ok=True)
+        for plan in plans:
+            plan.model = request.model
+            plan.seed = request.generation_attempt * 1000 + len(candidates) + 1
+            produced = self.engine.generate(
+                plan=plan,
+                node_code_dir=request.agent_code_dir,
+                repo_spec=repo_spec,
+                output_dir=cand_dir,
+            )
+            candidates.extend(produced)
+        return candidates
+
     def _build_repo_index(self, request: ProposerRequest) -> RepoIndex:
         """Build a RepoIndex from the repo_specs carried in the request.
 
@@ -185,11 +229,11 @@ class ProposerRunner:
         # Prefer explicit repo_specs from the request
         if request.repo_specs:
             spec = request.repo_specs[0]
-            # Determine source_dirs: for Ansible it's ["lib", "test/lib"],
-            # for a typical repo it's ["."]
-            source_dirs = ["."]
-            if "ansible" in spec.repo_id.lower():
-                source_dirs = ["lib", "test/lib"]
+            # Use RepoProfileRegistry to get source_dirs (no hardcoded checks).
+            from proposer.repo_profiles import get_profile
+
+            profile = get_profile(spec.repo_id)
+            source_dirs = profile.source_roots
             return RepoIndex.build(
                 repo_id=spec.repo_id,
                 repo_dir=spec.path,

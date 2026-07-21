@@ -38,8 +38,17 @@ evaluation:
   max_workers: 1
 
 proposer:
-  strategies:
-    repo_chain: 1.0
+  initial_workflow: repo_chain
+  repo_chain:
+    min_files: 2
+    max_files: 6
+    min_mutation_sites: 3
+    max_mutation_sites: 8
+    context_file_budget: 10
+    require_generated_contracts: true
+    require_causal_ablation: true
+    mutation_backends:
+      lm_modify: 1.0
   candidate_timeout_sec: 900
   max_patch_lines: 200
   forbid_test_file_edits: true

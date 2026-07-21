@@ -61,6 +61,7 @@ class ProposerRequest:
     feedback_dir: Optional[str] = None
     repo_specs: List[RepoSpecInfo] = field(default_factory=list)
     contract_test_renderer: str = ""
+    bootstrap: bool = False
 
     @classmethod
     def load(cls, path: str) -> "ProposerRequest":

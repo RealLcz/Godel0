@@ -47,9 +47,9 @@ class TestConfig:
             load_config("configs/default.yaml", overrides={"scoring.proposer_target_accuracy": 0.6})
 
     def test_proposer_strategies_sum(self):
-        """Strategy probabilities must sum to 1.0."""
+        """Mutation backend probabilities must sum to 1.0."""
         config = load_config("configs/default.yaml")
-        total = sum(config.proposer.strategies.values())
+        total = sum(config.proposer.repo_chain.mutation_backends.values())
         assert abs(total - 1.0) < 0.001
 
     def test_config_to_dict_roundtrip(self):

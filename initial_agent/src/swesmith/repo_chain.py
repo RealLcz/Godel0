@@ -191,6 +191,7 @@ class RepoChainGenerator:
     def __init__(self, agent_adapter: Any = None) -> None:
         self.agent_adapter = agent_adapter
         self.last_rejection = ""
+        self._current_repo_id = ""
 
     def generate(
         self,
@@ -200,6 +201,7 @@ class RepoChainGenerator:
         output_dir: str,
     ) -> List[CandidateArtifact]:
         self.last_rejection = ""
+        self._current_repo_id = getattr(repo_spec, "repo_id", "") or getattr(plan, "target_repo_id", "")
         if self.agent_adapter is None:
             self.last_rejection = "missing_agent_adapter"
             return []
@@ -1142,9 +1144,22 @@ class RepoChainGenerator:
         return selected
 
     def _python_module_path(self, root: Path, module: str) -> str:
-        if not module or not module.startswith("ansible"):
-            return ""
-        stem = "lib/" + module.replace(".", "/")
+        # Use RepoProfile to determine module prefix and path mapping
+        # (no hardcoded "ansible" check).
+        try:
+            from proposer.repo_profiles import get_profile
+
+            profile = get_profile(str(getattr(self, "_current_repo_id", "") or ""))
+            prefix = profile.module_prefix
+            if prefix and not module.startswith(prefix):
+                return ""
+            stem = profile.module_path(module)
+            if not stem:
+                return ""
+        except Exception:
+            if not module:
+                return ""
+            stem = module.replace(".", "/")
         for relative in (stem + ".py", stem + "/__init__.py"):
             if (root / relative).is_file():
                 return relative

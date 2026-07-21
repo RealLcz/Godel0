@@ -54,11 +54,16 @@ class TaskBatchBuilder:
         max_candidates: int = 50,
         strategy_weights: Optional[dict[str, float]] = None,
         contract_test_renderer: str = "",
+        source_quotas: Optional[dict] = None,
     ):
         self.batch_size = batch_size
         self.max_candidates = max_candidates
         self.strategy_weights = dict(strategy_weights or {})
         self.contract_test_renderer = str(contract_test_renderer or "")
+        # Phase 6: Task Source Quota. source_quotas is a dict like
+        # {"parent_failure": 5, "current_child_level1": 5}. When present, the
+        # builder tags each committed task with its source type.
+        self.source_quotas = dict(source_quotas or {})
 
     def build_for_node(
         self,
@@ -74,6 +79,7 @@ class TaskBatchBuilder:
         model: str = "deepseek/deepseek-chat",
         run_id: str = "run",
         task_store_dir: str = "./task_store",
+        bootstrap: bool = False,
     ) -> TaskBatchResult:
         """Build a task batch from the repo pool through validation.
 
@@ -152,6 +158,7 @@ class TaskBatchBuilder:
                 )
                 for r in repo_specs
             ],
+            bootstrap=bootstrap,
         )
 
         attempt = 0
@@ -287,6 +294,11 @@ class TaskBatchBuilder:
                 )
 
                 if report.passed and task_committer:
+                    # Phase 6: tag the task with its source type based on
+                    # which trajectory it was conditioned on.
+                    source_type = self._classify_source(
+                        cand, solver_trajectories or [], parent_task_ids or []
+                    )
                     task = task_committer.commit_task(
                         batch_id=batch_id,
                         proposer_node_id=node_id,
@@ -297,15 +309,14 @@ class TaskBatchBuilder:
                         problem_statement=problem_statement,
                         f2p_tests=report.f2p_tests,
                         baseline_test_command=generated_test_command,
-                        # The solver sees the repository's normal verification
-                        # command, never a hard-coded unrelated Ansible test or
-                        # the private generated contract path. Trusted scoring
-                        # still runs the exact F2P command above.
                         solver_test_command=str(repo_spec["test_command"]),
                         modified_files=cand.modified_files,
                         modified_entities=cand.modified_entities,
                         validation_report=report_data,
                         setup_patch=setup_patch,
+                        source_node=node_id,
+                        source_trajectory="",
+                        source_type=source_type,
                     )
                     result.tasks.append(task)
                 else:
@@ -402,6 +413,37 @@ class TaskBatchBuilder:
             if isinstance(data, dict):
                 return dict(data)
         return dict(getattr(candidate, "__dict__", {}))
+
+    def _classify_source(
+        self,
+        candidate: Any,
+        solver_trajectories: List[str],
+        parent_task_ids: List[str],
+    ) -> str:
+        """Classify a candidate's task source for Phase 6 quotas.
+
+        Returns "parent_failure" if the candidate was conditioned on a parent
+        trajectory, "current_child_level1" if conditioned on a current-child
+        Level 1 failure, or "bootstrap" if no trajectories were used.
+        """
+        cand_dict = self._candidate_dict(candidate)
+        plan_id = str(cand_dict.get("plan_id") or "")
+        source_traj_ids = []
+        if isinstance(cand_dict.get("generation_metadata"), dict):
+            source_traj_ids = list(
+                cand_dict["generation_metadata"].get("source_trajectory_ids") or []
+            )
+        if not solver_trajectories and not parent_task_ids:
+            return "bootstrap"
+        if source_traj_ids:
+            for traj in source_traj_ids:
+                if any(traj in path for path in solver_trajectories):
+                    return "parent_failure"
+            return "current_child_level1"
+        # Default: if we have parent trajectories, assume parent_failure.
+        if solver_trajectories:
+            return "parent_failure"
+        return "current_child_level1"
 
     def _trusted_test_command(
         self,

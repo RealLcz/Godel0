@@ -128,6 +128,58 @@ class TestEvidenceSelector:
         assert len(bundle.special_alerts) == 1
         assert bundle.special_alerts[0].alert_id == "critical_1"
 
+    def test_no_f2p_dominant_branch(self):
+        selector = CycleEvidenceSelector()
+        summary = NodeCycleSummary(node_id="test")
+        alerts = [
+            SpecialAlert(
+                alert_id="no_f2p",
+                alert_type="no_f2p_dominant",
+                source=AlertSource.PROPOSER,
+                priority=AlertPriority.HIGH,
+                triggered=True,
+                severity=0.8,
+                recommended_attention="No F2P",
+            )
+        ]
+        artifacts = {
+            "proposer_candidates": [{"no_f2p": True, "detail": "candidate failed f2p"}],
+            "chain_plans": ["chain_plan_detail"],
+            "success_contrast": "success case",
+        }
+        bundle = selector.select(summary, alerts, artifacts)
+        no_f2p_items = [i for i in bundle.items if i.evidence_id.startswith("no_f2p_cand")]
+        assert len(no_f2p_items) >= 1
+        chain_items = [i for i in bundle.items if i.evidence_id == "chain_plan_0"]
+        assert len(chain_items) == 1
+        contrast_items = [i for i in bundle.items if i.evidence_type == "success_contrast"]
+        assert len(contrast_items) == 1
+
+    def test_causal_ablation_branch(self):
+        selector = CycleEvidenceSelector()
+        summary = NodeCycleSummary(node_id="test")
+        alerts = [
+            SpecialAlert(
+                alert_id="causal_fail",
+                alert_type="causal_ablation_failure",
+                source=AlertSource.PROPOSER,
+                priority=AlertPriority.CRITICAL,
+                triggered=True,
+                severity=0.9,
+                recommended_attention="Causal ablation failed",
+            )
+        ]
+        artifacts = {
+            "chain_plans": ["failed_chain_plan_detail"],
+            "ablation_results": "ablation: repair_one_file restored all",
+            "success_contrast": "success case",
+        }
+        bundle = selector.select(summary, alerts, artifacts)
+        failed_items = [i for i in bundle.items if i.evidence_id == "failed_chain_plan"]
+        assert len(failed_items) == 1
+        ablation_items = [i for i in bundle.items if i.evidence_id == "ablation_results"]
+        assert len(ablation_items) == 1
+
 
 class TestCycleDiagnoser:
     def test_deterministic_diagnosis_with_critical(self):

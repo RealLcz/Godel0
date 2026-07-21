@@ -86,7 +86,6 @@ done
 echo "[$(date)] vLLM ready after ${VLLM_WAIT}s"
 
 export GODEL0_MODEL="${VLLM_MODEL_NAME}"
-export GODEL0_BOOTSTRAP_SOLVER_TRAJECTORY="${GODEL0_ROOT}/configs/evolve20_failure_seed.jsonl"
 export PYTHONPATH="${GODEL0_ROOT}/src:${GODEL0_ROOT}/initial_agent/src:${GODEL0_ROOT}"
 
 CONFIG_PATH="${GODEL0_CONFIG:-${GODEL0_ROOT}/configs/evolve20_ansible_formal.yaml}"

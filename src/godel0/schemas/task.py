@@ -22,6 +22,11 @@ class TaskRecord(BaseModel):
     source_trajectory_ids: List[str] = Field(default_factory=list)
     failure_signature_id: str = ""
 
+    # Task source metadata (Phase 6: Task Source Quota).
+    source_node: str = ""
+    source_trajectory: str = ""
+    source_type: str = ""
+
     bug_strategy: str
     bug_patch_path: str
     oracle_patch_path: Optional[str] = None

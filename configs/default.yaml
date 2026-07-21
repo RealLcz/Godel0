@@ -60,12 +60,21 @@ evaluation:
   max_workers: 8
 
 proposer:
-  strategies:
-    lm_modify: 0.30
-    lm_rewrite: 0.15
-    procedural: 0.40
-    combine: 0.10
-    pr_mirror: 0.05
+  initial_workflow: repo_chain
+  repo_chain:
+    min_files: 2
+    max_files: 6
+    min_mutation_sites: 3
+    max_mutation_sites: 8
+    context_file_budget: 10
+    require_generated_contracts: true
+    require_causal_ablation: true
+    mutation_backends:
+      lm_modify: 0.30
+      lm_rewrite: 0.15
+      procedural: 0.40
+      combine: 0.10
+      pr_mirror: 0.05
   candidate_timeout_sec: 120
   max_patch_lines: 80
   forbid_test_file_edits: true

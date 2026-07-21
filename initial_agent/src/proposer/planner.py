@@ -14,8 +14,6 @@ PlanStrategy = Literal[
     "combine",
     "pr_mirror",
     "pr_replay",
-    "repo_agent",
-    "repo_chain",
 ]
 
 
@@ -165,8 +163,6 @@ class ProposerPlanner:
             "combine",
             "pr_mirror",
             "pr_replay",
-            "repo_agent",
-            "repo_chain",
         }
         if preferred in supported:
             return preferred  # type: ignore[return-value]
@@ -176,14 +172,14 @@ class ProposerPlanner:
         ):
             return "pr_replay"
         if signature.failure_stage in ("localization", "tool_use"):
-            return "repo_chain"
+            return "lm_modify"
         if signature.failure_stage == "patch_generation":
-            return "repo_chain"
+            return "lm_modify"
         if signature.failure_stage == "validation":
-            return "repo_chain"
+            return "procedural"
         if signature.failure_stage == "context_management":
-            return "repo_chain"
-        return "repo_chain"
+            return "lm_rewrite"
+        return "lm_modify"
 
     def _choose_operator(
         self,
@@ -204,10 +200,6 @@ class ProposerPlanner:
             return "mirror_pr"
         if strategy == "pr_replay":
             return "reverse_real_fix"
-        if strategy == "repo_agent":
-            return "repository_contract_mutation"
-        if strategy == "repo_chain":
-            return "trajectory_conditioned_chain_mutation"
         return None
 
     def _choose_constraints(
@@ -216,15 +208,14 @@ class ProposerPlanner:
         strategy: str,
     ) -> BugConstraints:
         constraints = self.default_constraints.model_copy()
-        if strategy in ("pr_replay", "repo_agent", "repo_chain"):
+        if strategy in ("pr_replay",):
             constraints.min_modified_files = 2
             constraints.max_modified_files = 6
             constraints.max_modified_lines = 160
-            if strategy == "repo_chain":
-                constraints.context_file_budget = 10
-                constraints.min_mutation_sites = 3
-                constraints.max_mutation_sites = 8
-                constraints.require_generated_tests = True
+            constraints.context_file_budget = 10
+            constraints.min_mutation_sites = 3
+            constraints.max_mutation_sites = 8
+            constraints.require_generated_tests = True
         elif strategy in ("lm_modify", "lm_rewrite"):
             constraints.max_modified_lines = 30
         else:
@@ -247,25 +238,18 @@ class ProposerPlanner:
             "required_topology": "connected_cross_file_contract",
             "source_trajectory_id": signature.source_trajectory_id,
         }
-        if str(target.repo_id).lower() == "ansible":
-            # Repository integration profile: contracts exercise the public
-            # CLI instead of hallucinating fragile internal mocks. This only
-            # defines the harness; the node proposer still chooses the actual
-            # invariant, cases, mutation sites and issue statement.
+        # Use RepoProfileRegistry to get repo-specific contract settings
+        # (no hardcoded repo_id checks).
+        from proposer.repo_profiles import get_profile
+
+        profile = get_profile(str(target.repo_id))
+        if profile.name != "default":
             blueprint.update(
                 {
-                    "contract_scenario": (
-                        "Create temporary localhost playbooks and any included YAML "
-                        "files needed by the selected invariant. Exercise at least "
-                        "one target case and one nearby compatibility control."
-                    ),
-                    "contract_test_style": (
-                        "Use the repository's public ansible-playbook CLI with local "
-                        "connection and temporary YAML. Do not instantiate or mock "
-                        "Ansible internal classes."
-                    ),
-                    "contract_test_renderer": "ansible_playbook_cli",
-                    "require_expected_counts": True,
+                    "contract_scenario": profile.contract_scenario,
+                    "contract_test_style": profile.contract_test_style,
+                    "contract_test_renderer": profile.contract_renderer,
+                    "require_expected_counts": profile.require_expected_counts,
                 }
             )
         return blueprint

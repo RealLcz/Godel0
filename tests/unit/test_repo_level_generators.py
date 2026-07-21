@@ -856,9 +856,10 @@ def test_planner_routes_repository_failures_to_repo_generators(tmp_path: Path):
     )
     repo_plan = planner.create_plan(repo_signature, index)
     assert repo_plan is not None
-    assert repo_plan.strategy == "repo_chain"
-    assert repo_plan.constraints.min_modified_files == 2
-    assert repo_plan.constraints.max_modified_files == 6
+    # RepoChain is now a workflow, not a strategy. The planner returns a
+    # mutation backend (lm_modify for patch_generation stage); the workflow
+    # layer decides to use RepoChain based on proposer.initial_workflow.
+    assert repo_plan.strategy == "lm_modify"
 
     replay_signature = repo_signature.model_copy(
         update={
@@ -875,5 +876,6 @@ def test_planner_routes_repository_failures_to_repo_generators(tmp_path: Path):
 def test_engine_registers_repository_strategies():
     strategies = SWESmithEngine().list_strategies()
     assert "pr_replay" in strategies
-    assert "repo_agent" in strategies
-    assert "repo_chain" in strategies
+    # repo_agent and repo_chain are workflows, not mutation-backend strategies.
+    assert "repo_agent" not in strategies
+    assert "repo_chain" not in strategies

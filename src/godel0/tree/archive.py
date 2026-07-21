@@ -51,13 +51,24 @@ class NodeArchive:
             if r.parent_node_id == node_id
         ]
 
-    def eligible_parents(self, min_solved: int = 3) -> List[NodeRecord]:
-        """Get all nodes eligible to be parents."""
+    def eligible_parents(self, min_solved: int = 3, scoring_mode: str = "joint") -> List[NodeRecord]:
+        """Get all nodes eligible to be parents.
+
+        In "hgm" scoring mode, additionally enforce the proposer quality gate:
+        proposer_score must be > 0 (b > 0 means tasks were at the right
+        difficulty, not trivially easy or impossibly hard).
+        """
         self._ensure_loaded()
-        return [
-            r for r in self._cache.values()
-            if r.is_eligible_parent(min_solved)
-        ]
+        eligible = []
+        for r in self._cache.values():
+            if not r.is_eligible_parent(min_solved):
+                continue
+            if scoring_mode == "hgm":
+                # HGM gate: proposer quality must be non-zero.
+                if r.proposer_score is None or r.proposer_score <= 0:
+                    continue
+            eligible.append(r)
+        return eligible
 
     def all_nodes(self) -> List[NodeRecord]:
         """Get all nodes."""

@@ -45,6 +45,30 @@ class TaskConfig:
     candidates_per_signature: int = 5
     allow_same_repo_transfer: bool = True
     allow_cross_repo_transfer: bool = True
+    sources: "TaskSourceConfig" = field(default_factory=lambda: TaskSourceConfig())
+
+
+@dataclass(frozen=True)
+class TaskSourceConfig:
+    """Quotas for task sources.
+
+    parent_failure: tasks generated from the parent node's failure trajectories.
+    current_child_level1: tasks generated from the current child's Level 1
+        failures (forgotten tasks). The sum of quotas should equal batch_size;
+        if it doesn't, the provider falls back dynamically.
+    """
+    parent_failure: "TaskSourceQuota" = field(
+        default_factory=lambda: TaskSourceQuota(name="parent_failure", quota=5)
+    )
+    current_child_level1: "TaskSourceQuota" = field(
+        default_factory=lambda: TaskSourceQuota(name="current_child_level1", quota=5)
+    )
+
+
+@dataclass(frozen=True)
+class TaskSourceQuota:
+    name: str
+    quota: int = 5
 
 
 @dataclass(frozen=True)
@@ -53,6 +77,14 @@ class ScoringConfig:
     regression_weight: float = 0.5
     proposer_target_accuracy: float = 0.5
     min_parent_solved_tasks: int = 3
+    # Phase 8: Scoring Ablation.
+    # "joint" (default): node_score = a * b (Godel0 original).
+    # "hgm": solver_score = a, node_score = a; b is an eligibility gate only.
+    mode: str = "joint"
+    # HGM gate thresholds (only used in "hgm" mode).
+    hgm_valid_yield_threshold: float = 0.20
+    hgm_causal_ablation_pass_threshold: float = 0.50
+    hgm_difficulty_min: float = 0.30
 
 
 @dataclass(frozen=True)
@@ -91,16 +123,31 @@ class EvaluationConfig:
 
 
 @dataclass(frozen=True)
-class ProposerConfig:
-    strategies: Dict[str, float] = field(default_factory=lambda: {
-        "repo_chain": 0.30,
-        "lm_modify": 0.20,
-        "lm_rewrite": 0.15,
-        "procedural": 0.15,
-        "combine": 0.10,
-        "pr_mirror": 0.05,
-        "pr_replay": 0.05,
+class RepoChainWorkflowConfig:
+    """Configuration for the RepoChain proposer workflow.
+
+    RepoChain is the default Proposer workflow (not a mutation backend).
+    The mutation_backends dict selects which low-level mutation mechanisms
+    RepoChain uses internally, weighted by probability.
+    """
+    min_files: int = 2
+    max_files: int = 6
+    min_mutation_sites: int = 3
+    max_mutation_sites: int = 8
+    context_file_budget: int = 10
+    require_generated_contracts: bool = True
+    require_causal_ablation: bool = True
+    mutation_backends: Dict[str, float] = field(default_factory=lambda: {
+        "lm_modify": 0.5,
+        "procedural": 0.2,
+        "pr_replay": 0.3,
     })
+
+
+@dataclass(frozen=True)
+class ProposerConfig:
+    initial_workflow: str = "repo_chain"
+    repo_chain: RepoChainWorkflowConfig = field(default_factory=RepoChainWorkflowConfig)
     candidate_timeout_sec: int = 120
     max_patch_lines: int = 80
     forbid_test_file_edits: bool = True
@@ -163,13 +210,29 @@ def _build_subconfig(key: str, data: Any) -> Any:
         return cls()
     if not isinstance(data, dict):
         raise ConfigError(f"Config section '{key}' must be a mapping, got {type(data).__name__}")
-    if key == "proposer" and "strategies" in data:
-        strategies = data["strategies"]
-        if not isinstance(strategies, dict):
-            raise ConfigError("proposer.strategies must be a mapping")
-        total = sum(strategies.values())
-        if abs(total - 1.0) > 0.001:
-            raise ConfigError(f"proposer.strategies probabilities must sum to 1.0, got {total}")
+    if key == "proposer":
+        rc_data = data.get("repo_chain", {})
+        if rc_data is not None and not isinstance(rc_data, dict):
+            raise ConfigError("proposer.repo_chain must be a mapping")
+        valid_rc_keys = {f.name for f in fields(RepoChainWorkflowConfig)}
+        filtered_rc = {k: v for k, v in (rc_data or {}).items() if k in valid_rc_keys}
+        data = {k: v for k, v in data.items() if k != "repo_chain"}
+        data["repo_chain"] = RepoChainWorkflowConfig(**filtered_rc)
+    if key == "tasks":
+        sources_data = data.get("sources", {})
+        if sources_data is not None and not isinstance(sources_data, dict):
+            raise ConfigError("tasks.sources must be a mapping")
+        src = TaskSourceConfig()
+        if sources_data:
+            pf = sources_data.get("parent_failure", {})
+            cc = sources_data.get("current_child_level1", {})
+            if isinstance(pf, dict):
+                pf = TaskSourceQuota(**{k: v for k, v in pf.items() if k in {f2.name for f2 in fields(TaskSourceQuota)}})
+            if isinstance(cc, dict):
+                cc = TaskSourceQuota(**{k: v for k, v in cc.items() if k in {f2.name for f2 in fields(TaskSourceQuota)}})
+            src = TaskSourceConfig(parent_failure=pf, current_child_level1=cc)
+        data = {k: v for k, v in data.items() if k != "sources"}
+        data["sources"] = src
     valid_keys = {f.name for f in fields(cls)}
     filtered = {k: v for k, v in data.items() if k in valid_keys}
     return cls(**filtered)
@@ -188,9 +251,11 @@ def _validate(config: Godel0Config) -> None:
         raise ConfigError("tasks.max_generation_candidates must be >= tasks.batch_size")
     if config.evaluation.max_workers < 1:
         raise ConfigError("evaluation.max_workers must be >= 1")
-    total = sum(config.proposer.strategies.values())
-    if abs(total - 1.0) > 0.001:
-        raise ConfigError(f"proposer.strategies must sum to 1.0, got {total}")
+    total_backends = sum(config.proposer.repo_chain.mutation_backends.values())
+    if config.proposer.repo_chain.mutation_backends and abs(total_backends - 1.0) > 0.001:
+        raise ConfigError(
+            f"proposer.repo_chain.mutation_backends must sum to 1.0, got {total_backends}"
+        )
 
 
 def _apply_overrides(config_dict: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:

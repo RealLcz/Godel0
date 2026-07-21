@@ -74,7 +74,7 @@ def test_runner_preserves_repository_candidate_scope():
         target_base_commit="abc",
         target_file="provider.py",
         target_symbol="provide",
-        strategy="repo_agent",
+        strategy="pr_replay",
     )
     repo = RepoSpec(repo_id="repo", repo_dir="/repo", base_commit="abc")
 

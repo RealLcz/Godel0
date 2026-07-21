@@ -302,6 +302,7 @@ class SWESmithEngine:
         return list(OPERATORS.keys())
 
     def list_strategies(self) -> List[str]:
+        # Mutation backends only. RepoChain is a workflow, not a strategy.
         return [
             "lm_modify",
             "lm_rewrite",
@@ -309,6 +310,4 @@ class SWESmithEngine:
             "combine",
             "pr_mirror",
             "pr_replay",
-            "repo_agent",
-            "repo_chain",
         ]

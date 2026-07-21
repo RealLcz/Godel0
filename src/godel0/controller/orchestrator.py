@@ -42,6 +42,7 @@ class EvolutionOrchestrator:
         diagnoser=None,
         child_builder=None,
         level1_evaluator=None,
+        task_provider=None,
         task_batch_builder=None,
         level2_evaluator=None,
         repo_pool=None,
@@ -62,7 +63,22 @@ class EvolutionOrchestrator:
         self.diagnoser = diagnoser
         self.child_builder = child_builder
         self.level1_evaluator = level1_evaluator
+        # TaskProvider seam: the HGM-style loop calls get_tasks(node, context)
+        # and is agnostic to BenchmarkTaskProvider vs ProposerTaskProvider.
+        # For backwards compatibility, a raw TaskBatchBuilder is wrapped.
+        self.task_provider = task_provider
         self.task_batch_builder = task_batch_builder
+        if self.task_provider is None and self.task_batch_builder is not None:
+            from ..tasks.proposer_provider import ProposerTaskProvider
+
+            self.task_provider = ProposerTaskProvider(
+                batch_builder=self.task_batch_builder,
+                repo_pool=repo_pool,
+                validator=validator,
+                task_committer=task_committer,
+                proposer_runner=proposer_runner,
+                task_store_dir=config.paths.task_store,
+            )
         self.level2_evaluator = level2_evaluator
         self.repo_pool = repo_pool
         self.validator = validator
@@ -112,6 +128,7 @@ class EvolutionOrchestrator:
         from ..proposer_trusted.candidate_validator import CandidateValidator
         from ..proposer_trusted.task_committer import TaskCommitter
         from ..tasks.batch import TaskBatchBuilder
+        from ..tasks.proposer_provider import ProposerTaskProvider
         from ..tasks.repo_pool import RepoPool
         from ..tasks.store import TaskStore
 
@@ -128,6 +145,18 @@ class EvolutionOrchestrator:
 
         agent_adapter = cls._build_agent_adapter()
         from ..tasks.node_proposer import NodeProposerRunner
+        from ..execution.subprocess_runner import SubprocessRunner
+
+        # Phase 9: build the unified execution backend. Default is subprocess;
+        # when config.execution.backend == "apptainer" and an agent_image is
+        # configured, use ApptainerRunner for HPC container isolation.
+        execution_backend = SubprocessRunner()
+        if config.execution.backend == "apptainer" and config.execution.agent_image:
+            from ..execution.apptainer import ApptainerRunner
+
+            execution_backend = ApptainerRunner(
+                apptainer_bin=config.execution.apptainer_bin,
+            )
 
         proposer_runner = NodeProposerRunner(
             agent_repo=Path(config.paths.agent_repo),
@@ -136,6 +165,7 @@ class EvolutionOrchestrator:
             / "node_proposer",
             timeout_sec=config.proposer.candidate_timeout_sec
             * config.tasks.max_generation_candidates,
+            execution_backend=execution_backend,
         )
 
         from ..evolution.cycle_builder import NodeCycleBuilder
@@ -171,8 +201,29 @@ class EvolutionOrchestrator:
             "task_batch_builder": TaskBatchBuilder(
                 batch_size=config.tasks.batch_size,
                 max_candidates=config.tasks.max_generation_candidates,
-                strategy_weights=config.proposer.strategies,
+                strategy_weights=config.proposer.repo_chain.mutation_backends,
                 contract_test_renderer=config.proposer.contract_test_renderer,
+                source_quotas={
+                    "parent_failure": config.tasks.sources.parent_failure.quota,
+                    "current_child_level1": config.tasks.sources.current_child_level1.quota,
+                },
+            ),
+            "task_provider": ProposerTaskProvider(
+                batch_builder=TaskBatchBuilder(
+                    batch_size=config.tasks.batch_size,
+                    max_candidates=config.tasks.max_generation_candidates,
+                    strategy_weights=config.proposer.repo_chain.mutation_backends,
+                    contract_test_renderer=config.proposer.contract_test_renderer,
+                    source_quotas={
+                        "parent_failure": config.tasks.sources.parent_failure.quota,
+                        "current_child_level1": config.tasks.sources.current_child_level1.quota,
+                    },
+                ),
+                repo_pool=repo_pool,
+                validator=validator,
+                task_committer=task_committer,
+                proposer_runner=proposer_runner,
+                task_store_dir=config.paths.task_store,
             ),
             "level2_evaluator": Level2Evaluator(),
             "repo_pool": repo_pool,
@@ -417,7 +468,10 @@ class EvolutionOrchestrator:
         )
 
     def _select_parent(self):
-        eligible = self.archive.eligible_parents(self.config.scoring.min_parent_solved_tasks)
+        eligible = self.archive.eligible_parents(
+            self.config.scoring.min_parent_solved_tasks,
+            scoring_mode=self.config.scoring.mode,
+        )
         if not eligible:
             return None
         return self.selector.select(
@@ -465,6 +519,10 @@ class EvolutionOrchestrator:
             frontier_accuracy=level2.accuracy,
             regression_weight=self.config.scoring.regression_weight,
             target_accuracy=self.config.scoring.proposer_target_accuracy,
+            mode=self.config.scoring.mode,
+            hgm_valid_yield_threshold=self.config.scoring.hgm_valid_yield_threshold,
+            hgm_causal_ablation_pass_threshold=self.config.scoring.hgm_causal_ablation_pass_threshold,
+            hgm_difficulty_min=self.config.scoring.hgm_difficulty_min,
         )
         root.retention_rate = scores.retention_rate
         root.frontier_accuracy = scores.frontier_accuracy
@@ -514,6 +572,10 @@ class EvolutionOrchestrator:
         artifacts = {
             "solver_trajectories": self._trajectory_excerpts(parent.node_id),
             "proposer_candidates": proposer_stats.pop("reports", []),
+            "success_contrast": self._success_contrast(parent),
+            "chain_plans": self._chain_plans(parent),
+            "ablation_results": self._ablation_results(parent),
+            "task_quality_summary": self._task_quality_summary(parent, proposer_stats),
         }
 
         # Failed child attempts are evidence about the parent system. They are
@@ -535,6 +597,10 @@ class EvolutionOrchestrator:
             artifacts["solver_trajectories"].extend(
                 self._trajectory_excerpts(latest.node_id)
             )
+            if not artifacts.get("chain_plans"):
+                artifacts["chain_plans"] = self._chain_plans(latest)
+            if not artifacts.get("ablation_results"):
+                artifacts["ablation_results"] = self._ablation_results(latest)
 
         summary = self.cycle_builder.build(
             parent,
@@ -545,7 +611,18 @@ class EvolutionOrchestrator:
         )
         special_config = config_to_dict(self.config)["special_cases"]
         special_config["regression_threshold"] = self.config.scoring.regression_threshold
-        alerts = self.special_detector.detect(summary, config=special_config)
+        solver_stats = self._solver_stats(parent, level2)
+        extended_proposer_stats = self._extended_proposer_stats(parent, proposer_stats)
+        tool_events = self._tool_events(parent.node_id)
+        alerts = self.special_detector.detect(
+            summary,
+            trajectories=None,
+            candidates=None,
+            tool_events=tool_events,
+            solver_stats=solver_stats,
+            proposer_stats=extended_proposer_stats,
+            config=special_config,
+        )
         evidence = self.evidence_selector.select(summary, alerts, artifacts)
         diagnosis = self.diagnoser.diagnose(
             parent.node_id,
@@ -617,6 +694,162 @@ class EvolutionOrchestrator:
             excerpts.append(path.read_text(encoding="utf-8", errors="replace")[-20000:])
         return excerpts
 
+    def _solver_stats(self, node, level2=None) -> dict:
+        """Assemble solver-side stats for special detection.
+
+        Counts empty patches, test-only patches, timeouts, context overflows,
+        stochastic tasks, repeated tool loops, and localization collapses from
+        the Level 2 outcomes and trajectory files.
+        """
+        stats = {
+            "empty_patch_count": 0,
+            "test_only_patch_count": 0,
+            "evaluated_count": 0,
+            "timeout_count": 0,
+            "context_overflow_count": 0,
+            "stochastic_task_count": 0,
+            "repeated_tool_loop_count": 0,
+            "localization_collapse_count": 0,
+        }
+        if level2 is not None:
+            stats["evaluated_count"] = len(level2.outcomes)
+            for outcome in level2.outcomes:
+                patch_path = getattr(outcome, "patch_path", None)
+                patch = ""
+                if patch_path and Path(patch_path).is_file():
+                    patch = Path(patch_path).read_text(encoding="utf-8", errors="replace")
+                if not patch.strip():
+                    stats["empty_patch_count"] += 1
+                elif "test" in patch.lower() and not any(
+                    line.startswith("+") and not line.startswith("+++")
+                    for line in patch.splitlines()
+                    if not line.startswith(("diff ", "--- ", "+++ "))
+                ):
+                    stats["test_only_patch_count"] += 1
+                error_type = str(getattr(outcome, "error_type", "") or "").lower()
+                if "timeout" in error_type or "timed out" in error_type:
+                    stats["timeout_count"] += 1
+                if "context" in error_type or "token" in error_type:
+                    stats["context_overflow_count"] += 1
+        for excerpt in self._trajectory_excerpts(node.node_id):
+            lower = excerpt.lower()
+            if "context length" in lower or "token limit" in lower:
+                stats["context_overflow_count"] += 1
+            if lower.count('"tool":') > 20 and lower.count("repeated") > 0:
+                stats["repeated_tool_loop_count"] += 1
+        return stats
+
+    def _extended_proposer_stats(self, node, base_stats: dict) -> dict:
+        """Extend proposer stats with RepoChain-specific counters.
+
+        Reads the extended generation_summary.json written by the proposer,
+        which now includes causal_ablation_failure_count,
+        contract_generation_failure_count, clean_contract_failure_count,
+        no_f2p_count, no_p2p_count, duplicate_count, statement_leakage_count.
+        Falls back to 0 for each counter that the proposer has not yet emitted.
+        """
+        path = self.run_context.paths.proposer_dir(node.node_id) / "generation_summary.json"
+        extended = {
+            "causal_ablation_failure_count": 0,
+            "contract_generation_failure_count": 0,
+            "clean_contract_failure_count": 0,
+            "no_f2p_count": 0,
+            "no_p2p_count": 0,
+            "duplicate_count": 0,
+            "statement_leakage_count": 0,
+        }
+        if path.is_file():
+            data = read_json(path)
+            for key in extended:
+                extended[key] = int(data.get(key, 0))
+            # Also derive no_f2p / no_p2p from rejection_reasons if present.
+            rejections = data.get("rejection_reasons") or {}
+            for reason, count in rejections.items():
+                reason_lower = str(reason).lower()
+                if "no_f2p" in reason_lower or "f2p" in reason_lower:
+                    extended["no_f2p_count"] += int(count)
+                if "no_p2p" in reason_lower or "p2p" in reason_lower:
+                    extended["no_p2p_count"] += int(count)
+                if "duplicate" in reason_lower:
+                    extended["duplicate_count"] += int(count)
+                if "leakage" in reason_lower or "leak" in reason_lower:
+                    extended["statement_leakage_count"] += int(count)
+        return extended
+
+    def _tool_events(self, node_id: str) -> list[dict]:
+        """Extract tool-call events from solver trajectories for shared detection."""
+        events: list[dict] = []
+        for excerpt in self._trajectory_excerpts(node_id):
+            import json as _json
+
+            for line in excerpt.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = _json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(entry, dict) and entry.get("type") == "tool_call":
+                    tool_name = str(entry.get("tool") or entry.get("name") or "unknown")
+                    error = str(entry.get("error") or "")
+                    if error:
+                        events.append({"tool": tool_name, "error": error})
+        return events
+
+    def _success_contrast(self, node) -> str:
+        """Build a success-contrast excerpt for the diagnoser.
+
+        Picks one solved task's trajectory summary to contrast against failures.
+        """
+        if node.level2_result_path and Path(node.level2_result_path).is_file():
+            from ..schemas.evaluation import Level2Result
+
+            level2 = Level2Result.model_validate(read_json(Path(node.level2_result_path)))
+            solved = set(level2.solved_task_ids)
+            if solved and self.task_store is not None:
+                for tid in level2.solved_task_ids[:1]:
+                    return f"SOLVED task {tid}: solver successfully patched the bug."
+        return ""
+
+    def _chain_plans(self, node) -> list[str]:
+        """Extract RepoChain plan summaries from the proposer output."""
+        proposer_dir = self.run_context.paths.proposer_dir(node.node_id)
+        plans: list[str] = []
+        result_path = proposer_dir / "proposer_result.json"
+        if result_path.is_file():
+            import json as _json
+
+            try:
+                data = _json.loads(result_path.read_text(encoding="utf-8"))
+                for plan in data.get("plans") or []:
+                    plans.append(_json.dumps(plan, ensure_ascii=False)[:4000])
+            except Exception:
+                pass
+        return plans
+
+    def _ablation_results(self, node) -> str:
+        """Extract causal ablation results from the proposer output."""
+        proposer_dir = self.run_context.paths.proposer_dir(node.node_id)
+        summary_path = proposer_dir / "generation_summary.json"
+        if summary_path.is_file():
+            data = read_json(summary_path)
+            parts = []
+            for key in ("causal_ablation_pass", "causal_ablation_failure_count"):
+                if key in data:
+                    parts.append(f"{key}: {data[key]}")
+            return "; ".join(parts)
+        return ""
+
+    def _task_quality_summary(self, node, proposer_stats: dict) -> str:
+        """Build a short task-quality summary for empty-patch diagnosis."""
+        parts = [
+            f"generated={proposer_stats.get('generated', 0)}",
+            f"accepted={proposer_stats.get('accepted', 0)}",
+            f"rejections={proposer_stats.get('rejections', {})}",
+        ]
+        return "TaskQualitySummary: " + ", ".join(parts)
+
     def _build_child(self, parent, diagnosis=None):
         from ..evolution.child_builder import ChildBuildResult
         from ..schemas.diagnosis import CycleDiagnosis
@@ -653,13 +886,10 @@ class EvolutionOrchestrator:
         return result
 
     def _generate_batch(self, child, parent=None, level1_result=None):
-        if self.task_batch_builder is None:
+        if self.task_provider is None and self.task_batch_builder is None:
             return None
         self.run_context.paths.ensure_node_dirs(child.node_id)
         trajectories: list[str] = []
-        bootstrap = os.environ.get("GODEL0_BOOTSTRAP_SOLVER_TRAJECTORY", "")
-        if bootstrap and Path(bootstrap).is_file():
-            trajectories.append(bootstrap)
         scratch = Path(self.config.execution.scratch_root)
         allowed_node_ids = {child.node_id}
         if parent is not None:
@@ -673,25 +903,59 @@ class EvolutionOrchestrator:
             if value not in trajectories:
                 trajectories.append(value)
         parent_task_ids = self._parent_solved_task_ids(parent) if parent is not None else []
-        bound_runner = (
-            self.proposer_runner.for_node(child)
-            if hasattr(self.proposer_runner, "for_node")
-            else self.proposer_runner
-        )
-        result = self.task_batch_builder.build_for_node(
-            node_id=child.node_id,
-            repo_pool=self.repo_pool,
-            validator=self.validator,
-            task_committer=self.task_committer,
-            proposer_runner=bound_runner,
+        from ..tasks.provider import TaskGenerationContext
+
+        context = TaskGenerationContext(
+            node=child,
+            parent=parent,
+            level1_result=level1_result,
             solver_trajectories=trajectories,
             parent_task_ids=parent_task_ids,
-            output_dir=self.run_context.paths.proposer_dir(child.node_id),
-            agent_code_dir="",
-            model=self.config.models.agent_model,
+            parent_solved_task_ids=list(parent_task_ids),
             run_id=self.run_context.run_id,
+            output_dir=self.run_context.paths.proposer_dir(child.node_id),
+            model=self.config.models.agent_model,
             task_store_dir=self.config.paths.task_store,
+            bootstrap=parent is None,
         )
+        if self.task_provider is not None:
+            result = self.task_provider.get_tasks(child, context)
+        else:
+            # Legacy fallback when a raw TaskBatchBuilder was injected.
+            bound_runner = (
+                self.proposer_runner.for_node(child)
+                if hasattr(self.proposer_runner, "for_node")
+                else self.proposer_runner
+            )
+            legacy = self.task_batch_builder.build_for_node(
+                node_id=child.node_id,
+                repo_pool=self.repo_pool,
+                validator=self.validator,
+                task_committer=self.task_committer,
+                proposer_runner=bound_runner,
+                solver_trajectories=trajectories,
+                parent_task_ids=parent_task_ids,
+                output_dir=self.run_context.paths.proposer_dir(child.node_id),
+                agent_code_dir="",
+                model=self.config.models.agent_model,
+                run_id=self.run_context.run_id,
+                task_store_dir=self.config.paths.task_store,
+            )
+            from ..tasks.provider import TaskBatch
+
+            result = TaskBatch(
+                batch_id=legacy.batch_id,
+                node_id=legacy.node_id,
+                tasks=list(legacy.tasks),
+                complete=bool(legacy.complete),
+                rejected_candidates=legacy.rejected_candidates,
+                rejection_reasons=dict(legacy.rejection_reasons),
+                candidates_generated=legacy.candidates_generated,
+                candidates_validated=legacy.candidates_validated,
+                validation_reports=list(legacy.validation_reports),
+                proposer_error=legacy.proposer_error,
+                engine_rejections=list(legacy.engine_rejections),
+            )
         child.generated_task_batch_id = result.batch_id
         summary_path = self.run_context.paths.proposer_dir(child.node_id) / "generation_summary.json"
         atomic_write_json(
@@ -756,6 +1020,10 @@ class EvolutionOrchestrator:
             frontier_accuracy=p,
             regression_weight=self.config.scoring.regression_weight,
             target_accuracy=self.config.scoring.proposer_target_accuracy,
+            mode=self.config.scoring.mode,
+            hgm_valid_yield_threshold=self.config.scoring.hgm_valid_yield_threshold,
+            hgm_causal_ablation_pass_threshold=self.config.scoring.hgm_causal_ablation_pass_threshold,
+            hgm_difficulty_min=self.config.scoring.hgm_difficulty_min,
         )
 
         child.retention_rate = scores.retention_rate
