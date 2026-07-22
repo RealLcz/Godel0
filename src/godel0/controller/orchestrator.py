@@ -12,7 +12,7 @@ from typing import Optional
 
 import yaml
 
-from ..config import Godel0Config, config_to_dict
+from ..config import Godel0Config, assert_no_human_curated_data, config_to_dict
 from ..constants import ROOT_NODE_ID
 from ..errors import BudgetExhaustedError
 from ..schemas.node import NodeRecord, NodeStatus
@@ -103,6 +103,11 @@ class EvolutionOrchestrator:
     @classmethod
     def from_config(cls, config: Godel0Config) -> "EvolutionOrchestrator":
         """Create an orchestrator from config."""
+        from ..config import assert_no_human_curated_data
+
+        # P0-23: zero out PR-replay weights in the main experiment.
+        config = assert_no_human_curated_data(config)
+
         runs_dir = Path(config.paths.runs)
         run_context = RunContext.create(config, runs_dir)
 
@@ -155,6 +160,10 @@ class EvolutionOrchestrator:
             test_timeout_sec=config.proposer.candidate_timeout_sec,
             max_patch_lines=config.proposer.max_patch_lines,
             forbid_test_file_edits=config.proposer.forbid_test_file_edits,
+            # P0-7: authoritative trusted causal ablation gate.
+            require_causal_ablation=bool(
+                config.proposer.repo_chain.require_causal_ablation
+            ),
             # BUG-15/10.8: trusted repository tests run through the repo
             # backend so the chain is end-to-end Apptainer. The backend is
             # built later from the ExecutionBackendFactory; we patch it in
@@ -240,6 +249,9 @@ class EvolutionOrchestrator:
                     "parent_failure": config.tasks.sources.parent_failure.quota,
                     "current_child_level1": config.tasks.sources.current_child_level1.quota,
                 },
+                workflow_config=config_to_dict(config)["proposer"]["repo_chain"],
+                allow_workflow_fallback=config.proposer.allow_workflow_fallback,
+                allow_human_curated_data=config.proposer.allow_human_curated_data,
             ),
             "task_provider": ProposerTaskProvider(
                 batch_builder=TaskBatchBuilder(
@@ -251,6 +263,9 @@ class EvolutionOrchestrator:
                         "parent_failure": config.tasks.sources.parent_failure.quota,
                         "current_child_level1": config.tasks.sources.current_child_level1.quota,
                     },
+                    workflow_config=config_to_dict(config)["proposer"]["repo_chain"],
+                    allow_workflow_fallback=config.proposer.allow_workflow_fallback,
+                    allow_human_curated_data=config.proposer.allow_human_curated_data,
                 ),
                 repo_pool=repo_pool,
                 validator=validator,
@@ -270,7 +285,7 @@ class EvolutionOrchestrator:
                 repo_pool=repo_pool,
                 agent_repo=Path(config.paths.agent_repo),
                 agent_adapter=agent_adapter,
-                model=config.models.agent_model,
+                model=config.models.solver_model,
                 solver_timeout_sec=max(
                     config.evaluation.level1_timeout_sec,
                     config.evaluation.level2_timeout_sec,
@@ -567,19 +582,19 @@ class EvolutionOrchestrator:
             self.archive.update(root)
             return False
 
-        # BUG-12: root bootstrap also runs through the HGM quality gate so
-        # that ``selection_eligible`` is populated consistently. The root
-        # receives no Level1 (retention=1.0 by definition) and a full batch
-        # (valid_yield=1.0, causal_ablation_pass=1.0, batch_complete=True).
+        # P0-3: Root's ONLY special-case is retention_rate=1.0 (no parent).
+        # valid_yield / causal_ablation_pass / batch_complete must come from
+        # the real generation statistics, never hard-coded to 1.0.
+        gate = self._hgm_quality_from_batch(root, batch)
         scores = compute_scores(
             retention_rate=1.0,
             frontier_accuracy=level2.accuracy,
             regression_weight=self.config.scoring.regression_weight,
             target_accuracy=self.config.scoring.proposer_target_accuracy,
             mode=self.config.scoring.mode,
-            valid_yield=1.0,
-            causal_ablation_pass=1.0,
-            batch_complete=True,
+            valid_yield=gate["valid_yield"],
+            causal_ablation_pass=gate["causal_ablation_pass"],
+            batch_complete=gate["batch_complete"],
             hgm_valid_yield_threshold=self.config.scoring.hgm_valid_yield_threshold,
             hgm_causal_ablation_pass_threshold=self.config.scoring.hgm_causal_ablation_pass_threshold,
             hgm_difficulty_min=self.config.scoring.hgm_difficulty_min,
@@ -626,6 +641,75 @@ class EvolutionOrchestrator:
         self.archive.update(root)
         self.archive.save_node_json(root, self.run_context.paths.node_json(root.node_id))
         return True
+
+    def _hgm_quality_from_batch(self, node, batch) -> dict:
+        """P0-3: compute HGM gate inputs from a real generation batch.
+
+        Used by root bootstrap (retention special-cased to 1.0 elsewhere) and
+        unit-tested so valid_yield / causal_ablation_pass are never hard-coded.
+        """
+        proposer_summary = self._proposer_stats(node) if node is not None else {}
+        accepted = int(
+            proposer_summary.get("accepted", len(getattr(batch, "tasks", []) or []))
+            or 0
+        )
+        candidates_validated = int(
+            proposer_summary.get("candidates_validated", 0)
+            or getattr(batch, "candidates_validated", 0)
+            or 0
+        )
+        # ``_proposer_stats`` historically used ``generated`` for validated.
+        if candidates_validated <= 0:
+            candidates_validated = int(
+                proposer_summary.get("generated", 0)
+                or getattr(batch, "candidates_validated", 0)
+                or getattr(batch, "candidates_generated", 0)
+                or 0
+            )
+        if candidates_validated <= 0:
+            candidates_validated = int(getattr(batch, "candidates_validated", 0) or 0)
+            accepted = int(len(getattr(batch, "tasks", []) or []))
+        valid_yield = (
+            (accepted / candidates_validated) if candidates_validated > 0 else None
+        )
+        extended = (
+            self._extended_proposer_stats(node, proposer_summary)
+            if node is not None
+            else {}
+        )
+        ablation_failures = int(extended.get("causal_ablation_failure_count", 0) or 0)
+        if ablation_failures <= 0:
+            # Also derive from batch rejection reasons when summary is thin.
+            rejections = dict(getattr(batch, "rejection_reasons", {}) or {})
+            for reason, count in rejections.items():
+                reason_lower = str(reason).lower()
+                if any(
+                    key in reason_lower
+                    for key in (
+                        "causal_ablation",
+                        "single_file_repair",
+                        "independently_active",
+                        "not_multi_file",
+                        "trusted_causal_ablation",
+                    )
+                ):
+                    ablation_failures += int(count)
+        causal_ablation_pass = None
+        if candidates_validated > 0:
+            causal_ablation_pass = max(
+                0.0, 1.0 - (ablation_failures / max(candidates_validated, 1))
+            )
+        batch_complete = bool(
+            getattr(batch, "complete", False)
+            and len(getattr(batch, "tasks", []) or []) == self.config.tasks.batch_size
+        )
+        return {
+            "valid_yield": valid_yield,
+            "causal_ablation_pass": causal_ablation_pass,
+            "batch_complete": batch_complete,
+            "accepted": accepted,
+            "candidates_validated": candidates_validated,
+        }
 
     def _prepare_diagnosis(self, parent):
         """Build and persist one joint-cycle diagnosis for the whole node."""
@@ -820,35 +904,66 @@ class EvolutionOrchestrator:
                 if "context" in error_type or "token" in error_type:
                     stats["context_overflow_count"] += 1
 
-        # BUG-21: parse trajectory structure to compute real signals.
-        excerpts = self._trajectory_excerpts(node.node_id)
+        # BUG-21 / P1-4: collect per-task rollout outcomes so stochasticity
+        # only fires when the SAME task has inconsistent resolved outcomes
+        # across rollouts (not merely because it was rolled out multiple times).
         rollout_counts: dict[str, int] = {}
+        rollout_outcomes: dict[str, list[bool]] = {}
+        excerpts = self._trajectory_excerpts(node.node_id)
         for excerpt in excerpts:
             lower = excerpt.lower()
             if "context length" in lower or "token limit" in lower:
                 stats["context_overflow_count"] += 1
             if lower.count('"tool":') > 20 and lower.count("repeated") > 0:
                 stats["repeated_tool_loop_count"] += 1
-            # BUG-21: localization collapse -- structural signals that the
-            # solver never narrowed onto the relevant production code.
             if self._trajectory_localization_collapsed(excerpt):
                 stats["localization_collapse_count"] += 1
             task_id = self._trajectory_task_id(excerpt)
             if task_id:
                 rollout_counts[task_id] = rollout_counts.get(task_id, 0) + 1
+                resolved = self._trajectory_resolved(excerpt)
+                if resolved is not None:
+                    rollout_outcomes.setdefault(task_id, []).append(resolved)
         if rollout_counts:
             stats["solver_rollouts"] = max(rollout_counts.values())
             stats["tasks_with_multiple_rollouts"] = sum(
                 1 for c in rollout_counts.values() if c >= 2
             )
-            # BUG-21: stochasticity = tasks whose outcomes diverge across
-            # rollouts. We approximate by counting tasks with >=2 rollouts
-            # where at least one rollout failed and one succeeded. Without
-            # per-rollout resolution we use the count of multi-rollout tasks
-            # as an upper bound; the detector further gates on
-            # ``solver_rollouts >= min_rollouts``.
-            stats["stochastic_task_count"] = stats["tasks_with_multiple_rollouts"]
+            # P1-4: only count tasks with inconsistent outcomes across rollouts.
+            stochastic = 0
+            for task_id, outcomes in rollout_outcomes.items():
+                if len(outcomes) >= 2 and (True in outcomes) and (False in outcomes):
+                    stochastic += 1
+            stats["stochastic_task_count"] = stochastic
         return stats
+
+    @staticmethod
+    def _trajectory_resolved(excerpt: str) -> Optional[bool]:
+        """P1-4: best-effort resolved flag from a trajectory excerpt."""
+        if not excerpt:
+            return None
+        import json as _json
+
+        for line in excerpt.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = _json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if "resolved" in entry:
+                return bool(entry["resolved"])
+            if "success" in entry:
+                return bool(entry["success"])
+            status = str(entry.get("status") or "").lower()
+            if status in {"resolved", "success", "passed", "pass"}:
+                return True
+            if status in {"failed", "unresolved", "error", "fail"}:
+                return False
+        return None
 
     @staticmethod
     def _trajectory_localization_collapsed(excerpt: str) -> bool:
@@ -927,8 +1042,15 @@ class EvolutionOrchestrator:
         }
         if path.is_file():
             data = read_json(path)
+            # P1-3: prefer structured repo_chain_stats when the proposer emitted it.
+            structured = data.get("repo_chain_stats") or {}
+            if isinstance(structured, dict):
+                for key in extended:
+                    if key in structured:
+                        extended[key] = int(structured.get(key, 0) or 0)
             for key in extended:
-                extended[key] = int(data.get(key, 0))
+                if key in data:
+                    extended[key] = int(data.get(key, extended[key]) or 0)
             # Also derive no_f2p / no_p2p from rejection_reasons if present.
             rejections = data.get("rejection_reasons") or {}
             for reason, count in rejections.items():
@@ -941,6 +1063,17 @@ class EvolutionOrchestrator:
                     extended["duplicate_count"] += int(count)
                 if "leakage" in reason_lower or "leak" in reason_lower:
                     extended["statement_leakage_count"] += int(count)
+                if any(
+                    token in reason_lower
+                    for token in (
+                        "causal_ablation",
+                        "single_file_repair",
+                        "independently_active",
+                        "not_multi_file",
+                        "trusted_causal_ablation",
+                    )
+                ):
+                    extended["causal_ablation_failure_count"] += int(count)
         return extended
 
     def _tool_events(self, node_id: str) -> list[dict]:
@@ -1103,7 +1236,9 @@ class EvolutionOrchestrator:
 
         if diagnosis is None:
             raise RuntimeError("A persisted joint-cycle diagnosis is required")
-        return self.child_builder.build(parent, diagnosis, self.config.models.agent_model)
+        return self.child_builder.build(
+            parent, diagnosis, self.config.models.self_improve_model
+        )
 
     def _evaluate_level1(self, parent, child):
         if self.level1_evaluator is None or self.solver_runner is None:
@@ -1149,21 +1284,39 @@ class EvolutionOrchestrator:
         parent_task_ids = self._parent_solved_task_ids(parent) if parent is not None else []
         from ..tasks.provider import TaskGenerationContext
 
-        # BUG-08/09: split trajectories into parent-failure and current-child
-        # Level1 buckets so the 5+5 quota can be enforced downstream. When the
-        # split buckets cannot be derived (e.g. root bootstrap), fall back to
-        # the flat list so behavior remains backward compatible.
+        # P0-9: Parent source = Parent Level2 unresolved failures only.
+        # Child source = Current Child Level1 forgotten/unresolved only.
+        # Do NOT treat successful parent/child trajectories as weakness sources.
         parent_failure_trajectories: list[str] = []
         current_child_level1_trajectories: list[str] = []
+        parent_failed_task_ids = (
+            self._parent_failed_task_ids(parent) if parent is not None else []
+        )
+        child_forgotten_task_ids: list[str] = []
+        if level1_result is not None:
+            child_forgotten_task_ids = list(
+                getattr(level1_result, "child_forgotten_task_ids", None)
+                or getattr(level1_result, "forgotten_task_ids", None)
+                or []
+            )
+            # Also include tasks the child newly failed to retain from parent.
+            for tid in getattr(level1_result, "evaluated_task_ids", []) or []:
+                retained = set(
+                    getattr(level1_result, "child_retained_task_ids", None) or []
+                )
+                if tid not in retained and tid not in child_forgotten_task_ids:
+                    child_forgotten_task_ids.append(tid)
+
         if parent is not None and child is not None and parent.node_id != child.node_id:
             for value in trajectories:
-                if parent.node_id in value:
+                if parent.node_id in value and self._trajectory_matches_any_task(
+                    value, parent_failed_task_ids
+                ):
                     parent_failure_trajectories.append(value)
-                elif child.node_id in value:
+                elif child.node_id in value and self._trajectory_matches_any_task(
+                    value, child_forgotten_task_ids
+                ):
                     current_child_level1_trajectories.append(value)
-        else:
-            # Root bootstrap or same-node: everything goes into the flat list.
-            pass
 
         context = TaskGenerationContext(
             node=child,
@@ -1176,7 +1329,7 @@ class EvolutionOrchestrator:
             parent_solved_task_ids=list(parent_task_ids),
             run_id=self.run_context.run_id,
             output_dir=self.run_context.paths.proposer_dir(child.node_id),
-            model=self.config.models.agent_model,
+            model=self.config.models.proposer_model,
             task_store_dir=self.config.paths.task_store,
             bootstrap=parent is None,
         )
@@ -1199,7 +1352,7 @@ class EvolutionOrchestrator:
                 parent_task_ids=parent_task_ids,
                 output_dir=self.run_context.paths.proposer_dir(child.node_id),
                 agent_code_dir="",
-                model=self.config.models.agent_model,
+                model=self.config.models.proposer_model,
                 run_id=self.run_context.run_id,
                 task_store_dir=self.config.paths.task_store,
                 bootstrap=parent is None,
@@ -1302,6 +1455,53 @@ class EvolutionOrchestrator:
         if parent.generated_task_batch_id and self.task_store is not None:
             return [t.task_id for t in self.task_store.tasks_for_batch(parent.generated_task_batch_id)]
         return []
+
+    def _parent_failed_task_ids(self, parent) -> list[str]:
+        """P0-9: Parent Level2 unresolved task ids only."""
+        if parent is None:
+            return []
+        if parent.level2_result_path:
+            path = Path(parent.level2_result_path)
+            if path.exists():
+                data = read_json(path)
+                failed = list(data.get("failed_task_ids", []) or [])
+                if failed:
+                    return failed
+                # Derive from outcomes when failed_task_ids is absent.
+                failed = [
+                    o.get("task_id")
+                    for o in (data.get("outcomes") or [])
+                    if isinstance(o, dict) and not o.get("resolved", True)
+                ]
+                return [tid for tid in failed if tid]
+        return []
+
+    @staticmethod
+    def _trajectory_matches_any_task(trajectory_path: str, task_ids: list[str]) -> bool:
+        """P0-9: match a trajectory path/content against unresolved task ids.
+
+        When ``task_ids`` is empty we return False (do not treat unknown
+        trajectories as failure sources). Matching is substring-based on the
+        path first, then a cheap peek into the jsonl head for ``task_id``.
+        """
+        if not task_ids:
+            return False
+        path_str = str(trajectory_path)
+        for tid in task_ids:
+            if tid and tid in path_str:
+                return True
+        try:
+            p = Path(trajectory_path)
+            if not p.is_file():
+                return False
+            # Read a small head to avoid loading huge trajectories.
+            head = p.read_text(encoding="utf-8", errors="replace")[:8000]
+            for tid in task_ids:
+                if tid and tid in head:
+                    return True
+        except Exception:
+            return False
+        return False
 
     def _compute_and_apply_scores(self, child, level1_result, level2_result):
         r = level1_result.retention_rate if level1_result else 0.5

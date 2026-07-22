@@ -87,3 +87,13 @@ def filter_patch_by_files(patch: str, target_files: list[str]) -> str:
         if include:
             filtered.append(line)
     return "\n".join(filtered)
+
+
+def split_patch_by_file(patch: str) -> dict[str, str]:
+    """P0-7: split a unified diff into per-file patch fragments.
+
+    Returns ``{relative_path: file_patch}``. Used by trusted causal ablation
+    to restore one file at a time while keeping the remaining bug applied.
+    """
+    files = extract_changed_files(patch)
+    return {path: filter_patch_by_files(patch, [path]) for path in files}

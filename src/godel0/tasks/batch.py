@@ -21,6 +21,59 @@ from ..storage.atomic import atomic_write_json
 from ..proposer_trusted.statement_auditor import audit_statement
 
 
+def compute_effective_quotas(
+    batch_size: int,
+    nominal_parent: int,
+    nominal_child: int,
+    available_parent: int,
+    available_child: int,
+    *,
+    bootstrap: bool = False,
+) -> dict:
+    """P0-10/11: compute effective source quotas before generation.
+
+    Supports donation:
+      - parent has 3 sources, child many → 3+7
+      - child has 0 sources → 10+0
+      - parent has 0 sources → 0+10
+      - both unknown (0,0) → keep nominal 5+5
+    """
+    if bootstrap:
+        return {
+            "parent_failure": 0,
+            "current_child_level1": 0,
+            "bootstrap": int(batch_size),
+        }
+    k = max(1, int(batch_size))
+    avail_p = max(0, int(available_parent))
+    avail_c = max(0, int(available_child))
+    nominal_p = max(0, int(nominal_parent))
+    # Both unknown: keep the configured nominal split.
+    if avail_p == 0 and avail_c == 0:
+        parent_quota = min(nominal_p, k)
+        return {
+            "parent_failure": parent_quota,
+            "current_child_level1": k - parent_quota,
+            "bootstrap": 0,
+        }
+
+    parent_quota = min(nominal_p, avail_p) if avail_p > 0 else 0
+    child_quota = k - parent_quota
+    if avail_c < child_quota:
+        child_quota = avail_c
+        parent_quota = k - child_quota
+    # Do NOT re-cap parent by avail_p after donation: generation may reuse
+    # the available parent trajectories to fill the donated slots (5+5→10+0).
+
+    parent_quota = max(0, min(parent_quota, k))
+    child_quota = max(0, k - parent_quota)
+    return {
+        "parent_failure": parent_quota,
+        "current_child_level1": child_quota,
+        "bootstrap": 0,
+    }
+
+
 @dataclass
 class TaskBatchResult:
     batch_id: str
@@ -55,6 +108,9 @@ class TaskBatchBuilder:
         strategy_weights: Optional[dict[str, float]] = None,
         contract_test_renderer: str = "",
         source_quotas: Optional[dict] = None,
+        workflow_config: Optional[dict] = None,
+        allow_workflow_fallback: bool = False,
+        allow_human_curated_data: bool = False,
     ):
         self.batch_size = batch_size
         self.max_candidates = max_candidates
@@ -64,6 +120,9 @@ class TaskBatchBuilder:
         # {"parent_failure": 5, "current_child_level1": 5}. When present, the
         # builder tags each committed task with its source type.
         self.source_quotas = dict(source_quotas or {})
+        self.workflow_config = dict(workflow_config or {})
+        self.allow_workflow_fallback = bool(allow_workflow_fallback)
+        self.allow_human_curated_data = bool(allow_human_curated_data)
 
     def build_for_node(
         self,
@@ -129,6 +188,30 @@ class TaskBatchBuilder:
         if sum(quotas.values()) == 0:
             half = max(1, self.batch_size // 2)
             quotas = {"parent_failure": half, "current_child_level1": self.batch_size - half}
+
+        # P0-10/11: compute effective quotas BEFORE generation based on
+        # available failure-source counts, then use those as the generation
+        # targets. Supports 5+5 -> 3+7 -> 10+0 when one side underfills.
+        # Bootstrap skips the split entirely.
+        if bootstrap:
+            quotas = compute_effective_quotas(
+                self.batch_size,
+                quotas.get("parent_failure", 0),
+                quotas.get("current_child_level1", 0),
+                available_parent=0,
+                available_child=0,
+                bootstrap=True,
+            )
+        else:
+            quotas = compute_effective_quotas(
+                self.batch_size,
+                quotas["parent_failure"],
+                quotas["current_child_level1"],
+                available_parent=len(parent_failure_trajectories),
+                available_child=len(current_child_level1_trajectories),
+                bootstrap=False,
+            )
+
         source_counts = {"parent_failure": 0, "current_child_level1": 0, "bootstrap": 0}
         quota_fallback_log: list[dict] = []
 
@@ -203,6 +286,13 @@ class TaskBatchBuilder:
                 for r in repo_specs
             ],
             bootstrap=bootstrap,
+            workflow_config=dict(self.workflow_config),
+            generation_quotas={
+                "parent_failure": int(quotas.get("parent_failure", 0) or 0),
+                "current_child_level1": int(quotas.get("current_child_level1", 0) or 0),
+            },
+            allow_workflow_fallback=self.allow_workflow_fallback,
+            allow_human_curated_data=self.allow_human_curated_data,
         )
 
         attempt = 0
@@ -373,6 +463,32 @@ class TaskBatchBuilder:
                             "accepted_so_far": source_counts[source_type] + 1,
                             "reason": "other_source_underfilled",
                         })
+                    # P0-12: stamp full provenance from trajectory/plan metadata.
+                    meta = dict(getattr(cand, "generation_metadata", {}) or {})
+                    plan_meta = plans_by_id.get(getattr(cand, "plan_id", ""), {}) or {}
+                    blueprint = dict(plan_meta.get("task_blueprint") or {})
+                    source_node_id = str(
+                        meta.get("source_node_id")
+                        or meta.get("source_node")
+                        or (
+                            node_id
+                            if source_type in {"current_child_level1", "bootstrap"}
+                            else ""
+                        )
+                        or node_id
+                    )
+                    source_task_id = str(
+                        meta.get("source_task_id")
+                        or blueprint.get("source_task_id")
+                        or ""
+                    )
+                    source_failure_stage = str(
+                        meta.get("source_failure_stage")
+                        or blueprint.get("failure_stage")
+                        or ""
+                    )
+                    # P0-8: f2p_tests come ONLY from trusted report, never from
+                    # candidate-declared metadata.
                     task = task_committer.commit_task(
                         batch_id=batch_id,
                         proposer_node_id=node_id,
@@ -381,17 +497,20 @@ class TaskBatchBuilder:
                         bug_strategy=cand.strategy,
                         bug_patch=cand.patch,
                         problem_statement=problem_statement,
-                        f2p_tests=report.f2p_tests,
+                        f2p_tests=list(report.f2p_tests),
                         baseline_test_command=generated_test_command,
                         solver_test_command=str(repo_spec["test_command"]),
                         modified_files=cand.modified_files,
                         modified_entities=cand.modified_entities,
                         validation_report=report_data,
                         setup_patch=setup_patch,
-                        source_node=node_id,
-                        # BUG-09: persist the real trajectory id instead of "".
+                        source_node=source_node_id,
                         source_trajectory=source_trajectory,
                         source_type=source_type,
+                        source_node_id=source_node_id,
+                        source_trajectory_id=source_trajectory,
+                        source_task_id=source_task_id,
+                        source_failure_stage=source_failure_stage,
                     )
                     result.tasks.append(task)
                     source_counts[source_type] = source_counts.get(source_type, 0) + 1
@@ -592,31 +711,28 @@ class TaskBatchBuilder:
         quotas: dict,
         batch_size: int,
     ) -> bool:
-        """BUG-08: 5+5 quota with dynamic fallback.
+        """BUG-08 / P0-11: effective-quota targets with donation fallback.
 
         A source is accepted when either:
-        - Its count is below its nominal quota, OR
-        - The other source has already filled its nominal quota and the
-          batch is still not full (dynamic fallback 5+5 -> 4+6 -> ...).
+        - Its count is below its (effective) quota, OR
+        - The other source is at/over its quota and the batch still has room, OR
+        - The other source's quota is 0 (exhausted of sources) so this side
+          may fill the remainder.
         """
         if source_type == "bootstrap":
             return True
-        nominal = int(quotas.get(source_type, 0) or 0)
-        if nominal and source_counts.get(source_type, 0) < nominal:
-            return True
-        # Fallback: only accept past quota if the other source is full and
-        # the batch still has room.
         total = sum(v for k, v in source_counts.items() if k != "bootstrap")
         if total >= batch_size:
             return False
+        nominal = int(quotas.get(source_type, 0) or 0)
+        if source_counts.get(source_type, 0) < nominal:
+            return True
         other = "current_child_level1" if source_type == "parent_failure" else "parent_failure"
         other_nominal = int(quotas.get(other, 0) or 0)
         other_count = source_counts.get(other, 0)
-        if other_nominal and other_count >= other_nominal:
+        if other_nominal == 0 or other_count >= other_nominal:
             return True
-        # If the other source has no trajectory bucket at all, allow fallback.
         return False
-
 
     def _trusted_test_command(
         self,

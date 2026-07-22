@@ -109,7 +109,9 @@ class ScoringConfig:
     # Phase 8: Scoring Ablation.
     # "joint" (default): node_score = a * b (Godel0 original).
     # "hgm": solver_score = a, node_score = a; b is an eligibility gate only.
-    mode: str = "joint"
+    # P0-2: main experiment uses HGM quality gate + Thompson Sampling.
+    # ``joint`` (a x b) is retained as the Gödel0-Joint ablation only.
+    mode: str = "hgm"
     # HGM gate thresholds (only used in "hgm" mode).
     hgm_valid_yield_threshold: float = 0.20
     hgm_causal_ablation_pass_threshold: float = 0.50
@@ -167,10 +169,13 @@ class RepoChainWorkflowConfig:
     context_file_budget: int = 10
     require_generated_contracts: bool = True
     require_causal_ablation: bool = True
+    # P0-23: main experiment defaults disable PR replay so the
+    # zero-human-curated-data claim stays clean. Enable pr_replay only in
+    # explicit ablations via allow_human_curated_data=True.
     mutation_backends: Dict[str, float] = field(default_factory=lambda: {
-        "lm_modify": 0.5,
-        "procedural": 0.2,
-        "pr_replay": 0.3,
+        "lm_modify": 0.7,
+        "procedural": 0.3,
+        "pr_replay": 0.0,
     })
 
 
@@ -183,6 +188,12 @@ class ProposerConfig:
     forbid_test_file_edits: bool = True
     require_f2p: bool = True
     contract_test_renderer: str = ""
+    # P0-23: when False (default), PR-replay / human-curated task data is
+    # forbidden in the main evolution loop.
+    allow_human_curated_data: bool = False
+    # P0-6: production must not silently fall back to SWESmithEngine when
+    # RepoChainWorkflow fails to initialize. Unit tests may set True.
+    allow_workflow_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -346,15 +357,57 @@ def load_config(
 
 
 def config_to_dict(config: Godel0Config) -> Dict[str, Any]:
-    """Serialize config back to a plain dict suitable for YAML dump."""
-    result: Dict[str, Any] = {}
-    for key in _SUBCONFIG_KEYS:
-        sub = getattr(config, key)
-        d: Dict[str, Any] = {}
-        for f in fields(sub):
-            d[f.name] = getattr(sub, f.name)
-        result[key] = d
-    return result
+    """Serialize config recursively (P1-2).
+
+    Nested dataclasses (``scoring.selection``, ``tasks.sources``,
+    ``proposer.repo_chain``, ...) must be expanded; a shallow one-level dump
+    would serialize them as opaque Python objects in YAML.
+    """
+    from dataclasses import asdict
+
+    return asdict(config)
+
+
+def assert_no_human_curated_data(config: Godel0Config) -> Godel0Config:
+    """P0-23: refuse or zero-out human-curated mutation backends.
+
+    When ``allow_human_curated_data`` is False (main experiment default), any
+    positive ``pr_replay`` / ``pr_mirror`` weight is forced to 0 and remaining
+    backends are re-normalized. Returns a config with cleaned weights.
+    """
+    if config.proposer.allow_human_curated_data:
+        return config
+
+    backends = dict(config.proposer.repo_chain.mutation_backends or {})
+    human_keys = ("pr_replay", "pr_mirror")
+    dirty = [k for k in human_keys if float(backends.get(k, 0.0) or 0.0) > 0.0]
+    if not dirty and all(float(backends.get(k, 0.0) or 0.0) == 0.0 for k in human_keys):
+        return config
+
+    import logging
+    import dataclasses
+
+    logger = logging.getLogger("godel0.config")
+    for key in human_keys:
+        if float(backends.get(key, 0.0) or 0.0) > 0.0:
+            logger.warning(
+                "P0-23: disabling human-curated mutation backend %r "
+                "(allow_human_curated_data=False)",
+                key,
+            )
+        backends[key] = 0.0
+
+    remaining = {k: float(v) for k, v in backends.items() if float(v or 0.0) > 0.0}
+    total = sum(remaining.values())
+    if total <= 0:
+        backends = {"lm_modify": 0.7, "procedural": 0.3, "pr_replay": 0.0}
+    else:
+        backends = {k: (v / total) for k, v in remaining.items()}
+        backends.setdefault("pr_replay", 0.0)
+
+    new_rc = dataclasses.replace(config.proposer.repo_chain, mutation_backends=backends)
+    new_proposer = dataclasses.replace(config.proposer, repo_chain=new_rc)
+    return dataclasses.replace(config, proposer=new_proposer)
 
 
 def save_config(config: Godel0Config, path: Union[str, Path]) -> None:

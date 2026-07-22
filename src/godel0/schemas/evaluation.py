@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class EvaluationOutcome(BaseModel):
@@ -56,6 +56,12 @@ class CandidateValidationReport(BaseModel):
     f2p_tests: list[str] = []
     p2p_tests: list[str] = []
     reverse_restored: bool = False
+
+    # P0-7 / P0-8: trusted causal ablation. Only Trusted Validator results
+    # may set these; proposer-declared causal_ablation metadata is advisory.
+    trusted_causal_ablation_pass: bool = True
+    repair_one_file_results: dict = Field(default_factory=dict)
+    independently_active_file_count: int = 0
 
     syntax_valid: bool = False
     import_valid: bool = False

@@ -75,6 +75,9 @@ class ProposerRunner:
         agent_adapter: Optional[AgentAdapter] = None,
         engine: Optional[EngineLike] = None,
         workflow: Any = None,
+        workflow_config: Any = None,
+        allow_workflow_fallback: bool = False,
+        allow_human_curated_data: bool = False,
     ) -> None:
         self.agent_adapter = agent_adapter
         self.engine = engine
@@ -83,35 +86,70 @@ class ProposerRunner:
         # going straight to SWESmithEngine.generate(). When ``workflow`` is
         # None we lazily build a default RepoChainWorkflow wrapping the engine.
         self._workflow = workflow
+        self.workflow_config = workflow_config
+        # P0-6: production forbids silent fallback to SWESmithEngine.
+        self.allow_workflow_fallback = bool(allow_workflow_fallback)
+        # P0-23: main experiment forbids PR-replay / human-curated data.
+        self.allow_human_curated_data = bool(allow_human_curated_data)
         self.trajectory_analyzer = TrajectoryAnalyzer()
         self.code_locator = CodeLocator()
         self.planner = ProposerPlanner(code_locator=self.code_locator)
         self.feedback_processor = CandidateFeedbackProcessor()
         self.statement_generator = StatementGenerator()
+        self._workflow_fallback_used = False
 
     @property
     def workflow(self):
-        """Lazily instantiate the default RepoChainWorkflow."""
+        """Lazily instantiate the default RepoChainWorkflow (P0-5/P0-6)."""
         if self._workflow is None:
             try:
                 from proposer.workflows.repo_chain import RepoChainWorkflow
 
-                self._workflow = RepoChainWorkflow(
-                    agent_adapter=self.agent_adapter,
-                    engine=self.engine,
-                    trajectory_analyzer=self.trajectory_analyzer,
-                    code_locator=self.code_locator,
-                )
-            except Exception:
-                # If RepoChainWorkflow cannot be built, fall back to calling
-                # the engine directly so the proposer remains usable in tests
-                # that inject a stub engine.
+                kwargs = {
+                    "agent_adapter": self.agent_adapter,
+                    "engine": self.engine,
+                    "trajectory_analyzer": self.trajectory_analyzer,
+                    "code_locator": self.code_locator,
+                }
+                cfg = self.workflow_config
+                if cfg is not None:
+                    kwargs["config"] = cfg
+                    if hasattr(cfg, "mutation_backends"):
+                        kwargs["mutation_backend_weights"] = dict(
+                            cfg.mutation_backends or {}
+                        )
+                    if hasattr(cfg, "require_causal_ablation"):
+                        kwargs["require_causal_ablation"] = bool(
+                            cfg.require_causal_ablation
+                        )
+                self._workflow = RepoChainWorkflow(**kwargs)
+            except Exception as exc:
+                # P0-6: production must crash rather than silently degrade
+                # to plain SWE-smith generation.
+                if not self.allow_workflow_fallback:
+                    raise RuntimeError(
+                        "RepoChainWorkflow unavailable in production mode"
+                    ) from exc
                 self._workflow = None
+                self._workflow_fallback_used = True
         return self._workflow
 
     def generate_batch(self, request: ProposerRequest) -> ProposerResult:
         result = ProposerResult.new_for(request)
+        # P0-6: always record which workflow ran so silent degradation is
+        # visible in batch artifacts.
+        result.workflow = "repo_chain"
+        result.workflow_fallback = False
+        # Prefer request-carried workflow config when the runner was not
+        # constructed with an explicit config object (subprocess path).
+        if self.workflow_config is None and getattr(request, "workflow_config", None):
+            self.workflow_config = request.workflow_config
+        if getattr(request, "allow_workflow_fallback", None) is not None:
+            self.allow_workflow_fallback = bool(request.allow_workflow_fallback)
+        if getattr(request, "allow_human_curated_data", None) is not None:
+            self.allow_human_curated_data = bool(request.allow_human_curated_data)
         try:
+            self._enforce_human_data_policy(request)
             traces = self._load_trajectories(request)
             outcomes = self._load_outcomes(request, traces)
             signatures = self.trajectory_analyzer.extract_signatures(traces, outcomes)
@@ -127,6 +165,7 @@ class ProposerRunner:
                         result.add_candidate(cand, accepted=True)
                         result.add_pending_candidate(cand)
                     result.completed = len(candidates) > 0
+                    result.workflow_fallback = bool(self._workflow_fallback_used)
                     return result
                 result.completed = True
                 return result
@@ -145,6 +184,8 @@ class ProposerRunner:
             )
             for index, plan in enumerate(plans):
                 plan.seed = request.generation_attempt * 1000 + index + 1
+                # P0-5: stamp RepoChain difficulty constraints onto every plan.
+                self._stamp_repo_chain_constraints(plan)
                 rejected_feedback = [
                     {
                         "candidate_id": feedback.candidate_id,
@@ -159,6 +200,7 @@ class ProposerRunner:
                     # same invalid construction on the next generation attempt.
                     plan.task_blueprint["trusted_validation_feedback"] = rejected_feedback
             candidates = self._generate_candidates(request, plans, repo_index)
+            result.workflow_fallback = bool(self._workflow_fallback_used)
             # Generation may attach an engine rejection reason to the plan.
             result.plans = [p.model_dump() for p in plans]
             self._write_candidates(request, candidates, plans)
@@ -186,7 +228,57 @@ class ProposerRunner:
         except Exception as exc:  # pragma: no cover - skeleton guard
             result.error = f"{type(exc).__name__}: {exc}"
             result.completed = False
+            result.workflow_fallback = bool(self._workflow_fallback_used)
         return result
+
+    def _enforce_human_data_policy(self, request: ProposerRequest) -> None:
+        """P0-23: refuse PR-replay / human-curated data in the main setting."""
+        if self.allow_human_curated_data:
+            return
+        weights = dict(getattr(request, "strategy_weights", None) or {})
+        cfg = self.workflow_config or getattr(request, "workflow_config", None) or {}
+        if isinstance(cfg, dict):
+            backends = dict(cfg.get("mutation_backends") or {})
+        else:
+            backends = dict(getattr(cfg, "mutation_backends", None) or {})
+        pr_weight = max(
+            float(weights.get("pr_replay", 0.0) or 0.0),
+            float(weights.get("pr_mirror", 0.0) or 0.0),
+            float(backends.get("pr_replay", 0.0) or 0.0),
+            float(backends.get("pr_mirror", 0.0) or 0.0),
+        )
+        if pr_weight > 0.0:
+            # Prefer zeroing request weights so a misconfigured YAML cannot
+            # silently introduce human-curated PR data into the main run.
+            for key in ("pr_replay", "pr_mirror"):
+                if key in weights:
+                    weights[key] = 0.0
+            request.strategy_weights = weights
+            import logging
+
+            logging.getLogger("proposer.runner").warning(
+                "P0-23: forced pr_replay/pr_mirror weights to 0 "
+                "(allow_human_curated_data=False)"
+            )
+
+    def _stamp_repo_chain_constraints(self, plan: BugGenerationPlan) -> None:
+        """P0-5: force plan constraints from RepoChainWorkflowConfig."""
+        cfg = self.workflow_config
+        if cfg is None:
+            return
+        constraints = plan.task_blueprint.setdefault("constraints", {})
+        if not isinstance(constraints, dict):
+            constraints = {}
+            plan.task_blueprint["constraints"] = constraints
+        for src, dst in (
+            ("min_files", "min_modified_files"),
+            ("max_files", "max_modified_files"),
+            ("min_mutation_sites", "min_mutation_sites"),
+            ("max_mutation_sites", "max_mutation_sites"),
+            ("context_file_budget", "context_file_budget"),
+        ):
+            if hasattr(cfg, src):
+                constraints[dst] = getattr(cfg, src)
 
     def _load_trajectories(self, request: ProposerRequest) -> List[TrajectoryView]:
         views: List[TrajectoryView] = []
@@ -223,11 +315,15 @@ class ProposerRunner:
         bypassing RepoChain entirely.
         """
         try:
-            from proposer.workflows.repo_chain import RepoChainWorkflow
             from proposer.workflows.repo_chain.bootstrap import (
                 BOOTSTRAP_CAPABILITY_PRIOR,
             )
-        except Exception:
+        except Exception as exc:
+            if not self.allow_workflow_fallback:
+                raise RuntimeError(
+                    "RepoChain bootstrap unavailable in production mode"
+                ) from exc
+            self._workflow_fallback_used = True
             return []
         if not request.repo_specs:
             return []
@@ -238,18 +334,24 @@ class ProposerRunner:
             base_commit=spec.base_commit,
             test_command=spec.test_command,
         )
-        workflow = RepoChainWorkflow(
-            agent_adapter=self.agent_adapter,
-            engine=self.engine,
-            trajectory_analyzer=self.trajectory_analyzer,
-            code_locator=self.code_locator,
-        )
+        # P0-5/P0-6: bootstrap must use the same RepoChainWorkflow path as
+        # normal generation (no silent engine fallback).
+        workflow = self.workflow
+        if workflow is None:
+            if not self.allow_workflow_fallback:
+                raise RuntimeError(
+                    "RepoChainWorkflow required for bootstrap but unavailable"
+                )
+            self._workflow_fallback_used = True
+            return []
         cand_dir = os.path.join(request.output_dir, "proposer_candidates", "bootstrap")
         os.makedirs(cand_dir, exist_ok=True)
         candidates = workflow.bootstrap(
             repo_spec=repo_spec,
             output_dir=cand_dir,
             capability_prior=BOOTSTRAP_CAPABILITY_PRIOR,
+            target_count=int(request.target_batch_size or 10),
+            max_candidates=int(request.max_candidates or 50),
         )
         # Stamp each candidate with the request model / plan id metadata so the
         # downstream commit step has the provenance it expects.
@@ -340,12 +442,7 @@ class ProposerRunner:
             os.makedirs(cand_dir, exist_ok=True)
             self._write_plan(cand_dir, plan)
             try:
-                # BUG-02/03: route through RepoChainWorkflow so the stages
-                # (weakness -> transfer -> chain discovery -> contract ->
-                # mutation -> ablation) actually run. The workflow delegates
-                # the heavy lifting to its backing RepoChainGenerator. When no
-                # workflow is available (e.g. stub engines in unit tests) we
-                # fall back to the raw engine so the contract is preserved.
+                # P0-6: production must not silently fall back to SWE-smith.
                 if workflow is not None:
                     produced = workflow.generate(
                         plan=plan,
@@ -354,6 +451,11 @@ class ProposerRunner:
                         output_dir=cand_dir,
                     )
                 else:
+                    if not self.allow_workflow_fallback:
+                        raise RuntimeError(
+                            "RepoChainWorkflow unavailable in production mode"
+                        )
+                    self._workflow_fallback_used = True
                     produced = self.engine.generate(
                         plan=plan,
                         node_code_dir=request.agent_code_dir,

@@ -70,14 +70,14 @@ class TestThompsonSamplingSelector:
         assert counts["strong"] > counts["weak"]
 
     def test_descendant_evals_includes_descendant_utilities(self, node_archive):
-        parent = _make_node("parent", [1.0, 0.0])
+        parent = _make_node("parent", [1.0, 0.0])  # mean 0.5
         node_archive.add(parent)
         child = _make_node("child", [1.0, 1.0], parent="parent")
         node_archive.add(child)
         evals = descendant_evals(parent, node_archive, num_pseudo=10)
-        # parent's own (2 evals) + child's (2 evals) = 4
-        assert len(evals) == 4
-        assert sum(evals) == 3.0  # 1+0+1+1
+        # parent's pseudo [0.5]*10 + child's raw [1.0, 1.0]
+        assert len(evals) == 12
+        assert sum(evals) == pytest.approx(7.0)  # 5.0 + 2.0
 
 
 class TestScorerHGMGate:

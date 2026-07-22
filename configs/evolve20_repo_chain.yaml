@@ -28,6 +28,10 @@ scoring:
   regression_weight: 0.5
   proposer_target_accuracy: 0.5
   min_parent_solved_tasks: 1
+  mode: hgm
+  selection:
+    strategy: thompson_sampling
+    num_pseudo_descendant_evals: 10
 
 evaluation:
   solver_rollouts: 1

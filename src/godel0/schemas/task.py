@@ -22,10 +22,15 @@ class TaskRecord(BaseModel):
     source_trajectory_ids: List[str] = Field(default_factory=list)
     failure_signature_id: str = ""
 
-    # Task source metadata (Phase 6: Task Source Quota).
+    # Task source metadata (Phase 6 / P0-12 provenance).
     source_node: str = ""
     source_trajectory: str = ""
     source_type: str = ""
+    # P0-12: explicit provenance fields (preferred over the shorter aliases).
+    source_node_id: str = ""
+    source_trajectory_id: str = ""
+    source_task_id: str = ""
+    source_failure_stage: str = ""
 
     bug_strategy: str
     bug_patch_path: str

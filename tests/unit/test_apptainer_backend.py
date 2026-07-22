@@ -94,3 +94,72 @@ class TestExecutionBackendFactory:
         )
         backend = factory.repo_backend("nonexistent")
         assert isinstance(backend, SubprocessRunner)
+
+
+class TestApptainerOptionOrderAndHostEnv:
+    def test_pwd_appears_before_image(self, tmp_path, monkeypatch):
+        """P0-13: --pwd and other exec options must precede image.sif."""
+        image = tmp_path / "agent.sif"
+        image.write_text("dummy")
+        runner = ApptainerRunner(image=image)
+
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["env"] = dict(kwargs.get("env") or {})
+
+            class R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return R()
+
+        monkeypatch.setattr("godel0.execution.apptainer.subprocess.run", fake_run)
+        runner.run(
+            command=["python", "-c", "print(1)"],
+            cwd=tmp_path,
+            env={},
+            timeout_sec=5,
+            binds={tmp_path: "/workspace"},
+        )
+        cmd = captured["cmd"]
+        image_idx = cmd.index(str(image))
+        pwd_idx = cmd.index("--pwd")
+        assert pwd_idx < image_idx
+        # Options must all come before the image.
+        assert "--bind" in cmd[:image_idx]
+        assert "--cleanenv" in cmd[:image_idx]
+
+    def test_host_launcher_keeps_path_home(self, tmp_path, monkeypatch):
+        """P0-15: host subprocess env retains PATH/HOME even under --cleanenv."""
+        image = tmp_path / "agent.sif"
+        image.write_text("dummy")
+        runner = ApptainerRunner(image=image, clean_env=True)
+
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["env"] = dict(kwargs.get("env") or {})
+
+            class R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return R()
+
+        monkeypatch.setenv("PATH", "/custom/bin:/usr/bin")
+        monkeypatch.setenv("HOME", "/home/tester")
+        monkeypatch.setattr("godel0.execution.apptainer.subprocess.run", fake_run)
+        runner.run(
+            command=["true"],
+            cwd=tmp_path,
+            env={},
+            timeout_sec=5,
+        )
+        env = captured["env"]
+        assert "PATH" in env
+        assert env["PATH"].startswith("/custom/bin")
+        assert env.get("HOME") == "/home/tester"

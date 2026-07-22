@@ -29,6 +29,12 @@ scoring:
   regression_weight: 0.5
   proposer_target_accuracy: 0.5
   min_parent_solved_tasks: 3
+  # P0-2: main experiment uses HGM quality gate + Thompson Sampling.
+  # Use mode: joint only for the Gödel0-Joint ablation.
+  mode: hgm
+  selection:
+    strategy: thompson_sampling
+    num_pseudo_descendant_evals: 10
 
 diagnosis:
   one_primary_root_cause: true
@@ -70,15 +76,15 @@ proposer:
     require_generated_contracts: true
     require_causal_ablation: true
     mutation_backends:
-      lm_modify: 0.30
-      lm_rewrite: 0.15
-      procedural: 0.40
-      combine: 0.10
-      pr_mirror: 0.05
+      lm_modify: 0.7
+      procedural: 0.3
+      pr_replay: 0.0
   candidate_timeout_sec: 120
   max_patch_lines: 80
   forbid_test_file_edits: true
   require_f2p: true
+  allow_human_curated_data: false
+  allow_workflow_fallback: false
 
 execution:
   backend: "subprocess"

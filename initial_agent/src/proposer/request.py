@@ -67,6 +67,13 @@ class ProposerRequest:
     repo_specs: List[RepoSpecInfo] = field(default_factory=list)
     contract_test_renderer: str = ""
     bootstrap: bool = False
+    # P0-5: optional RepoChainWorkflowConfig payload (dict form for JSON).
+    workflow_config: Dict[str, Any] = field(default_factory=dict)
+    # P0-10/11: effective per-source generation targets.
+    generation_quotas: Dict[str, int] = field(default_factory=dict)
+    # P0-6 / P0-23: production defaults mirror ProposerConfig.
+    allow_workflow_fallback: bool = False
+    allow_human_curated_data: bool = False
 
     @classmethod
     def load(cls, path: str) -> "ProposerRequest":
@@ -149,6 +156,9 @@ class ProposerResult:
     failure_signatures: List[Dict[str, Any]] = field(default_factory=list)
     plans: List[Dict[str, Any]] = field(default_factory=list)
     error: str = ""
+    # P0-6: persist which workflow ran so silent degradation is auditable.
+    workflow: str = "repo_chain"
+    workflow_fallback: bool = False
     timestamp: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
 
     def add_candidate(self, candidate: CandidateArtifact, accepted: bool) -> None:
@@ -171,6 +181,8 @@ class ProposerResult:
             "failure_signatures": self.failure_signatures,
             "plans": self.plans,
             "error": self.error,
+            "workflow": self.workflow,
+            "workflow_fallback": self.workflow_fallback,
             "timestamp": self.timestamp,
         }
 
@@ -196,6 +208,8 @@ class ProposerResult:
             failure_signatures=list(data.get("failure_signatures") or []),
             plans=list(data.get("plans") or []),
             error=str(data.get("error") or ""),
+            workflow=str(data.get("workflow") or "repo_chain"),
+            workflow_fallback=bool(data.get("workflow_fallback", False)),
             timestamp=str(data.get("timestamp") or ""),
         )
         result.accepted_candidates = [

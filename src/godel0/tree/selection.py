@@ -78,16 +78,15 @@ def _pseudo_descendant_evals(
 ) -> List[float]:
     """HGM-style pseudo-descendant evaluations for a single node.
 
-    When a node has fewer utility measurements than ``num_pseudo``, return the
-    raw measurements. Otherwise return ``num_pseudo`` copies of the node's mean
-    outcome so a node with many evaluations does not get an artificially wider
-    posterior simply because it was exercised more often.
+    P0-1: always summarise the node's trusted Level2 utilities by their mean
+    and replicate ``num_pseudo`` times. That yields fractional observations
+    such as ``[0.6] * 10`` which the Beta posterior must sum (not threshold).
     """
     own = list(getattr(node, "utility_measures", []) or [])
-    if not own or len(own) < num_pseudo:
-        return own
-    mean = sum(own) / len(own)
-    return [mean] * num_pseudo
+    if not own:
+        return []
+    mean = float(sum(own) / len(own))
+    return [mean] * max(1, int(num_pseudo))
 
 
 def descendant_evals(
@@ -138,10 +137,15 @@ class ThompsonSamplingSelector:
                 alpha = 1.0
                 beta = 1.0
             else:
-                successes = sum(1.0 for value in evals if value >= 1.0)
+                # P0-1: fractional posterior. Pseudo-descendant evals are
+                # mean-replicated floats (e.g. [0.6]*10). Counting only
+                # ``value >= 1.0`` treats every 0.6 as a full failure and
+                # collapses Beta(7,5) -> Beta(1,11). Sum the fractional
+                # observations directly so 0.6 x 10 => success=6, failure=4.
+                successes = float(sum(evals))
                 failures = float(len(evals)) - successes
                 alpha = 1.0 + successes
-                beta = 1.0 + failures
+                beta = 1.0 + max(0.0, failures)
             theta = rng.betavariate(alpha, beta)
             if theta > best_theta:
                 best_theta = theta

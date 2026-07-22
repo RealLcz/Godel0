@@ -54,7 +54,18 @@ def _build_runner(args: argparse.Namespace, request: ProposerRequest) -> Propose
     engine = None
     if not args.dry_run:
         engine = _load_engine(args.engine, request, agent_adapter)
-    return ProposerRunner(agent_adapter=agent_adapter, engine=engine)
+    workflow_config = getattr(request, "workflow_config", None) or None
+    return ProposerRunner(
+        agent_adapter=agent_adapter,
+        engine=engine,
+        workflow_config=workflow_config,
+        allow_workflow_fallback=bool(
+            getattr(request, "allow_workflow_fallback", False)
+        ),
+        allow_human_curated_data=bool(
+            getattr(request, "allow_human_curated_data", False)
+        ),
+    )
 
 
 def _load_engine(name: str, request: ProposerRequest, agent_adapter=None):

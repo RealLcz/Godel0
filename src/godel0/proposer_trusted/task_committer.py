@@ -40,6 +40,10 @@ class TaskCommitter:
         source_node: str = "",
         source_trajectory: str = "",
         source_type: str = "",
+        source_node_id: str = "",
+        source_trajectory_id: str = "",
+        source_task_id: str = "",
+        source_failure_stage: str = "",
     ) -> TaskRecord:
         """Create and commit a new task."""
         task_id = f"task_{uuid.uuid4().hex[:12]}"
@@ -49,6 +53,10 @@ class TaskCommitter:
 
         added_lines = bug_patch.count("\n+")
         deleted_lines = bug_patch.count("\n-")
+
+        # P0-12: prefer explicit provenance fields; fall back to aliases.
+        resolved_node_id = source_node_id or source_node
+        resolved_traj_id = source_trajectory_id or source_trajectory
 
         record = TaskRecord(
             task_id=task_id,
@@ -74,9 +82,13 @@ class TaskCommitter:
             safety_valid=True,
             duplicate_valid=True,
             content_hash=hashlib.sha256(bug_patch.encode()).hexdigest(),
-            source_node=source_node,
-            source_trajectory=source_trajectory,
+            source_node=resolved_node_id,
+            source_trajectory=resolved_traj_id,
             source_type=source_type,
+            source_node_id=resolved_node_id,
+            source_trajectory_id=resolved_traj_id,
+            source_task_id=source_task_id,
+            source_failure_stage=source_failure_stage,
         )
 
         artifacts = TaskArtifacts(
