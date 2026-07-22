@@ -119,6 +119,7 @@ def test_solver_patch_rejects_empty_patch(toy_repo, tmp_path):
         / "trajectories"
         / "level_2"
         / task.task_id
+        / "rollout_0"
         / "trajectory_eval.json"
     )
     assert eval_path.is_file()
@@ -151,6 +152,7 @@ def test_solver_artifact_dir_is_absolute_for_relative_scratch(tmp_path, monkeypa
         / "trajectories"
         / "level_2"
         / "task"
+        / "rollout_0"
     )
 
 

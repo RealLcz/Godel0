@@ -51,6 +51,7 @@ class CandidateValidator:
         forbid_test_file_edits: bool = True,
         duplicate_detector: Optional[DuplicateDetector] = None,
         execution_backend=None,
+        backend_factory=None,
         require_causal_ablation: bool = False,
         min_independently_active: int = 2,
     ):
@@ -65,6 +66,10 @@ class CandidateValidator:
         # whole chain is end-to-end Apptainer. When None, fall back to direct
         # subprocess (backward compatible).
         self.execution_backend = execution_backend
+        # P0-8.2: prefer factory so each validate(repo_id=...) resolves
+        # repo_image_dir/<repo_id>.sif dynamically.
+        self.backend_factory = backend_factory
+        self._active_repo_id = ""
         # P0-7: authoritative trusted causal ablation gate. Default False so
         # unit tests / ablations that inject a bare validator keep working;
         # EvolutionOrchestrator.from_config enables it from RepoChain config.
@@ -147,82 +152,103 @@ class CandidateValidator:
             **duplicate_args,
         )
         if not report.duplicate_valid:
-            report.rejection_reasons.append("duplicate")
+            self._add_rejection(report, "duplicate", stage="duplicate")
             return report
 
         workspace = self.workspace_root / f"validate_{candidate_id}"
         workspace.mkdir(parents=True, exist_ok=True)
 
+        # P0-8.2: pin active repo_id for _run_tests → factory.repo_backend(repo_id)
+        # through both main validation and trusted causal ablation.
+        previous_repo_id = self._active_repo_id
+        self._active_repo_id = str(repo_id or "")
         try:
-            report = self._run_validation(
-                candidate_patch=candidate_patch,
-                repo_path=repo_path,
-                base_commit=base_commit,
-                test_command=self._ensure_verbose_pytest(test_command),
-                workspace=workspace,
-                install_command=install_command,
-                target_file=target_file,
-                target_symbol=target_symbol,
-                report=report,
-                validation_mode=validation_mode,
-                command_test_id=command_test_id,
-                control_test_command=control_test_command,
-                setup_patch=setup_patch,
+            try:
+                report = self._run_validation(
+                    candidate_patch=candidate_patch,
+                    repo_path=repo_path,
+                    base_commit=base_commit,
+                    test_command=self._ensure_verbose_pytest(test_command),
+                    workspace=workspace,
+                    install_command=install_command,
+                    target_file=target_file,
+                    target_symbol=target_symbol,
+                    report=report,
+                    validation_mode=validation_mode,
+                    command_test_id=command_test_id,
+                    control_test_command=control_test_command,
+                    setup_patch=setup_patch,
+                )
+            except Exception as e:
+                report.rejection_reasons.append(f"validation_error: {str(e)[:200]}")
+            finally:
+                import shutil
+                shutil.rmtree(workspace, ignore_errors=True)
+
+            report.passed = (
+                report.patch_applied
+                and report.syntax_valid
+                and len(report.f2p_tests) >= 1
+                and len(report.p2p_tests) >= 1
+                and report.reverse_restored
+                and report.safety_valid
+                and report.duplicate_valid
+                and report.relevance_valid
             )
-        except Exception as e:
-            report.rejection_reasons.append(f"validation_error: {str(e)[:200]}")
+
+            # P0-7: Trusted Causal Ablation (authoritative). Local RepoChain
+            # metadata is advisory only; this re-executes per-file repairs.
+            if report.passed and self.require_causal_ablation:
+                ablation_ok = self._run_trusted_causal_ablation(
+                    candidate_patch=candidate_patch,
+                    repo_path=repo_path,
+                    base_commit=base_commit,
+                    test_command=self._ensure_verbose_pytest(test_command),
+                    setup_patch=setup_patch,
+                    f2p_tests=list(report.f2p_tests),
+                    report=report,
+                    validation_mode=validation_mode,
+                    command_test_id=command_test_id,
+                    control_test_command=control_test_command,
+                )
+                if not ablation_ok:
+                    report.passed = False
+                    if "trusted_causal_ablation_failed" not in report.rejection_reasons:
+                        self._add_rejection(report, "trusted_causal_ablation_failed", stage="trusted_causal_failure")
+
+            if report.passed:
+                report.duplicate_valid = self.duplicate_detector.record(
+                    **duplicate_args,
+                )
+                if not report.duplicate_valid:
+                    report.passed = False
+                    self._add_rejection(report, "duplicate", stage="duplicate")
+
+            if not report.passed and not report.rejection_reasons:
+                if not report.f2p_tests:
+                    self._add_rejection(report, "no_f2p", stage="no_f2p")
+                if not report.reverse_restored:
+                    report.rejection_reasons.append("reverse_not_restored")
+                if not report.syntax_valid:
+                    report.rejection_reasons.append("syntax_error")
+
+            return report
         finally:
-            import shutil
-            shutil.rmtree(workspace, ignore_errors=True)
+            self._active_repo_id = previous_repo_id
 
-        report.passed = (
-            report.patch_applied
-            and report.syntax_valid
-            and len(report.f2p_tests) >= 1
-            and len(report.p2p_tests) >= 1
-            and report.reverse_restored
-            and report.safety_valid
-            and report.duplicate_valid
-            and report.relevance_valid
-        )
 
-        # P0-7: Trusted Causal Ablation (authoritative). Local RepoChain
-        # metadata is advisory only; this re-executes per-file repairs.
-        if report.passed and self.require_causal_ablation:
-            ablation_ok = self._run_trusted_causal_ablation(
-                candidate_patch=candidate_patch,
-                repo_path=repo_path,
-                base_commit=base_commit,
-                test_command=self._ensure_verbose_pytest(test_command),
-                setup_patch=setup_patch,
-                f2p_tests=list(report.f2p_tests),
-                report=report,
-                validation_mode=validation_mode,
-                command_test_id=command_test_id,
-                control_test_command=control_test_command,
-            )
-            if not ablation_ok:
-                report.passed = False
-                if "trusted_causal_ablation_failed" not in report.rejection_reasons:
-                    report.rejection_reasons.append("trusted_causal_ablation_failed")
-
-        if report.passed:
-            report.duplicate_valid = self.duplicate_detector.record(
-                **duplicate_args,
-            )
-            if not report.duplicate_valid:
-                report.passed = False
-                report.rejection_reasons.append("duplicate")
-
-        if not report.passed and not report.rejection_reasons:
-            if not report.f2p_tests:
-                report.rejection_reasons.append("no_f2p")
-            if not report.reverse_restored:
-                report.rejection_reasons.append("reverse_not_restored")
-            if not report.syntax_valid:
-                report.rejection_reasons.append("syntax_error")
-
-        return report
+    def _add_rejection(
+        self,
+        report: CandidateValidationReport,
+        reason: str,
+        *,
+        stage: str = "",
+    ) -> None:
+        """P1-3: append a human reason and an optional structured stage code."""
+        report.rejection_reasons.append(reason)
+        code = str(stage or "").strip()
+        if code and code not in report.failure_stages:
+            report.failure_stages.append(code)
 
     def _run_trusted_causal_ablation(
         self,
@@ -238,18 +264,21 @@ class CandidateValidator:
         command_test_id: str,
         control_test_command: Optional[str],
     ) -> bool:
-        """P0-7: re-execute causal ablation under Trusted Validator authority.
+        """P0-7 / P0-6: trusted causal ablation with necessity + isolation.
 
-        For each modified source file F:
-          full bug applied → restore only F → re-run F2P tests.
-        If restoring F alone makes ALL F2P tests pass again, the task is
-        single-file solvable via F (``repair_one_file_results[F]=True``).
+        Two complementary checks (mirroring RepoChain ``_causal_ablation``):
 
-        Gate:
-          - at least 2 source files
-          - no single-file repair restores all F2P
-          - independently_active_file_count >= min_independently_active
-            (files whose solo repair still leaves at least one F2P failing)
+        A. Necessity / leave-one-out repair
+           Full bug − File_i → does the contract fully restore?
+           Require: no single-file repair fully restores.
+
+        B. Independent causal activity (isolation)
+           Clean repo + only File_i mutation → does the target contract fail?
+           ``independently_active_file_count`` = number of files whose isolated
+           mutation alone triggers regression. Require >= min_independently_active.
+
+        Leave-one-out "still fail after repairing C" does NOT prove C is
+        active — unrelated filler edits also leave other bugs intact.
         """
         source_files = [
             f for f in extract_changed_files(candidate_patch)
@@ -257,19 +286,22 @@ class CandidateValidator:
         ]
         if len(source_files) < 2:
             report.trusted_causal_ablation_pass = False
-            report.independently_active_file_count = len(source_files)
-            report.repair_one_file_results = {f: True for f in source_files}
-            report.rejection_reasons.append("not_multi_file")
+            report.independently_active_file_count = 0
+            report.repair_one_file_results = {f: False for f in source_files}
+            report.isolated_file_triggers = {f: False for f in source_files}
+            self._add_rejection(report, "not_multi_file", stage="trusted_causal_failure")
             return False
 
         per_file = split_patch_by_file(candidate_patch)
         repair_results: dict = {}
-        independently_active = 0
+        isolated_triggers: dict = {}
 
         with tempfile.TemporaryDirectory(
             prefix="causal_ablation_", dir=str(self.workspace_root)
         ) as tmp:
             workspace = Path(tmp)
+
+            # ---- A. Leave-one-out necessity ----
             for file_path in source_files:
                 file_patch = per_file.get(file_path) or filter_patch_by_files(
                     candidate_patch, [file_path]
@@ -277,8 +309,7 @@ class CandidateValidator:
                 if not file_patch.strip():
                     repair_results[file_path] = False
                     continue
-                # Fresh workspace: apply full bug, then reverse only this file.
-                repo_copy = workspace / f"ablate_{file_path.replace('/', '_')}"
+                repo_copy = workspace / f"ablate_repair_{file_path.replace('/', '_')}"
                 try:
                     self._prepare_ablation_workspace(
                         repo_copy, repo_path, base_commit, setup_patch, candidate_patch
@@ -290,10 +321,8 @@ class CandidateValidator:
                     repair_results[file_path] = False
                     continue
 
-                # Restore only this file (reverse its hunk).
                 reverse_ok = reverse_patch(repo_copy, file_patch)
                 if not reverse_ok:
-                    # Fallback: reset and re-apply full patch minus this file.
                     try:
                         reset_to_commit(repo_copy, base_commit)
                         if setup_patch.strip():
@@ -311,25 +340,52 @@ class CandidateValidator:
                     repair_results[file_path] = False
                     continue
 
-                result = self._run_tests(repo_copy, test_command)
-                if result.get("timed_out"):
-                    repair_results[file_path] = False
-                    continue
-                if validation_mode == "exit_code":
-                    # Restored if primary test now passes.
-                    restored = result.get("returncode") == 0
-                else:
-                    passed = self._parse_passed_tests(result, repo_copy)
-                    restored = all(t in passed for t in f2p_tests) if f2p_tests else False
-
-                # True = single-file repair restored contracts (BAD for RepoChain).
+                restored = self._ablation_contracts_restored(
+                    repo_copy,
+                    test_command,
+                    f2p_tests=f2p_tests,
+                    validation_mode=validation_mode,
+                )
+                # True = single-file repair restored contracts (BAD).
                 repair_results[file_path] = bool(restored)
-                if not restored:
-                    independently_active += 1
 
+            # ---- B. Isolation activity ----
+            for file_path in source_files:
+                file_patch = per_file.get(file_path) or filter_patch_by_files(
+                    candidate_patch, [file_path]
+                )
+                if not file_patch.strip():
+                    isolated_triggers[file_path] = False
+                    continue
+                repo_copy = workspace / f"ablate_iso_{file_path.replace('/', '_')}"
+                try:
+                    self._prepare_isolation_workspace(
+                        repo_copy, repo_path, base_commit, setup_patch, file_patch
+                    )
+                except Exception as exc:
+                    report.rejection_reasons.append(
+                        f"causal_isolation_setup_error:{file_path}:{str(exc)[:80]}"
+                    )
+                    isolated_triggers[file_path] = False
+                    continue
+
+                # Independently active iff isolated mutation alone breaks
+                # the target contract (F2P / exit_code).
+                triggers = self._ablation_contracts_fail(
+                    repo_copy,
+                    test_command,
+                    f2p_tests=f2p_tests,
+                    validation_mode=validation_mode,
+                )
+                isolated_triggers[file_path] = bool(triggers)
+
+        independently_active = sum(1 for v in isolated_triggers.values() if v)
         report.repair_one_file_results = repair_results
+        report.isolated_file_triggers = isolated_triggers
         report.independently_active_file_count = independently_active
-        all_single_fail = not any(repair_results.values()) if repair_results else False
+        all_single_fail = (
+            bool(repair_results) and not any(repair_results.values())
+        )
         passed = (
             all_single_fail
             and independently_active >= self.min_independently_active
@@ -337,13 +393,52 @@ class CandidateValidator:
         report.trusted_causal_ablation_pass = bool(passed)
         if not passed:
             if any(repair_results.values()):
-                report.rejection_reasons.append("single_file_repair_restored_contract")
+                self._add_rejection(report, "single_file_repair_restored_contract", stage="trusted_causal_failure")
             if independently_active < self.min_independently_active:
-                report.rejection_reasons.append(
+                self._add_rejection(
+                    report,
                     f"independently_active_file_count={independently_active}"
-                    f"<{self.min_independently_active}"
+                    f"<{self.min_independently_active}",
+                    stage="trusted_causal_failure",
                 )
         return bool(passed)
+
+    def _ablation_contracts_restored(
+        self,
+        repo_copy: Path,
+        test_command: str,
+        *,
+        f2p_tests: List[str],
+        validation_mode: str,
+    ) -> bool:
+        """True when the ablation workspace fully restores target contracts."""
+        result = self._run_tests(repo_copy, test_command)
+        if result.get("timed_out"):
+            return False
+        if validation_mode == "exit_code":
+            return result.get("returncode") == 0
+        passed = self._parse_passed_tests(result, repo_copy)
+        return all(t in passed for t in f2p_tests) if f2p_tests else False
+
+    def _ablation_contracts_fail(
+        self,
+        repo_copy: Path,
+        test_command: str,
+        *,
+        f2p_tests: List[str],
+        validation_mode: str,
+    ) -> bool:
+        """True when the ablation workspace breaks target contracts."""
+        result = self._run_tests(repo_copy, test_command)
+        if result.get("timed_out"):
+            return False
+        if validation_mode == "exit_code":
+            return result.get("returncode") != 0
+        passed = self._parse_passed_tests(result, repo_copy)
+        if not f2p_tests:
+            return False
+        # At least one F2P regression is enough to count as a trigger.
+        return any(t not in passed for t in f2p_tests)
 
     def _prepare_ablation_workspace(
         self,
@@ -354,6 +449,36 @@ class CandidateValidator:
         candidate_patch: str,
     ) -> None:
         """Clone/reset workspace and apply setup + full bug patch."""
+        self._clone_reset_workspace(repo_copy, repo_path, base_commit)
+        if setup_patch.strip():
+            apply_patch(repo_copy, setup_patch)
+        if not apply_patch(repo_copy, candidate_patch):
+            raise CandidateValidationError("failed to apply full bug for ablation")
+
+    def _prepare_isolation_workspace(
+        self,
+        repo_copy: Path,
+        repo_path: Path,
+        base_commit: str,
+        setup_patch: str,
+        file_patch: str,
+    ) -> None:
+        """Clone/reset workspace and apply setup + a single-file mutation only."""
+        self._clone_reset_workspace(repo_copy, repo_path, base_commit)
+        if setup_patch.strip():
+            apply_patch(repo_copy, setup_patch)
+        if not apply_patch(repo_copy, file_patch):
+            raise CandidateValidationError(
+                "failed to apply isolated file patch for ablation"
+            )
+
+    def _clone_reset_workspace(
+        self,
+        repo_copy: Path,
+        repo_path: Path,
+        base_commit: str,
+    ) -> None:
+        """Shared clone/reset helper for ablation workspaces."""
         import shutil
 
         if repo_copy.exists():
@@ -385,10 +510,6 @@ class CandidateValidator:
                 capture_output=True,
             )
         reset_to_commit(repo_copy, base_commit)
-        if setup_patch.strip():
-            apply_patch(repo_copy, setup_patch)
-        if not apply_patch(repo_copy, candidate_patch):
-            raise CandidateValidationError("failed to apply full bug for ablation")
 
     def _run_validation(
         self,
@@ -522,11 +643,13 @@ class CandidateValidator:
         report.p2p_tests = [t for t in bugged_passed if t in clean_passed]
 
         if not report.f2p_tests:
+            # P1-3: emit no_f2p at the F2P gate (not via substring inference later).
+            self._add_rejection(report, "no_f2p", stage="no_f2p")
             return report
 
         # Require at least 1 P2P (bug should not break everything)
         if not report.p2p_tests:
-            report.rejection_reasons.append("no_p2p")
+            self._add_rejection(report, "no_p2p", stage="no_p2p")
             return report
 
         reverse_ok = reverse_patch(repo_copy, candidate_patch)
@@ -629,20 +752,28 @@ class CandidateValidator:
         filtered = [p for p in parts if p not in {"-q", "--quiet"}]
         return " ".join(filtered + ["-v"])
 
+    def _resolve_repo_backend(self):
+        """P0-8.2: resolve per-repo Apptainer image via factory when present."""
+        if self.backend_factory is not None:
+            return self.backend_factory.repo_backend(self._active_repo_id)
+        return self.execution_backend
+
     def _run_tests(self, repo_path: Path, test_command: str) -> dict:
         """Run a test command and return results.
 
-        BUG-15/10.8: route through the ExecutionBackend when one is configured
-        so trusted repository tests also run inside Apptainer (end-to-end
-        chain). Falls back to direct subprocess for backward compatibility.
+        BUG-15/10.8 / P0-8.2: route through ExecutionBackendFactory.repo_backend
+        (repo_id) when configured so trusted repository tests resolve
+        ``repo_image_dir/<repo_id>.sif``. Falls back to a static
+        ``execution_backend`` or direct subprocess for backward compatibility.
         """
-        if self.execution_backend is not None:
+        backend = self._resolve_repo_backend()
+        if backend is not None:
             try:
                 import shlex as _shlex
 
                 parts = _shlex.split(test_command) if isinstance(test_command, str) else list(test_command)
                 binds = {Path(repo_path): "/workspace"}
-                result = self.execution_backend.run(
+                result = backend.run(
                     command=parts,
                     cwd=Path(repo_path),
                     env={},

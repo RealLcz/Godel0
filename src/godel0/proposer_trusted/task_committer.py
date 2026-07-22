@@ -54,7 +54,9 @@ class TaskCommitter:
         added_lines = bug_patch.count("\n+")
         deleted_lines = bug_patch.count("\n-")
 
-        # P0-12: prefer explicit provenance fields; fall back to aliases.
+        # P0-12 / P0-5: prefer explicit provenance fields; fall back only to
+        # explicit aliases (source_node / source_trajectory). Never invent
+        # values from the proposer node id.
         resolved_node_id = source_node_id or source_node
         resolved_traj_id = source_trajectory_id or source_trajectory
 

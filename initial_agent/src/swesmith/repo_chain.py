@@ -191,7 +191,30 @@ class RepoChainGenerator:
     def __init__(self, agent_adapter: Any = None) -> None:
         self.agent_adapter = agent_adapter
         self.last_rejection = ""
+        self.last_rejection_stage = ""
         self._current_repo_id = ""
+
+    def _stage_for_rejection(self, detail: str) -> str:
+        try:
+            from godel0.schemas.repo_chain_stats import stage_for_engine_rejection
+
+            return stage_for_engine_rejection(detail)
+        except Exception:
+            text = str(detail or "").lower()
+            if "unmodified repository" in text or "clean_contract" in text:
+                return "clean_contract_failure"
+            if "invalid_chain_plan" in text or "contract_not_restored" in text:
+                return "contract_generation_failure"
+            return "mutation_failure"
+
+    def _reject(self, stage: str, detail: str) -> None:
+        """P1-3: emit structured stage + detail for orchestrator stats."""
+        self.last_rejection_stage = str(stage or "")
+        self.last_rejection = str(detail or "")
+
+    def _reject_detail(self, detail: str) -> None:
+        """Classify and emit a rejection from a detail string."""
+        self._reject(self._stage_for_rejection(detail), detail)
 
     def generate(
         self,
@@ -201,13 +224,14 @@ class RepoChainGenerator:
         output_dir: str,
     ) -> List[CandidateArtifact]:
         self.last_rejection = ""
+        self.last_rejection_stage = ""
         self._current_repo_id = getattr(repo_spec, "repo_id", "") or getattr(plan, "target_repo_id", "")
         if self.agent_adapter is None:
-            self.last_rejection = "missing_agent_adapter"
+            self._reject_detail("missing_agent_adapter")
             return []
         source_repo = repository_path(repo_spec, node_code_dir)
         if not source_repo or not os.path.isdir(source_repo):
-            self.last_rejection = "missing_source_repository"
+            self._reject_detail("missing_source_repository")
             return []
 
         constraints = plan.constraints
@@ -230,7 +254,7 @@ class RepoChainGenerator:
             context_budget,
         )
         if len(context_files) < min_files:
-            self.last_rejection = "insufficient_context_files"
+            self._reject_detail("insufficient_context_files")
             return []
         source_bundle = self._source_bundle(Path(source_repo), context_files)
         trajectory_evidence = self._trajectory_evidence(plan)
@@ -371,7 +395,17 @@ class RepoChainGenerator:
                     )
                     self._discard_tests(Path(workspace), tests)
                 if contract_error:
-                    self.last_rejection = f"invalid_chain_plan:{contract_error}"
+                    # P1-3: emit stage at source (clean vs contract generation).
+                    if "unmodified repository" in contract_error.lower():
+                        self._reject(
+                            "clean_contract_failure",
+                            f"clean_contract:{contract_error}",
+                        )
+                    else:
+                        self._reject(
+                            "contract_generation_failure",
+                            f"invalid_chain_plan:{contract_error}",
+                        )
                     return []
                 assert clean_result is not None
                 contract_contents = {
@@ -385,7 +419,7 @@ class RepoChainGenerator:
                     Path(workspace), contract_payload["chain_plan"]
                 )
                 if not mutation_source_bundle:
-                    self.last_rejection = "mutation_symbols_not_found"
+                    self._reject_detail("mutation_symbols_not_found")
                     return []
 
                 mutation_prompt = MUTATION_PROMPT.format(
@@ -463,7 +497,7 @@ class RepoChainGenerator:
                     )
                     break
                 if mutation_error:
-                    self.last_rejection = f"mutation_patch_apply_failed:{mutation_error}"
+                    self._reject_detail(f"mutation_patch_apply_failed:{mutation_error}")
                     return []
                 self._remove_runtime_artifacts(Path(workspace))
                 full_patch = repository_diff(workspace, "HEAD")
@@ -480,7 +514,7 @@ class RepoChainGenerator:
                     self._test_patch(full_patch)
                 )
                 if changed_contract_contents or set(observed_test_files) != set(test_files):
-                    self.last_rejection = (
+                    self._reject_detail(
                         "mutation_modified_contract_tests:"
                         f"changed={changed_contract_contents}:"
                         f"observed={observed_test_files}:expected={test_files}"
@@ -493,18 +527,18 @@ class RepoChainGenerator:
                     require_multiple_files=True,
                 )
                 if not summary.valid:
-                    self.last_rejection = f"invalid_bug_patch:{summary.rejection_reason}"
+                    self._reject_detail(f"invalid_bug_patch:{summary.rejection_reason}")
                     return []
                 if not self._plan_matches_patch(
                     contract_payload["chain_plan"], summary.changed_files, min_sites
                 ):
-                    self.last_rejection = "mutation_patch_does_not_match_plan"
+                    self._reject_detail("mutation_patch_does_not_match_plan")
                     return []
                 bugged_result = self._run_command(
                     workspace, test_command, constraints.generation_timeout_sec
                 )
                 if bugged_result.returncode == 0:
-                    self.last_rejection = "generated_contract_did_not_fail"
+                    self._reject_detail("generated_contract_did_not_fail")
                     return []
                 provisional_taxonomy = self._contract_test_taxonomy(
                     contract_payload, test_files
@@ -522,7 +556,7 @@ class RepoChainGenerator:
                     for control_id in control_ids
                 )
                 if control_ids and not control_passed:
-                    self.last_rejection = "compatibility_control_failed_after_mutation"
+                    self._reject_detail("compatibility_control_failed_after_mutation")
                     return []
                 target_command = self._selected_contract_command(
                     test_command,
@@ -534,17 +568,17 @@ class RepoChainGenerator:
                     target_command,
                     constraints.generation_timeout_sec,
                 ).returncode == 0:
-                    self.last_rejection = "target_contract_did_not_fail_after_mutation"
+                    self._reject_detail("target_contract_did_not_fail_after_mutation")
                     return []
                 if not apply_repository_patch(workspace, bug_patch, reverse=True):
-                    self.last_rejection = "bug_patch_reverse_failed"
+                    self._reject_detail("bug_patch_reverse_failed")
                     return []
                 self._remove_runtime_artifacts(Path(workspace))
                 restored_result = self._run_command(
                     workspace, test_command, constraints.generation_timeout_sec
                 )
                 if restored_result.returncode != 0:
-                    self.last_rejection = "contract_not_restored"
+                    self._reject("contract_generation_failure", "contract_not_restored")
                     return []
                 causal = self._causal_ablation(
                     workspace,
@@ -559,7 +593,7 @@ class RepoChainGenerator:
                     contract_payload, test_files
                 )
                 if not apply_repository_patch(workspace, bug_patch):
-                    self.last_rejection = "bug_patch_reapply_failed_for_oracle"
+                    self._reject_detail("bug_patch_reapply_failed_for_oracle")
                     return []
                 oracle_patch = self._reverse_worktree_diff(
                     workspace, summary.changed_files
@@ -567,10 +601,10 @@ class RepoChainGenerator:
                 if not oracle_patch or not apply_repository_patch(
                     workspace, bug_patch, reverse=True
                 ):
-                    self.last_rejection = "oracle_patch_generation_failed"
+                    self._reject_detail("oracle_patch_generation_failed")
                     return []
         except (RepositoryWorkspaceError, OSError, ValueError, subprocess.SubprocessError) as exc:
-            self.last_rejection = f"generation_error:{type(exc).__name__}:{exc}"
+            self._reject_detail(f"generation_error:{type(exc).__name__}:{exc}")
             return []
 
         candidate_id = self._candidate_id(plan, bug_patch, contract_patch)
@@ -595,6 +629,25 @@ class RepoChainGenerator:
                 "modified_lines": summary.modified_lines,
                 "task_blueprint": blueprint,
                 "source_trajectory_ids": list(getattr(plan, "source_trajectory_ids", []) or []),
+                # P0-5: promote blueprint provenance onto candidate metadata so
+                # TaskBatchBuilder does not invent source_node_id at commit.
+                **{
+                    key: value
+                    for key, value in {
+                        "source_type": str(blueprint.get("source_type") or ""),
+                        "source_node_id": str(blueprint.get("source_node_id") or ""),
+                        "source_task_id": str(blueprint.get("source_task_id") or ""),
+                        "source_trajectory_id": str(
+                            blueprint.get("source_trajectory_id") or ""
+                        ),
+                        "source_failure_stage": str(
+                            blueprint.get("source_failure_stage")
+                            or blueprint.get("failure_stage")
+                            or ""
+                        ),
+                    }.items()
+                    if value
+                },
                 "context_files": context_files,
                 "chain_plan": chain_plan,
                 "structured_symbol_edits": accepted_edits,
@@ -674,21 +727,62 @@ class RepoChainGenerator:
             return method(workspace, prompt, plan)
         blueprint = dict(getattr(plan, "task_blueprint", None) or {})
         max_tokens = 4096 if blueprint.get("contract_test_renderer") else 8192
-        return self._chat(CHAIN_SYSTEM_PROMPT, prompt, max_tokens=max_tokens)
+        return self._chat(
+            CHAIN_SYSTEM_PROMPT,
+            prompt,
+            max_tokens=max_tokens,
+            model=str(getattr(plan, "model", "") or ""),
+        )
 
     def _call_mutation_agent(self, *, plan: BugGenerationPlan, workspace: str, prompt: str) -> Any:
         method = getattr(self.agent_adapter, "generate_repo_chain_bug", None)
         if callable(method):
             result = method(workspace, prompt, plan)
             return result
-        return self._chat(CHAIN_SYSTEM_PROMPT, prompt, max_tokens=4096)
+        return self._chat(
+            CHAIN_SYSTEM_PROMPT,
+            prompt,
+            max_tokens=4096,
+            model=str(getattr(plan, "model", "") or ""),
+        )
 
-    def _chat(self, system_prompt: str, user_prompt: str, *, max_tokens: int) -> str:
+    def _chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        max_tokens: int,
+        model: str = "",
+    ) -> str:
         chat = getattr(self.agent_adapter, "chat", None)
         if not callable(chat):
             return ""
+        resolved = (
+            str(model or "").strip()
+            or str(getattr(self.agent_adapter, "default_model", "") or "").strip()
+        )
+        # P1-1: prefer explicit model=; fall back for older fake adapters.
         try:
-            return str(chat(system_prompt, user_prompt, temperature=0, max_tokens=max_tokens) or "")
+            if resolved:
+                return str(
+                    chat(
+                        system_prompt,
+                        user_prompt,
+                        temperature=0,
+                        max_tokens=max_tokens,
+                        model=resolved,
+                    )
+                    or ""
+                )
+            return str(
+                chat(
+                    system_prompt,
+                    user_prompt,
+                    temperature=0,
+                    max_tokens=max_tokens,
+                )
+                or ""
+            )
         except TypeError:
             try:
                 return str(chat(system_prompt, user_prompt, temperature=0) or "")

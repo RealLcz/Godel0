@@ -71,6 +71,8 @@ class TaskBatch:
     validation_reports: List[dict] = field(default_factory=list)
     proposer_error: str = ""
     engine_rejections: List[dict] = field(default_factory=list)
+    # P1-3: structured stage counters emitted by RepoChain / validator.
+    repo_chain_stats: dict = field(default_factory=dict)
 
 
 @runtime_checkable

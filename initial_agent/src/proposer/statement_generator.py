@@ -144,7 +144,15 @@ class StatementGenerator:
 
     def _call_agent(self, system_prompt: str, user_prompt: str) -> str:
         if hasattr(self.agent_adapter, "chat"):
-            return self.agent_adapter.chat(system_prompt, user_prompt)
+            model = str(getattr(self.agent_adapter, "default_model", "") or "")
+            try:
+                if model:
+                    return self.agent_adapter.chat(
+                        system_prompt, user_prompt, model=model
+                    )
+                return self.agent_adapter.chat(system_prompt, user_prompt)
+            except TypeError:
+                return self.agent_adapter.chat(system_prompt, user_prompt)
         if hasattr(self.agent_adapter, "run_task"):
             return self.agent_adapter.run_task(user_prompt, system_prompt, "", "")
         if hasattr(self.agent_adapter, "chat") and hasattr(self.agent_adapter, "completions"):

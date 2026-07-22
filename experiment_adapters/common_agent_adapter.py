@@ -48,9 +48,13 @@ class CommonAgentAdapter:
         self,
         execution_backend: Optional[ExecutionBackend] = None,
         workspace_manager: Optional[WorkspaceManager] = None,
+        default_model: Optional[str] = None,
     ):
         self.execution_backend = execution_backend or SubprocessRunner()
         self.workspace_manager = workspace_manager
+        # P1-1: role-specific default used when chat(..., model=...) is omitted
+        # (e.g. Proposer subprocess sets default_model=request.model).
+        self.default_model = str(default_model or "").strip()
 
     def run(
         self,
@@ -171,12 +175,25 @@ class CommonAgentAdapter:
         user_prompt: str,
         temperature: float = 0,
         max_tokens: int = 8192,
+        model: Optional[str] = None,
     ) -> str:
-        """Provide the direct chat interface used by repo-level generators."""
+        """Direct chat used by RepoChain / Diagnoser / LM generators.
+
+        P1-1: ``model`` is an explicit role-specific argument. Resolution order:
+          1. ``model=`` argument
+          2. ``self.default_model`` (set by Proposer subprocess from proposer_model)
+          3. ``GODEL0_MODEL`` env (legacy scripts only)
+          4. hard-coded last-resort default
+        """
         from llm import create_client
 
-        model = os.getenv("GODEL0_MODEL", "Qwen/Qwen3.6-35B-A3B")
-        client, client_model = create_client(model)
+        resolved = (
+            str(model or "").strip()
+            or self.default_model
+            or str(os.getenv("GODEL0_MODEL", "") or "").strip()
+            or "Qwen/Qwen3.6-35B-A3B"
+        )
+        client, client_model = create_client(resolved)
         request = {
             "model": client_model,
             "messages": [

@@ -151,6 +151,28 @@ class TestClassifySourceV2:
         assert source_type == "parent_failure"
         assert traj == parent_traj
 
+    def test_prefers_stamped_source_type(self):
+        from godel0.tasks.batch import TaskBatchBuilder
+        from types import SimpleNamespace
+
+        builder = TaskBatchBuilder()
+        child_traj = "/scratch/run1/solver/child/trajectory.jsonl"
+        cand = SimpleNamespace(
+            generation_metadata={
+                "source_type": "current_child_level1",
+                "source_trajectory_id": child_traj,
+                "source_trajectory_ids": [child_traj],
+            },
+        )
+        source_type, traj = builder._classify_source_v2(
+            cand,
+            parent_failure_trajectories=["/other/parent.jsonl"],
+            current_child_level1_trajectories=[child_traj],
+            parent_task_ids=[],
+        )
+        assert source_type == "current_child_level1"
+        assert traj == child_traj
+
     def test_classifies_current_child_level1(self):
         from godel0.tasks.batch import TaskBatchBuilder
         from types import SimpleNamespace

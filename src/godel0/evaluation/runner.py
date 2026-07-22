@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json as _json
 import subprocess
 import time
 import shutil
@@ -38,6 +39,7 @@ class SolverEvaluationRunner:
         task_store,
         workspace_manager,
         execution_backend=None,
+        backend_factory=None,
         test_runner=None,
         repo_pool=None,
         agent_repo: Optional[Path] = None,
@@ -49,7 +51,15 @@ class SolverEvaluationRunner:
         self.task_store = task_store
         self.workspace_manager = workspace_manager
         self.execution_backend = execution_backend
-        self.test_runner = test_runner or SimpleTestRunner()
+        self.backend_factory = backend_factory
+        # P0-8.3: trusted F2P evaluation must use Apptainer repo backends when
+        # configured. A bare SimpleTestRunner is host subprocess only.
+        if test_runner is not None:
+            self.test_runner = test_runner
+        elif backend_factory is not None:
+            self.test_runner = BackendAwareTestRunner(backend_factory)
+        else:
+            self.test_runner = SimpleTestRunner()
         self.repo_pool = repo_pool
         self.agent_repo = Path(agent_repo) if agent_repo else None
         self.agent_adapter = agent_adapter
@@ -65,28 +75,53 @@ class SolverEvaluationRunner:
         seed: int,
         run_id: str = "",
         solver_result_patch: Optional[str] = None,
+        rollout_index: int = 0,
     ) -> EvaluationOutcome:
         """Run solver evaluation on a single task.
 
         If solver_result_patch is provided, skip the actual solver execution
         and just evaluate the given patch (useful for testing).
+
+        P1-4: ``rollout_index`` isolates artifacts when the same task is run
+        multiple times under ``evaluation.solver_rollouts``.
         """
         start_time = time.time()
 
         task_id = task.task_id
         node_id = node.node_id
+        rollout_index = max(0, int(rollout_index))
+        trajectory_id = f"{node_id}_{task_id}_{level}_r{rollout_index}"
 
         try:
             if solver_result_patch is not None:
-                resolved = self._evaluate_patch(task, solver_result_patch, run_id, node_id)
+                resolved = self._evaluate_patch(
+                    task,
+                    solver_result_patch,
+                    run_id,
+                    node_id,
+                    rollout_index=rollout_index,
+                )
                 error_type = None
             else:
-                solver_result_patch = self._run_solver(node, task, run_id, level)
+                solver_result_patch = self._run_solver(
+                    node,
+                    task,
+                    run_id,
+                    level,
+                    seed=seed,
+                    rollout_index=rollout_index,
+                )
                 if solver_result_patch is None:
                     resolved = False
                     error_type = "solver_execution_not_configured"
                 else:
-                    resolved = self._evaluate_patch(task, solver_result_patch, run_id, node_id)
+                    resolved = self._evaluate_patch(
+                        task,
+                        solver_result_patch,
+                        run_id,
+                        node_id,
+                        rollout_index=rollout_index,
+                    )
                     error_type = None
 
             runtime = time.time() - start_time
@@ -97,10 +132,11 @@ class SolverEvaluationRunner:
                 level=level,
                 resolved=resolved,
                 patch_path="",
-                trajectory_id=f"{node_id}_{task_id}_{level}",
+                trajectory_id=trajectory_id,
                 test_summary_path="",
                 runtime_sec=runtime,
                 error_type=error_type,
+                rollout_index=rollout_index,
             )
             self._persist_outcome(outcome, solver_result_patch or "", run_id)
             return outcome
@@ -111,9 +147,10 @@ class SolverEvaluationRunner:
                 task_id=task_id,
                 level=level,
                 resolved=False,
-                trajectory_id=f"{node_id}_{task_id}_{level}",
+                trajectory_id=trajectory_id,
                 runtime_sec=runtime,
                 error_type=str(e),
+                rollout_index=rollout_index,
             )
             self._persist_outcome(outcome, solver_result_patch or "", run_id)
             return outcome
@@ -124,9 +161,17 @@ class SolverEvaluationRunner:
         node_id: str,
         task_id: str,
         level: int,
+        rollout_index: int = 0,
     ) -> Path:
         workspace_root = self._workspace_root(run_id, node_id, task_id)
-        path = workspace_root / "trajectories" / f"level_{level}" / task_id
+        # P1-4: per-rollout dir so repeated solves do not overwrite each other.
+        path = (
+            workspace_root
+            / "trajectories"
+            / f"level_{level}"
+            / task_id
+            / f"rollout_{int(rollout_index)}"
+        )
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -141,6 +186,7 @@ class SolverEvaluationRunner:
             outcome.node_id,
             outcome.task_id,
             outcome.level,
+            rollout_index=int(getattr(outcome, "rollout_index", 0) or 0),
         )
         # BUG-07: persist the solver patch as a real file and record its path on
         # the outcome so downstream stats (empty_patch / test_only) can read it.
@@ -160,6 +206,24 @@ class SolverEvaluationRunner:
             }
         )
         atomic_write_json(artifact_dir / "trajectory_eval.json", data)
+        # P1-4: also write a tiny jsonl marker so trajectory-based solvers_stats
+        # can discover this rollout even when the agent never wrote chat history.
+        marker = artifact_dir / "trajectory.jsonl"
+        if not marker.exists():
+            marker.write_text(
+                _json.dumps(
+                    {
+                        "type": "evaluation_outcome",
+                        "task_id": outcome.task_id,
+                        "resolved": outcome.resolved,
+                        "success": outcome.resolved,
+                        "rollout_index": outcome.rollout_index,
+                        "trajectory_id": outcome.trajectory_id,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
     def _evaluate_patch(
         self,
@@ -167,6 +231,7 @@ class SolverEvaluationRunner:
         solver_patch: str,
         run_id: str = "",
         node_id: str = "",
+        rollout_index: int = 0,
     ) -> bool:
         """Evaluate whether the solver patch resolves the task.
 
@@ -198,11 +263,14 @@ class SolverEvaluationRunner:
         workspace_root = self._workspace_root(run_id, node_id, task.task_id)
         task_workspace = TaskWorkspace(workspace_root)
         bug_patch = self.task_store.get_bug_patch(task.task_id)
+        # Isolate bugged worktrees per rollout so concurrent/repeated runs
+        # do not clobber each other under the same task_id.
+        eval_task_id = f"{task.task_id}__r{int(rollout_index)}"
         repo = task_workspace.setup_bugged_repo(
             source_repo=source_repo,
             base_commit=task.base_commit,
             bug_patch=bug_patch,
-            task_id=task.task_id,
+            task_id=eval_task_id,
         )
 
         try:
@@ -213,11 +281,14 @@ class SolverEvaluationRunner:
                 return False
             command = self._f2p_test_command(task.baseline_test_command, f2p_tests)
             result = self.test_runner.run_tests(
-                repo, command, timeout_sec=self.test_timeout_sec
+                repo,
+                command,
+                timeout_sec=self.test_timeout_sec,
+                repo_id=str(getattr(task, "repo_id", "") or ""),
             )
             return bool(result.get("passed"))
         finally:
-            task_workspace.cleanup(task.task_id)
+            task_workspace.cleanup(eval_task_id)
 
     def _source_repo_for_task(self, task: TaskRecord) -> Optional[Path]:
         if self.repo_pool is None:
@@ -256,6 +327,8 @@ class SolverEvaluationRunner:
         task: TaskRecord,
         run_id: str,
         level: int,
+        seed: int = 0,
+        rollout_index: int = 0,
     ) -> Optional[str]:
         """Run the configured solver adapter and return its patch, if configured."""
         if self.agent_adapter is None or self.agent_repo is None or self.repo_pool is None:
@@ -271,14 +344,21 @@ class SolverEvaluationRunner:
         workspace_root = self._workspace_root(run_id, node.node_id, task.task_id)
         task_workspace = TaskWorkspace(workspace_root)
         bug_patch = self.task_store.get_bug_patch(task.task_id)
+        solve_task_id = f"{task.task_id}__r{int(rollout_index)}"
         repo = task_workspace.setup_bugged_repo(
             source_repo=source_repo,
             base_commit=task.base_commit,
             bug_patch=bug_patch,
-            task_id=task.task_id,
+            task_id=solve_task_id,
         )
         bugged_base_commit = task_workspace.seal_bugged_snapshot(repo)
-        outdir = self._artifact_dir(run_id, node.node_id, task.task_id, level)
+        outdir = self._artifact_dir(
+            run_id,
+            node.node_id,
+            task.task_id,
+            level,
+            rollout_index=rollout_index,
+        )
         outdir.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -291,26 +371,32 @@ class SolverEvaluationRunner:
                     outdir=outdir,
                     test_description=(task.solver_test_command or task.baseline_test_command),
                     self_improve=False,
-                    instance_id=task.task_id,
+                    instance_id=f"{task.task_id}__r{int(rollout_index)}",
                     model=self.model,
                     timeout_sec=self.solver_timeout_sec,
+                    extra_env={
+                        # P1-4: expose rollout seed so agents that honor it can diversify.
+                        "GODEL0_SOLVER_SEED": str(int(seed)),
+                        "GODEL0_SOLVER_ROLLOUT": str(int(rollout_index)),
+                    },
                 )
                 result = self.agent_adapter.run(agent_src, request)
             if not result.success or result.patch_path is None:
                 return None
             return result.patch_path.read_text()
         finally:
-            task_workspace.cleanup(task.task_id)
+            task_workspace.cleanup(solve_task_id)
 
 
 class SimpleTestRunner:
-    """Simple test runner that executes pytest commands."""
+    """Simple test runner that executes pytest commands on the host."""
 
     def run_tests(
         self,
         repo_path: Path,
         test_command: str,
         timeout_sec: int = 120,
+        repo_id: str = "",
     ) -> dict:
         """Run a test command and return parsed results."""
         try:
@@ -340,5 +426,54 @@ class SimpleTestRunner:
                 "returncode": -1,
                 "stdout": "",
                 "stderr": str(e),
+                "passed": False,
+            }
+
+
+class BackendAwareTestRunner:
+    """P0-8.3: route trusted solver F2P tests through repo_backend(repo_id)."""
+
+    def __init__(self, backend_factory) -> None:
+        self.backend_factory = backend_factory
+
+    def run_tests(
+        self,
+        repo_path: Path,
+        test_command: str,
+        timeout_sec: int = 120,
+        repo_id: str = "",
+    ) -> dict:
+        import shlex
+
+        from ..execution.apptainer import ApptainerRunner
+
+        backend = self.backend_factory.repo_backend(str(repo_id or ""))
+        try:
+            parts = (
+                shlex.split(test_command)
+                if isinstance(test_command, str)
+                else list(test_command)
+            )
+            binds = None
+            if isinstance(backend, ApptainerRunner):
+                binds = {Path(repo_path): "/workspace"}
+            result = backend.run(
+                command=parts,
+                cwd=Path(repo_path),
+                env={},
+                timeout_sec=timeout_sec,
+                binds=binds,
+            )
+            return {
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "passed": result.returncode == 0 and not result.timed_out,
+            }
+        except Exception as exc:
+            return {
+                "returncode": -1,
+                "stdout": "",
+                "stderr": str(exc),
                 "passed": False,
             }

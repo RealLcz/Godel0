@@ -135,26 +135,58 @@ class TestEffectiveQuota:
         assert quotas["current_child_level1"] == 0
 
 
-class TestMutationBackendsDefault:
-    def test_pr_replay_default_is_zero(self):
-        cfg = RepoChainWorkflowConfig()
-        assert cfg.mutation_backends.get("pr_replay", None) == 0.0
-        assert cfg.mutation_backends.get("lm_modify") == pytest.approx(0.7)
-        assert cfg.mutation_backends.get("procedural") == pytest.approx(0.3)
+class TestRepoChainMutationOperatorV1:
+    def test_default_operator_is_trajectory_conditioned_chain_mutation(self):
+        from godel0.config import RepoChainWorkflowConfig
 
-    def test_assert_no_human_curated_data_zeros_pr_replay(self):
-        import dataclasses
+        cfg = RepoChainWorkflowConfig()
+        assert cfg.mutation_operator == "trajectory_conditioned_chain_mutation"
+        assert not hasattr(cfg, "mutation_backends")
+
+    def test_legacy_mutation_backends_yaml_is_ignored(self, tmp_path):
+        """Old YAML with mutation_backends must still load (key filtered out)."""
+        from godel0.config import load_config
+
+        yaml_path = tmp_path / "legacy.yaml"
+        yaml_path.write_text(
+            """
+run:
+  seed: 1
+  max_nodes: 2
+proposer:
+  repo_chain:
+    min_files: 2
+    mutation_backends:
+      lm_modify: 0.7
+      procedural: 0.3
+      pr_replay: 0.0
+""",
+            encoding="utf-8",
+        )
+        # Merge onto default by using as full config may miss required sections;
+        # use Godel0Config defaults via partial load path.
+        from godel0.config import Godel0Config, _build_subconfig
+
+        rc = _build_subconfig(
+            "proposer",
+            {
+                "repo_chain": {
+                    "min_files": 2,
+                    "mutation_backends": {
+                        "lm_modify": 0.7,
+                        "procedural": 0.3,
+                        "pr_replay": 0.0,
+                    },
+                }
+            },
+        )
+        assert rc.repo_chain.mutation_operator == "trajectory_conditioned_chain_mutation"
+
+    def test_assert_no_human_curated_data_is_noop_without_backends(self):
+        from godel0.config import Godel0Config, assert_no_human_curated_data
 
         base = Godel0Config()
-        dirty_rc = dataclasses.replace(
-            base.proposer.repo_chain,
-            mutation_backends={"lm_modify": 0.5, "pr_replay": 0.5},
+        clean = assert_no_human_curated_data(base)
+        assert clean.proposer.repo_chain.mutation_operator == (
+            "trajectory_conditioned_chain_mutation"
         )
-        dirty = dataclasses.replace(
-            base,
-            proposer=dataclasses.replace(base.proposer, repo_chain=dirty_rc),
-        )
-        clean = assert_no_human_curated_data(dirty)
-        assert clean.proposer.repo_chain.mutation_backends.get("pr_replay", 0.0) == 0.0
-        total = sum(clean.proposer.repo_chain.mutation_backends.values())
-        assert total == pytest.approx(1.0)

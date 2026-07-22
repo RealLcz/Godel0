@@ -46,11 +46,13 @@ class TestConfig:
         with pytest.raises(ConfigError):
             load_config("configs/default.yaml", overrides={"scoring.proposer_target_accuracy": 0.6})
 
-    def test_proposer_strategies_sum(self):
-        """Mutation backend probabilities must sum to 1.0."""
+    def test_repo_chain_mutation_operator_v1(self):
+        """P1-2: Stage 5 uses a fixed operator, not weighted backends."""
         config = load_config("configs/default.yaml")
-        total = sum(config.proposer.repo_chain.mutation_backends.values())
-        assert abs(total - 1.0) < 0.001
+        assert (
+            config.proposer.repo_chain.mutation_operator
+            == "trajectory_conditioned_chain_mutation"
+        )
 
     def test_config_to_dict_roundtrip(self):
         """Config should survive dict conversion."""

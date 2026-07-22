@@ -30,6 +30,7 @@ def _result_to_batch(result: TaskBatchResult) -> TaskBatch:
         validation_reports=list(result.validation_reports),
         proposer_error=result.proposer_error,
         engine_rejections=list(result.engine_rejections),
+        repo_chain_stats=dict(getattr(result, "repo_chain_stats", None) or {}),
     )
 
 

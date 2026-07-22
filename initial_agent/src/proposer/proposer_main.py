@@ -47,7 +47,11 @@ def _build_runner(args: argparse.Namespace, request: ProposerRequest) -> Propose
     try:
         from experiment_adapters.common_agent_adapter import CommonAgentAdapter
 
-        agent_adapter = CommonAgentAdapter()
+        # P1-1: bind proposer_model from the request so RepoChain chat()
+        # does not silently fall back to GODEL0_MODEL.
+        agent_adapter = CommonAgentAdapter(
+            default_model=str(getattr(request, "model", "") or "")
+        )
     except Exception:
         # Procedural generators remain usable without an LLM adapter.
         agent_adapter = None

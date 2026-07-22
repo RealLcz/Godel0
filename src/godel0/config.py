@@ -158,9 +158,13 @@ class EvaluationConfig:
 class RepoChainWorkflowConfig:
     """Configuration for the RepoChain proposer workflow.
 
-    RepoChain is the default Proposer workflow (not a mutation backend).
-    The mutation_backends dict selects which low-level mutation mechanisms
-    RepoChain uses internally, weighted by probability.
+    RepoChain is the default Proposer workflow (not a mutation-backend mixer).
+
+    P1-2 (v1): Stage 5 always uses the fixed operator
+    ``trajectory_conditioned_chain_mutation`` via ``RepoChainGenerator``.
+    Weighted ``mutation_backends`` (lm_modify/procedural/...) were misleading
+    planner metadata and did not select Stage 5 backends — removed.
+    A real ``ChainMutationBackend`` registry can be added later.
     """
     min_files: int = 2
     max_files: int = 6
@@ -169,14 +173,8 @@ class RepoChainWorkflowConfig:
     context_file_budget: int = 10
     require_generated_contracts: bool = True
     require_causal_ablation: bool = True
-    # P0-23: main experiment defaults disable PR replay so the
-    # zero-human-curated-data claim stays clean. Enable pr_replay only in
-    # explicit ablations via allow_human_curated_data=True.
-    mutation_backends: Dict[str, float] = field(default_factory=lambda: {
-        "lm_modify": 0.7,
-        "procedural": 0.3,
-        "pr_replay": 0.0,
-    })
+    # Fixed v1 Stage-5 operator (not a weight table).
+    mutation_operator: str = "trajectory_conditioned_chain_mutation"
 
 
 @dataclass(frozen=True)
@@ -314,10 +312,13 @@ def _validate(config: Godel0Config) -> None:
         raise ConfigError("tasks.max_generation_candidates must be >= tasks.batch_size")
     if config.evaluation.max_workers < 1:
         raise ConfigError("evaluation.max_workers must be >= 1")
-    total_backends = sum(config.proposer.repo_chain.mutation_backends.values())
-    if config.proposer.repo_chain.mutation_backends and abs(total_backends - 1.0) > 0.001:
+    if config.evaluation.solver_rollouts < 1:
+        raise ConfigError("evaluation.solver_rollouts must be >= 1")
+    op = str(config.proposer.repo_chain.mutation_operator or "").strip()
+    if not op:
         raise ConfigError(
-            f"proposer.repo_chain.mutation_backends must sum to 1.0, got {total_backends}"
+            "proposer.repo_chain.mutation_operator must be non-empty "
+            "(v1 default: trajectory_conditioned_chain_mutation)"
         )
 
 
@@ -369,45 +370,18 @@ def config_to_dict(config: Godel0Config) -> Dict[str, Any]:
 
 
 def assert_no_human_curated_data(config: Godel0Config) -> Godel0Config:
-    """P0-23: refuse or zero-out human-curated mutation backends.
+    """P0-23: refuse human-curated PR-replay in the main setting.
 
-    When ``allow_human_curated_data`` is False (main experiment default), any
-    positive ``pr_replay`` / ``pr_mirror`` weight is forced to 0 and remaining
-    backends are re-normalized. Returns a config with cleaned weights.
+    P1-2: weighted ``mutation_backends`` were removed from RepoChain v1.
+    Human-curated data is gated by ``allow_human_curated_data`` and by the
+    proposer's strategy_weights / plan strategy checks (not a fake Stage-5
+    weight table).
     """
     if config.proposer.allow_human_curated_data:
         return config
-
-    backends = dict(config.proposer.repo_chain.mutation_backends or {})
-    human_keys = ("pr_replay", "pr_mirror")
-    dirty = [k for k in human_keys if float(backends.get(k, 0.0) or 0.0) > 0.0]
-    if not dirty and all(float(backends.get(k, 0.0) or 0.0) == 0.0 for k in human_keys):
-        return config
-
-    import logging
-    import dataclasses
-
-    logger = logging.getLogger("godel0.config")
-    for key in human_keys:
-        if float(backends.get(key, 0.0) or 0.0) > 0.0:
-            logger.warning(
-                "P0-23: disabling human-curated mutation backend %r "
-                "(allow_human_curated_data=False)",
-                key,
-            )
-        backends[key] = 0.0
-
-    remaining = {k: float(v) for k, v in backends.items() if float(v or 0.0) > 0.0}
-    total = sum(remaining.values())
-    if total <= 0:
-        backends = {"lm_modify": 0.7, "procedural": 0.3, "pr_replay": 0.0}
-    else:
-        backends = {k: (v / total) for k, v in remaining.items()}
-        backends.setdefault("pr_replay", 0.0)
-
-    new_rc = dataclasses.replace(config.proposer.repo_chain, mutation_backends=backends)
-    new_proposer = dataclasses.replace(config.proposer, repo_chain=new_rc)
-    return dataclasses.replace(config, proposer=new_proposer)
+    # RepoChain v1 has no mutation_backends weights to scrub. Keep this hook
+    # so callers (load_config) remain stable.
+    return config
 
 
 def save_config(config: Godel0Config, path: Union[str, Path]) -> None:

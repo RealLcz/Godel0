@@ -157,7 +157,9 @@ class TrajectoryAnalyzer:
             signature_id=f"sig-{uuid.uuid4().hex[:12]}",
             source_solver_node_id=traj.node_id,
             source_task_id=traj.task_id,
-            source_trajectory_id=traj.trajectory_id,
+            # Prefer concrete path when available so downstream matching against
+            # trajectory file buckets does not depend on basename-only ids.
+            source_trajectory_id=traj.raw_path or traj.trajectory_id,
             failure_stage=stage,
             root_cause=root_cause,
             target_capability=target_capability,

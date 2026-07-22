@@ -182,8 +182,18 @@ class CodeLocator:
                     score += 1.5
                 if pat and pat == name.lower():
                     score += 2.0
+                # Path tokens matter for bootstrap capability priors
+                # (e.g. "inventory" → lib/ansible/inventory/...).
+                if pat and pat in file_path.lower():
+                    score += 1.2
             if signature.target_capability and signature.target_capability in source.lower():
                 score += 0.5
+            # Also score capability tokens against the file path.
+            if signature.target_capability:
+                for tok in str(signature.target_capability).lower().replace("-", "_").split("_"):
+                    if len(tok) >= 4 and tok in file_path.lower():
+                        score += 0.4
+                        break
             line_span = int(sym.get("line_end", 0)) - int(sym.get("line_start", 0))
             if 0 < line_span <= 60:
                 score += 0.5
@@ -205,6 +215,11 @@ class CodeLocator:
             )
             scored.append((score, target))
         scored.sort(key=lambda t: t[0], reverse=True)
+        # Prefer positive-scoring targets; fall back to the top of the
+        # ranking so bootstrap still gets a real file when patterns are weak.
+        positive = [t for score, t in scored if score > 0 and t.symbol_name]
+        if positive:
+            return positive[:max_results]
         return [t for _score, t in scored[:max_results] if t.symbol_name]
 
     def _has_test_coverage(self, index: RepoIndex, file_path: str) -> bool:

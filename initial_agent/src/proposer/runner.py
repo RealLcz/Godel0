@@ -114,14 +114,17 @@ class ProposerRunner:
                 cfg = self.workflow_config
                 if cfg is not None:
                     kwargs["config"] = cfg
-                    if hasattr(cfg, "mutation_backends"):
-                        kwargs["mutation_backend_weights"] = dict(
-                            cfg.mutation_backends or {}
-                        )
                     if hasattr(cfg, "require_causal_ablation"):
                         kwargs["require_causal_ablation"] = bool(
                             cfg.require_causal_ablation
                         )
+                    # P1-2: pass fixed operator; ignore legacy mutation_backends.
+                    if isinstance(cfg, dict):
+                        op = cfg.get("mutation_operator")
+                    else:
+                        op = getattr(cfg, "mutation_operator", None)
+                    if op:
+                        kwargs["mutation_operator"] = str(op)
                 self._workflow = RepoChainWorkflow(**kwargs)
             except Exception as exc:
                 # P0-6: production must crash rather than silently degrade
@@ -150,15 +153,46 @@ class ProposerRunner:
             self.allow_human_curated_data = bool(request.allow_human_curated_data)
         try:
             self._enforce_human_data_policy(request)
-            traces = self._load_trajectories(request)
-            outcomes = self._load_outcomes(request, traces)
-            signatures = self.trajectory_analyzer.extract_signatures(traces, outcomes)
-            result.failure_signatures = [s.model_dump() for s in signatures]
+
+            # P0-4: load Parent / Child failure trajectories SEPARATELY and
+            # generate against generation_quotas *before* validation. Do NOT
+            # mix into a single signature pool and discard post-hoc.
+            parent_paths = list(getattr(request, "parent_failure_trajectories", None) or [])
+            child_paths = list(
+                getattr(request, "current_child_level1_trajectories", None) or []
+            )
+            quotas = dict(getattr(request, "generation_quotas", None) or {})
+            parent_quota = int(quotas.get("parent_failure", 0) or 0)
+            child_quota = int(quotas.get("current_child_level1", 0) or 0)
+            split_mode = bool(parent_paths or child_paths) and (
+                parent_quota > 0 or child_quota > 0
+            )
+
+            if split_mode:
+                parent_traces = self._load_trajectories_from_paths(parent_paths)
+                child_traces = self._load_trajectories_from_paths(child_paths)
+                parent_outcomes = self._load_outcomes_for_traces(parent_traces)
+                child_outcomes = self._load_outcomes_for_traces(child_traces)
+                parent_sigs = self.trajectory_analyzer.extract_signatures(
+                    parent_traces, parent_outcomes
+                )
+                child_sigs = self.trajectory_analyzer.extract_signatures(
+                    child_traces, child_outcomes
+                )
+                signatures = list(parent_sigs) + list(child_sigs)
+                result.failure_signatures = [s.model_dump() for s in signatures]
+            else:
+                traces = self._load_trajectories(request)
+                outcomes = self._load_outcomes(request, traces)
+                signatures = self.trajectory_analyzer.extract_signatures(
+                    traces, outcomes
+                )
+                result.failure_signatures = [s.model_dump() for s in signatures]
+                parent_sigs, child_sigs = [], []
+                parent_traces, child_traces = [], []
 
             if not signatures:
                 if getattr(request, "bootstrap", False):
-                    # Root bootstrap: no solver trajectories yet. Generate T_0
-                    # from a capability prior via RepoChainWorkflow.bootstrap.
                     candidates = self._bootstrap_candidates(request)
                     self._write_candidates(request, candidates, [])
                     for cand in candidates:
@@ -176,32 +210,33 @@ class ProposerRunner:
                 request.strategy_weights,
                 offset=request.generation_attempt * max(1, request.target_batch_size),
             )
-            plans = self.planner.create_plans(
-                signatures,
-                repo_index,
-                base_commit=repo_index.base_commit,
-                max_plans=request.target_batch_size,
-            )
-            for index, plan in enumerate(plans):
-                plan.seed = request.generation_attempt * 1000 + index + 1
-                # P0-5: stamp RepoChain difficulty constraints onto every plan.
-                self._stamp_repo_chain_constraints(plan)
-                rejected_feedback = [
-                    {
-                        "candidate_id": feedback.candidate_id,
-                        "reason": feedback.reason,
-                    }
-                    for feedback in feedbacks
-                    if not feedback.accepted
-                ][-20:]
-                if rejected_feedback:
-                    # This is a standard trusted response file, not validator
-                    # private state. Engines can use it to avoid repeating the
-                    # same invalid construction on the next generation attempt.
-                    plan.task_blueprint["trusted_validation_feedback"] = rejected_feedback
+
+            if split_mode:
+                plans = self._create_quota_plans(
+                    request=request,
+                    repo_index=repo_index,
+                    parent_sigs=parent_sigs,
+                    child_sigs=child_sigs,
+                    parent_traces=parent_traces,
+                    child_traces=child_traces,
+                    parent_quota=parent_quota,
+                    child_quota=child_quota,
+                    feedbacks=feedbacks,
+                )
+            else:
+                plans = self.planner.create_plans(
+                    signatures,
+                    repo_index,
+                    base_commit=repo_index.base_commit,
+                    max_plans=request.target_batch_size,
+                )
+                for index, plan in enumerate(plans):
+                    plan.seed = request.generation_attempt * 1000 + index + 1
+                    self._stamp_repo_chain_constraints(plan)
+                    self._attach_validation_feedback(plan, feedbacks)
+
             candidates = self._generate_candidates(request, plans, repo_index)
             result.workflow_fallback = bool(self._workflow_fallback_used)
-            # Generation may attach an engine rejection reason to the plan.
             result.plans = [p.model_dump() for p in plans]
             self._write_candidates(request, candidates, plans)
 
@@ -231,25 +266,168 @@ class ProposerRunner:
             result.workflow_fallback = bool(self._workflow_fallback_used)
         return result
 
+    def _create_quota_plans(
+        self,
+        *,
+        request: ProposerRequest,
+        repo_index: RepoIndex,
+        parent_sigs: List[FailureSignature],
+        child_sigs: List[FailureSignature],
+        parent_traces: List[TrajectoryView],
+        child_traces: List[TrajectoryView],
+        parent_quota: int,
+        child_quota: int,
+        feedbacks: list,
+    ) -> List[BugGenerationPlan]:
+        """P0-4: create plans separately for each failure source up to quota."""
+        plans: List[BugGenerationPlan] = []
+        seed_base = request.generation_attempt * 1000
+
+        def _build(
+            signatures: List[FailureSignature],
+            traces: List[TrajectoryView],
+            source_type: str,
+            quota: int,
+            seed_offset: int,
+        ) -> List[BugGenerationPlan]:
+            if quota <= 0 or not signatures:
+                return []
+            built = self.planner.create_plans(
+                signatures,
+                repo_index,
+                base_commit=repo_index.base_commit,
+                max_plans=quota,
+            )
+            traj_by_id = {t.trajectory_id: t for t in traces}
+            # Also index by raw path basename for robustness.
+            for t in traces:
+                if t.raw_path:
+                    traj_by_id.setdefault(os.path.abspath(t.raw_path), t)
+                    traj_by_id.setdefault(t.raw_path, t)
+            out: List[BugGenerationPlan] = []
+            for index, plan in enumerate(built):
+                plan.seed = seed_base + seed_offset + index + 1
+                self._stamp_repo_chain_constraints(plan)
+                self._attach_validation_feedback(plan, feedbacks)
+                self._stamp_plan_source_provenance(
+                    plan,
+                    source_type=source_type,
+                    traces=traces,
+                    traj_by_id=traj_by_id,
+                    proposer_node_id=request.node_id,
+                )
+                out.append(plan)
+            return out
+
+        plans.extend(
+            _build(parent_sigs, parent_traces, "parent_failure", parent_quota, 0)
+        )
+        plans.extend(
+            _build(
+                child_sigs,
+                child_traces,
+                "current_child_level1",
+                child_quota,
+                100,
+            )
+        )
+        return plans
+
+    def _stamp_plan_source_provenance(
+        self,
+        plan: BugGenerationPlan,
+        *,
+        source_type: str,
+        traces: List[TrajectoryView],
+        traj_by_id: Dict[str, TrajectoryView],
+        proposer_node_id: str,
+    ) -> None:
+        """Stamp source_type / trajectory / task / node onto the plan.
+
+        P0-5: prefer FailureSignature / already-stamped blueprint fields.
+        Never invent ``source_node_id = proposer_node_id`` (that mis-attributes
+        parent failures to the current child). Never guess ``traces[0]``.
+        """
+        from .provenance import (
+            apply_provenance_to_mapping,
+            merge_provenance,
+            provenance_from_blueprint,
+            provenance_from_signature,
+        )
+
+        blueprint = plan.task_blueprint if isinstance(plan.task_blueprint, dict) else {}
+        plan.task_blueprint = blueprint
+
+        traj: Optional[TrajectoryView] = None
+        for tid in list(plan.source_trajectory_ids or []):
+            traj = traj_by_id.get(str(tid))
+            if traj is not None:
+                break
+        if traj is None and plan.failure_signature is not None:
+            sid = str(getattr(plan.failure_signature, "source_trajectory_id", "") or "")
+            traj = traj_by_id.get(sid)
+            if traj is None and sid:
+                for t in traces:
+                    if sid in (
+                        t.trajectory_id,
+                        t.raw_path,
+                        os.path.abspath(t.raw_path or ""),
+                    ):
+                        traj = t
+                        break
+        # Do NOT fall back to traces[0] — that invents provenance.
+
+        traj_layer: Dict[str, str] = {}
+        if traj is not None:
+            traj_layer = {
+                "source_node_id": str(traj.node_id or ""),
+                "source_task_id": str(traj.task_id or ""),
+                "source_trajectory_id": str(traj.raw_path or traj.trajectory_id or ""),
+            }
+            traj_id = traj_layer["source_trajectory_id"]
+            if traj_id and traj_id not in (plan.source_trajectory_ids or []):
+                plan.source_trajectory_ids = list(
+                    dict.fromkeys(
+                        list(plan.source_trajectory_ids or []) + [traj_id]
+                    )
+                )
+
+        provenance = merge_provenance(
+            {"source_type": source_type},
+            provenance_from_blueprint(blueprint),
+            provenance_from_signature(plan.failure_signature),
+            traj_layer,
+        )
+        # Bucket membership is authoritative for source_type.
+        provenance["source_type"] = source_type
+        apply_provenance_to_mapping(blueprint, provenance)
+        # proposer_node_id is intentionally unused for identity fields.
+        _ = proposer_node_id
+
+    def _attach_validation_feedback(self, plan: BugGenerationPlan, feedbacks: list) -> None:
+        rejected_feedback = [
+            {
+                "candidate_id": feedback.candidate_id,
+                "reason": feedback.reason,
+            }
+            for feedback in feedbacks
+            if not feedback.accepted
+        ][-20:]
+        if rejected_feedback:
+            plan.task_blueprint["trusted_validation_feedback"] = rejected_feedback
+
     def _enforce_human_data_policy(self, request: ProposerRequest) -> None:
         """P0-23: refuse PR-replay / human-curated data in the main setting."""
         if self.allow_human_curated_data:
             return
         weights = dict(getattr(request, "strategy_weights", None) or {})
-        cfg = self.workflow_config or getattr(request, "workflow_config", None) or {}
-        if isinstance(cfg, dict):
-            backends = dict(cfg.get("mutation_backends") or {})
-        else:
-            backends = dict(getattr(cfg, "mutation_backends", None) or {})
+        # P1-2: RepoChain no longer carries mutation_backends weights; only
+        # planner strategy_weights can still request pr_replay/pr_mirror.
         pr_weight = max(
             float(weights.get("pr_replay", 0.0) or 0.0),
             float(weights.get("pr_mirror", 0.0) or 0.0),
-            float(backends.get("pr_replay", 0.0) or 0.0),
-            float(backends.get("pr_mirror", 0.0) or 0.0),
         )
         if pr_weight > 0.0:
-            # Prefer zeroing request weights so a misconfigured YAML cannot
-            # silently introduce human-curated PR data into the main run.
             for key in ("pr_replay", "pr_mirror"):
                 if key in weights:
                     weights[key] = 0.0
@@ -262,28 +440,83 @@ class ProposerRunner:
             )
 
     def _stamp_repo_chain_constraints(self, plan: BugGenerationPlan) -> None:
-        """P0-5: force plan constraints from RepoChainWorkflowConfig."""
+        """P0-2/P0-5: force ``plan.constraints`` from RepoChainWorkflowConfig.
+
+        Algorithm constraints must live on ``plan.constraints`` (what
+        RepoChainGenerator reads). ``task_blueprint["constraints"]`` is only
+        metadata.
+        """
         cfg = self.workflow_config
         if cfg is None:
             return
-        constraints = plan.task_blueprint.setdefault("constraints", {})
-        if not isinstance(constraints, dict):
-            constraints = {}
-            plan.task_blueprint["constraints"] = constraints
-        for src, dst in (
+        updates = {}
+        mapping = (
             ("min_files", "min_modified_files"),
             ("max_files", "max_modified_files"),
             ("min_mutation_sites", "min_mutation_sites"),
             ("max_mutation_sites", "max_mutation_sites"),
             ("context_file_budget", "context_file_budget"),
-        ):
+        )
+        for src, dst in mapping:
             if hasattr(cfg, src):
-                constraints[dst] = getattr(cfg, src)
+                updates[dst] = getattr(cfg, src)
+        if getattr(cfg, "require_generated_contracts", None) is not None:
+            updates["require_generated_tests"] = bool(cfg.require_generated_contracts)
+        # P1-2: stamp fixed Stage-5 operator (not mutation_backends weights).
+        if isinstance(cfg, dict):
+            op = str(cfg.get("mutation_operator") or "").strip()
+        else:
+            op = str(getattr(cfg, "mutation_operator", "") or "").strip()
+        if op:
+            plan.strategy = "repo_chain"
+            plan.operator = op
+            plan.task_blueprint["mutation_operator"] = op
+        if not updates and not op:
+            return
+        if updates:
+            current = plan.constraints
+            if hasattr(current, "model_copy"):
+                plan.constraints = current.model_copy(update=updates)
+            elif hasattr(current, "copy"):
+                plan.constraints = current.copy(update=updates)
+            meta = plan.task_blueprint.setdefault("constraints", {})
+            if not isinstance(meta, dict):
+                meta = {}
+                plan.task_blueprint["constraints"] = meta
+            meta.update(updates)
+
+    def _resolve_generation_rejection(
+        self, workflow, *, default: str = ""
+    ) -> tuple[str, str]:
+        """P1-3: pull structured stage from workflow backing or engine."""
+        sources = []
+        if workflow is not None:
+            sources.append(getattr(workflow, "_backing_generator", None))
+        if self.engine is not None:
+            sources.append(getattr(self.engine, "repo_chain", None))
+            sources.append(self.engine)
+        rejection = ""
+        stage = ""
+        for src in sources:
+            if src is None:
+                continue
+            detail = str(getattr(src, "last_rejection", "") or "")
+            code = str(getattr(src, "last_rejection_stage", "") or "")
+            if detail and not rejection:
+                rejection = detail
+            if code and not stage:
+                stage = code
+            if rejection and stage:
+                break
+        return rejection or str(default or ""), stage
 
     def _load_trajectories(self, request: ProposerRequest) -> List[TrajectoryView]:
+        return self._load_trajectories_from_paths(list(request.solver_trajectories or []))
+
+    def _load_trajectories_from_paths(self, paths: List[str]) -> List[TrajectoryView]:
         views: List[TrajectoryView] = []
-        for path in request.solver_trajectories:
-            if not os.path.isfile(path):
+        for path in paths:
+            if not path or not os.path.isfile(path):
                 continue
             views.append(TrajectoryView.from_jsonl(path))
         return views
@@ -293,8 +526,29 @@ class ProposerRunner:
         request: ProposerRequest,
         traces: List[TrajectoryView],
     ) -> List[EvaluationOutcomeView]:
+        return self._load_outcomes_for_paths(
+            list(request.solver_trajectories or []), traces
+        )
+
+    def _load_outcomes_for_traces(
+        self, traces: List[TrajectoryView]
+    ) -> List[EvaluationOutcomeView]:
+        paths = [
+            t.raw_path
+            for t in traces
+            if getattr(t, "raw_path", None)
+        ]
+        return self._load_outcomes_for_paths(paths, traces)
+
+    def _load_outcomes_for_paths(
+        self,
+        paths: List[str],
+        traces: List[TrajectoryView],
+    ) -> List[EvaluationOutcomeView]:
         outcomes: List[EvaluationOutcomeView] = []
-        for path in request.solver_trajectories:
+        for path in paths:
+            if not path:
+                continue
             outcome_path = os.path.splitext(path)[0] + "_eval.json"
             if os.path.isfile(outcome_path):
                 outcomes.append(EvaluationOutcomeView.from_json(outcome_path))
@@ -363,6 +617,12 @@ class ProposerRunner:
             ):
                 cand.generation_metadata.setdefault("bootstrap", True)
                 cand.generation_metadata.setdefault("source_type", "bootstrap")
+                cand.generation_metadata.setdefault("source_node_id", "")
+                cand.generation_metadata.setdefault("source_task_id", "")
+                cand.generation_metadata.setdefault("source_trajectory_id", "")
+                cand.generation_metadata.setdefault(
+                    "source_failure_stage", "bootstrap"
+                )
         return candidates
 
     def _build_repo_index(self, request: ProposerRequest) -> RepoIndex:
@@ -463,20 +723,31 @@ class ProposerRunner:
                         output_dir=cand_dir,
                     )
             except Exception as exc:
-                rejection = str(
-                    getattr(getattr(self.engine, "repo_chain", None), "last_rejection", "")
-                    or getattr(self.engine, "last_rejection", "")
-                    or f"{type(exc).__name__}: {exc}"
+                rejection, stage = self._resolve_generation_rejection(
+                    workflow, default=f"{type(exc).__name__}: {exc}"
                 )
                 plan.task_blueprint["last_rejection"] = rejection
+                if stage:
+                    plan.task_blueprint["last_rejection_stage"] = stage
                 produced = []
             if not produced:
-                rejection = str(
-                    getattr(getattr(self.engine, "repo_chain", None), "last_rejection", "")
-                    or getattr(self.engine, "last_rejection", "")
-                    or "engine_returned_no_candidates"
+                rejection, stage = self._resolve_generation_rejection(
+                    workflow, default="engine_returned_no_candidates"
                 )
                 plan.task_blueprint["last_rejection"] = rejection
+                if stage:
+                    plan.task_blueprint["last_rejection_stage"] = stage
+                elif rejection:
+                    try:
+                        from godel0.schemas.repo_chain_stats import (
+                            stage_for_engine_rejection,
+                        )
+
+                        plan.task_blueprint["last_rejection_stage"] = (
+                            stage_for_engine_rejection(rejection)
+                        )
+                    except Exception:
+                        plan.task_blueprint["last_rejection_stage"] = "mutation_failure"
             for raw in produced:
                 cand = self._coerce_candidate(raw, plan, repo_spec)
                 if not cand.candidate_id:
@@ -494,6 +765,12 @@ class ProposerRunner:
     ) -> CandidateArtifact:
         """Normalize engine-specific candidate objects to the proposer contract."""
         if isinstance(raw, CandidateArtifact):
+            # P0-5: still merge plan provenance onto metadata (no guessing).
+            stamped = self._stamp_provenance(
+                {"generation_metadata": dict(raw.generation_metadata or {})},
+                plan,
+            )
+            raw.generation_metadata = stamped
             return raw
 
         to_dict = getattr(raw, "to_dict", None)
@@ -549,18 +826,39 @@ class ProposerRunner:
         )
 
     def _stamp_provenance(self, data: dict, plan: BugGenerationPlan) -> dict:
-        """BUG-09: stamp source_trajectory_ids / source_type onto metadata.
+        """P0-5: copy plan provenance onto candidate metadata without guessing.
 
-        The plan already carries ``source_trajectory_ids`` (from the
-        trajectory analyzer). We copy them onto the candidate's
-        ``generation_metadata`` so the trusted ``TaskBatchBuilder`` can
-        classify the source without re-reading the plan.
+        Prefer task_blueprint stamps, then FailureSignature fields. Do not
+        invent ``source_node`` from ``reference_parent`` (PR commit parent ≠
+        solver node id).
         """
+        from .provenance import (
+            apply_provenance_to_mapping,
+            merge_provenance,
+            provenance_from_blueprint,
+            provenance_from_signature,
+        )
+
         metadata = dict(data.get("generation_metadata") or {})
+        blueprint = plan.task_blueprint if isinstance(plan.task_blueprint, dict) else {}
+        provenance = merge_provenance(
+            provenance_from_blueprint(blueprint),
+            provenance_from_signature(plan.failure_signature),
+            {
+                "source_trajectory_id": (
+                    list(plan.source_trajectory_ids or [])[0]
+                    if plan.source_trajectory_ids
+                    else ""
+                ),
+            },
+        )
+        apply_provenance_to_mapping(metadata, provenance)
         ids = list(plan.source_trajectory_ids or [])
         if ids:
-            metadata.setdefault("source_trajectory_ids", ids)
-        metadata.setdefault("source_node", getattr(plan, "reference_parent", "") or "")
+            existing = list(metadata.get("source_trajectory_ids") or [])
+            metadata["source_trajectory_ids"] = list(dict.fromkeys(ids + existing))
+        if provenance.get("source_node_id"):
+            metadata["source_node"] = provenance["source_node_id"]
         metadata.setdefault("plan_id", plan.plan_id)
         return metadata
 

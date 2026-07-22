@@ -227,6 +227,9 @@ class ProposerPlanner:
         return constraints
 
     def _build_task_blueprint(self, signature: FailureSignature, target) -> dict:
+        # P0-5: provenance must flow FailureSignature → blueprint without
+        # dropping node/task ids. source_type is stamped later when the runner
+        # knows which failure bucket (parent vs child) produced the plan.
         blueprint = {
             "capability_gap": signature.target_capability,
             "failure_stage": signature.failure_stage,
@@ -236,7 +239,10 @@ class ProposerPlanner:
                 "symbol": target.symbol_name,
             },
             "required_topology": "connected_cross_file_contract",
-            "source_trajectory_id": signature.source_trajectory_id,
+            "source_node_id": str(signature.source_solver_node_id or ""),
+            "source_task_id": str(signature.source_task_id or ""),
+            "source_trajectory_id": str(signature.source_trajectory_id or ""),
+            "source_failure_stage": str(signature.failure_stage or ""),
         }
         # Use RepoProfileRegistry to get repo-specific contract settings
         # (no hardcoded repo_id checks).

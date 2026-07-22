@@ -1,6 +1,6 @@
 """RepoChainWorkflow: the default Proposer task-generation workflow.
 
-RepoChain is a workflow, not a tool and not a mutation backend. It runs 8
+RepoChain is a workflow, not a tool and not a mutation-backend mixer. It runs 8
 stages: Weakness Identification -> Repository Transfer -> Semantic Chain
 Discovery -> Contract Generation -> Chain Mutation -> Causal Ablation ->
 Trusted Validation -> Task Packaging.
@@ -11,6 +11,9 @@ swesmith/repo_chain.py); this workflow wraps that generator so the existing
 multi-file chain logic keeps working while the stages are progressively
 extracted into explicit modules. Stage 7 (Trusted Validation) and Stage 8
 (Task Packaging) run in the trusted controller, not here.
+
+P1-2 (v1): Stage 5 always uses ``trajectory_conditioned_chain_mutation``.
+Weighted mutation_backends are not a Stage-5 selector.
 """
 
 from __future__ import annotations
@@ -25,20 +28,22 @@ from .contract_generation import ContractGenerationStage
 from .mutation_planning import MutationPlanningStage
 from .causal_ablation import CausalAblationStage
 
+# Fixed v1 Stage-5 operator (matches RepoChainGenerator metadata).
+DEFAULT_MUTATION_OPERATOR = "trajectory_conditioned_chain_mutation"
+
 
 class RepoChainWorkflow:
     """The default RepoChain task-generation workflow.
 
     Args:
         agent_adapter: LLM adapter for LM-driven steps.
-        engine: SWESmithEngine (mutation backend registry). The workflow uses
-            it as the mutation backend in Stage 5.
+        engine: optional SWESmithEngine (legacy / fallback registry only).
         trajectory_analyzer: existing analyzer for Stage 1.
         code_locator: existing locator for Stage 2.
-        mutation_backend_weights: weights for selecting mutation backends.
         require_causal_ablation: if True, candidates failing Stage 6 are dropped.
         config: optional RepoChainWorkflowConfig (or compatible object / dict)
-            carrying min/max files, mutation sites, context budget, backends.
+            carrying min/max files, mutation sites, context budget, operator.
+        mutation_operator: fixed Stage-5 operator name (v1 default above).
     """
 
     def __init__(
@@ -47,7 +52,6 @@ class RepoChainWorkflow:
         engine: Any = None,
         trajectory_analyzer: Any = None,
         code_locator: Any = None,
-        mutation_backend_weights: Optional[dict] = None,
         require_causal_ablation: bool = True,
         config: Any = None,
         min_files: Optional[int] = None,
@@ -55,6 +59,9 @@ class RepoChainWorkflow:
         min_mutation_sites: Optional[int] = None,
         max_mutation_sites: Optional[int] = None,
         context_file_budget: Optional[int] = None,
+        mutation_operator: Optional[str] = None,
+        # Deprecated P1-2: accepted for call-site compatibility, ignored.
+        mutation_backend_weights: Optional[dict] = None,
         mutation_backends: Optional[dict] = None,
     ) -> None:
         self.agent_adapter = agent_adapter
@@ -62,7 +69,6 @@ class RepoChainWorkflow:
         self.trajectory_analyzer = trajectory_analyzer
         self.code_locator = code_locator
 
-        # P0-5: resolve constraints from config object / dict / explicit kwargs.
         cfg = config
         if isinstance(cfg, dict):
             cfg = type("RCConfig", (), cfg)()
@@ -96,44 +102,37 @@ class RepoChainWorkflow:
             if context_file_budget is not None
             else _cfg_get("context_file_budget", 10)
         )
-        backends = (
-            mutation_backends
-            if mutation_backends is not None
-            else mutation_backend_weights
-            if mutation_backend_weights is not None
-            else _cfg_get("mutation_backends", {})
+        self.mutation_operator = str(
+            mutation_operator
+            if mutation_operator is not None
+            else _cfg_get("mutation_operator", DEFAULT_MUTATION_OPERATOR)
+            or DEFAULT_MUTATION_OPERATOR
         )
-        self.mutation_backend_weights = dict(backends or {})
+        # Keep empty for diagnostics only; weights no longer select backends.
+        self.mutation_backend_weights: dict = {}
+        _ = mutation_backend_weights, mutation_backends  # deprecated, ignored
+
         self.require_causal_ablation = bool(
             require_causal_ablation
             if config is None and not hasattr(cfg, "require_causal_ablation")
             else _cfg_get("require_causal_ablation", require_causal_ablation)
         )
 
-        # Stage objects (delegating to existing components for now).
-        self.weakness_stage = WeaknessAnalysisStage(trajectory_analyzer) if trajectory_analyzer else None
-        self.transfer_stage = RepositoryTransferStage(code_locator) if code_locator else None
-        self.chain_discovery_stage = ChainDiscoveryStage()
+        self.weakness_stage = WeaknessAnalysisStage(trajectory_analyzer)
+        self.transfer_stage = RepositoryTransferStage(code_locator)
+        self.chain_stage = ChainDiscoveryStage()
         self.contract_stage = ContractGenerationStage()
         self.mutation_stage = MutationPlanningStage(
-            engine, mutation_backend_weights=self.mutation_backend_weights
+            engine, mutation_operator=self.mutation_operator
         )
         self.ablation_stage = CausalAblationStage()
-
-        # Lazily-loaded backing generator (the existing RepoChainGenerator).
         self._backing_generator = None
 
     def _load_backing_generator(self):
-        """Lazily import and instantiate the existing RepoChainGenerator.
-
-        The full chain-discovery + contract-generation + mutation logic
-        currently lives in swesmith/repo_chain.py. Until each stage is fully
-        extracted into this package, we delegate ``generate`` to it.
-        """
         if self._backing_generator is not None:
             return self._backing_generator
         try:
-            from swesmith.repo_chain import RepoChainGenerator  # type: ignore
+            from swesmith.repo_chain import RepoChainGenerator
 
             self._backing_generator = RepoChainGenerator(self.agent_adapter)
         except Exception:
@@ -141,21 +140,54 @@ class RepoChainWorkflow:
         return self._backing_generator
 
     def _apply_constraints_to_plan(self, plan) -> None:
-        """P0-5: stamp workflow difficulty constraints onto the plan."""
+        """Stamp RepoChain difficulty constraints onto plan.constraints.
+
+        P0-2: ``RepoChainGenerator`` reads ``plan.constraints`` (BugConstraints),
+        etc., NOT ``plan.task_blueprint["constraints"]``. Writing only the
+        blueprint left runtime on BugConstraints defaults (min/max files = 1).
+
+        P1-2: also force strategy/operator to the fixed v1 chain mutation.
+        """
+        updates = {
+            "min_modified_files": self.min_files,
+            "max_modified_files": self.max_files,
+            "min_mutation_sites": self.min_mutation_sites,
+            "max_mutation_sites": self.max_mutation_sites,
+            "context_file_budget": self.context_file_budget,
+            "require_generated_tests": True,
+        }
+        constraints = getattr(plan, "constraints", None)
+        if constraints is not None and hasattr(constraints, "model_copy"):
+            plan.constraints = constraints.model_copy(update=updates)
+        elif constraints is not None and hasattr(constraints, "copy"):
+            # pydantic v1
+            plan.constraints = constraints.copy(update=updates)
+        else:
+            try:
+                from proposer.schemas import BugConstraints
+
+                plan.constraints = BugConstraints(**updates)
+            except Exception:
+                pass
+
+        # P1-2: Stage 5 is not a weighted backend mixer.
+        try:
+            plan.strategy = "repo_chain"
+        except Exception:
+            pass
+        try:
+            plan.operator = self.mutation_operator
+        except Exception:
+            pass
+
         blueprint = getattr(plan, "task_blueprint", None)
-        if not isinstance(blueprint, dict):
-            return
-        constraints = blueprint.setdefault("constraints", {})
-        if not isinstance(constraints, dict):
-            constraints = {}
-            blueprint["constraints"] = constraints
-        constraints["min_modified_files"] = self.min_files
-        constraints["max_modified_files"] = self.max_files
-        constraints["min_mutation_sites"] = self.min_mutation_sites
-        constraints["max_mutation_sites"] = self.max_mutation_sites
-        constraints["context_file_budget"] = self.context_file_budget
-        if self.mutation_backend_weights:
-            constraints["mutation_backends"] = dict(self.mutation_backend_weights)
+        if isinstance(blueprint, dict):
+            meta = blueprint.setdefault("constraints", {})
+            if not isinstance(meta, dict):
+                meta = {}
+                blueprint["constraints"] = meta
+            meta.update(updates)
+            blueprint["mutation_operator"] = self.mutation_operator
 
     def generate(
         self,
@@ -170,7 +202,7 @@ class RepoChainWorkflow:
         ``ProposerRunner`` before plans are created. This method takes an
         already-formed ``BugGenerationPlan`` and delegates to the backing
         ``RepoChainGenerator`` for the chain discovery, contract generation,
-        and mutation materialization.
+        and mutation materialization (fixed operator, not backend weights).
         """
         self._apply_constraints_to_plan(plan)
         backing = self._load_backing_generator()
@@ -194,8 +226,8 @@ class RepoChainWorkflow:
     ) -> List:
         """Root bootstrap mode: generate T_0 without solver trajectory conditioning.
 
-        P0-4: keep generating diverse capability-prior plans until we have
-        enough candidates (``target_count``) or hit ``max_candidates``.
+        Builds capability-prior plans then runs each through the same generate()
+        path (fixed Stage-5 operator).
         """
         from .bootstrap import BOOTSTRAP_CAPABILITY_PRIOR, build_bootstrap_plans
 
@@ -205,7 +237,11 @@ class RepoChainWorkflow:
             return []
         limit = max_candidates if max_candidates is not None else max(target_count * 3, 21)
         plans = build_bootstrap_plans(
-            prior, repo_spec, target_count=target_count, max_plans=limit
+            prior,
+            repo_spec,
+            target_count=target_count,
+            max_plans=limit,
+            code_locator=self.code_locator,
         )
         candidates: List = []
         for plan in plans:
@@ -220,4 +256,4 @@ class RepoChainWorkflow:
         return candidates
 
 
-__all__ = ["RepoChainWorkflow"]
+__all__ = ["RepoChainWorkflow", "DEFAULT_MUTATION_OPERATOR"]

@@ -19,6 +19,13 @@ from ..schemas.task import TaskRecord
 from ..git.patch import extract_changed_files
 from ..storage.atomic import atomic_write_json
 from ..proposer_trusted.statement_auditor import audit_statement
+from ..schemas.repo_chain_stats import (
+    STATEMENT_LEAKAGE,
+    accumulate_stages,
+    empty_repo_chain_stats,
+    increment_stage,
+    stage_for_engine_rejection,
+)
 
 
 def compute_effective_quotas(
@@ -87,6 +94,8 @@ class TaskBatchResult:
     validation_reports: List[dict] = field(default_factory=list)
     proposer_error: str = ""
     engine_rejections: List[dict] = field(default_factory=list)
+    # P1-3: structured stage counters (no substring inference).
+    repo_chain_stats: dict = field(default_factory=dict)
 
 
 class TaskBatchBuilder:
@@ -169,6 +178,7 @@ class TaskBatchBuilder:
         """
         batch_id = f"batch_{uuid.uuid4().hex[:8]}"
         result = TaskBatchResult(batch_id=batch_id, node_id=node_id)
+        result.repo_chain_stats = empty_repo_chain_stats()
 
         # BUG-08/09: 5+5 quota with dynamic fallback. Prefer the split
         # trajectory buckets when available; otherwise fall back to the flat
@@ -303,12 +313,28 @@ class TaskBatchBuilder:
             remaining_tasks = self.batch_size - len(result.tasks)
             remaining_candidates = self.max_candidates - result.candidates_generated
             attempt_dir = output_dir / f"attempt_{attempt:03d}"
+            # P0-4: pass *remaining* pre-generation quotas so ProposerRunner
+            # creates at most rem_parent + rem_child plans, not a mixed pool.
+            remaining_quotas = self._remaining_generation_quotas(
+                quotas=quotas,
+                source_counts=source_counts,
+                remaining_tasks=remaining_tasks,
+                parent_failure_trajectories=parent_failure_trajectories,
+                current_child_level1_trajectories=current_child_level1_trajectories,
+            )
+            quota_budget = int(remaining_quotas.get("parent_failure", 0) or 0) + int(
+                remaining_quotas.get("current_child_level1", 0) or 0
+            )
+            attempt_target = min(remaining_tasks, remaining_candidates)
+            if quota_budget > 0:
+                attempt_target = min(attempt_target, quota_budget)
             attempt_request = replace(
                 request,
                 output_dir=str(attempt_dir),
-                target_batch_size=min(remaining_tasks, remaining_candidates),
+                target_batch_size=attempt_target,
                 max_candidates=remaining_candidates,
                 generation_attempt=attempt,
+                generation_quotas=dict(remaining_quotas),
             )
             proposer_result = proposer_runner.generate_batch(attempt_request)
             proposer_error = str(getattr(proposer_result, "error", "") or "")
@@ -346,12 +372,17 @@ class TaskBatchBuilder:
                 blueprint = dict(plan.get("task_blueprint") or {})
                 rejection = str(blueprint.get("last_rejection") or "")
                 if rejection:
+                    stage = str(blueprint.get("last_rejection_stage") or "")
+                    if not stage:
+                        stage = stage_for_engine_rejection(rejection)
                     rejection_record = {
                         "attempt": attempt,
                         "plan_id": plan.get("plan_id"),
                         "reason": rejection,
+                        "stage": stage,
                     }
                     result.engine_rejections.append(rejection_record)
+                    increment_stage(result.repo_chain_stats, stage)
                     feedback_id = f"engine-{attempt}-{plan.get('plan_id') or 'plan'}"
                     atomic_write_json(
                         output_dir / "trusted_feedback" / f"{feedback_id}.json",
@@ -359,6 +390,7 @@ class TaskBatchBuilder:
                             "candidate_id": feedback_id,
                             "accepted": False,
                             "reason": rejection,
+                            "stage": stage,
                             "notes": rejection_record,
                         },
                     )
@@ -411,11 +443,17 @@ class TaskBatchBuilder:
                     )
                     if not statement_valid:
                         report.passed = False
-                        report.rejection_reasons.extend(
-                            f"statement_audit:{issue}" for issue in statement_issues
-                        )
+                        for issue in statement_issues:
+                            report.rejection_reasons.append(f"statement_audit:{issue}")
+                        if STATEMENT_LEAKAGE not in report.failure_stages:
+                            report.failure_stages.append(STATEMENT_LEAKAGE)
                 report_data = report.model_dump(mode="json")
                 result.validation_reports.append(report_data)
+                if not report.passed:
+                    accumulate_stages(
+                        result.repo_chain_stats,
+                        list(getattr(report, "failure_stages", None) or []),
+                    )
                 feedback_reason = "; ".join(report.rejection_reasons)
                 atomic_write_json(
                     output_dir / "trusted_feedback" / f"{cand.candidate_id}.json",
@@ -463,19 +501,17 @@ class TaskBatchBuilder:
                             "accepted_so_far": source_counts[source_type] + 1,
                             "reason": "other_source_underfilled",
                         })
-                    # P0-12: stamp full provenance from trajectory/plan metadata.
+                    # P0-5: stamp provenance only from candidate/plan metadata.
+                    # Never fall back to the current proposer node_id — that
+                    # mis-labels Parent-failure tasks as Current Child.
                     meta = dict(getattr(cand, "generation_metadata", {}) or {})
                     plan_meta = plans_by_id.get(getattr(cand, "plan_id", ""), {}) or {}
                     blueprint = dict(plan_meta.get("task_blueprint") or {})
                     source_node_id = str(
                         meta.get("source_node_id")
+                        or blueprint.get("source_node_id")
                         or meta.get("source_node")
-                        or (
-                            node_id
-                            if source_type in {"current_child_level1", "bootstrap"}
-                            else ""
-                        )
-                        or node_id
+                        or ""
                     )
                     source_task_id = str(
                         meta.get("source_task_id")
@@ -484,9 +520,26 @@ class TaskBatchBuilder:
                     )
                     source_failure_stage = str(
                         meta.get("source_failure_stage")
+                        or blueprint.get("source_failure_stage")
                         or blueprint.get("failure_stage")
                         or ""
                     )
+                    stamped_traj = str(
+                        meta.get("source_trajectory_id")
+                        or blueprint.get("source_trajectory_id")
+                        or ""
+                    )
+                    if stamped_traj:
+                        source_trajectory = stamped_traj
+                    stamped_type = str(
+                        meta.get("source_type") or blueprint.get("source_type") or ""
+                    )
+                    if stamped_type in {
+                        "parent_failure",
+                        "current_child_level1",
+                        "bootstrap",
+                    }:
+                        source_type = stamped_type
                     # P0-8: f2p_tests come ONLY from trusted report, never from
                     # candidate-declared metadata.
                     task = task_committer.commit_task(
@@ -669,13 +722,41 @@ class TaskBatchBuilder:
         """
         cand_dict = self._candidate_dict(candidate)
         source_traj_ids: list[str] = []
-        if isinstance(cand_dict.get("generation_metadata"), dict):
-            source_traj_ids = list(
-                cand_dict["generation_metadata"].get("source_trajectory_ids") or []
-            )
+        meta = cand_dict.get("generation_metadata")
+        stamped_source = ""
+        if isinstance(meta, dict):
+            source_traj_ids = list(meta.get("source_trajectory_ids") or [])
+            single = str(meta.get("source_trajectory_id") or "")
+            if single and single not in source_traj_ids:
+                source_traj_ids = [single] + source_traj_ids
+            stamped = str(meta.get("source_type") or "")
+            if stamped in {"parent_failure", "current_child_level1", "bootstrap"}:
+                stamped_source = stamped
 
         if bootstrap and not parent_failure_trajectories and not current_child_level1_trajectories:
             return "bootstrap", ""
+
+        # P0-4: prefer pre-generation stamp when present; still resolve traj id.
+        if stamped_source == "bootstrap":
+            return "bootstrap", ""
+        if stamped_source:
+            matched = ""
+            bucket = (
+                parent_failure_trajectories
+                if stamped_source == "parent_failure"
+                else current_child_level1_trajectories
+            )
+            for traj_id in source_traj_ids:
+                for path in bucket:
+                    if traj_id and (traj_id in path or path in traj_id or traj_id == path):
+                        return stamped_source, str(traj_id)
+                if traj_id:
+                    matched = matched or str(traj_id)
+            if matched:
+                return stamped_source, matched
+            if bucket:
+                return stamped_source, str(bucket[0])
+            return stamped_source, ""
 
         def _match(traj_id: str, bucket: List[str]) -> bool:
             for path in bucket:
@@ -703,6 +784,54 @@ class TaskBatchBuilder:
         if current_child_level1_trajectories:
             return "current_child_level1", str(current_child_level1_trajectories[0])
         return "bootstrap", ""
+
+    @staticmethod
+    def _remaining_generation_quotas(
+        *,
+        quotas: dict,
+        source_counts: dict,
+        remaining_tasks: int,
+        parent_failure_trajectories: List[str],
+        current_child_level1_trajectories: List[str],
+    ) -> dict:
+        """P0-4: remaining Parent/Child plan budgets for the next generate call.
+
+        Starts from nominal remaining quotas. If the batch still needs tasks
+        beyond those remainders (donation / one side exhausted of trajectories),
+        donate the slack to a source that still has trajectories — matching
+        ``_accepts_source`` commit-time donation.
+        """
+        rem_p = max(
+            0,
+            int(quotas.get("parent_failure", 0) or 0)
+            - int(source_counts.get("parent_failure", 0) or 0),
+        )
+        rem_c = max(
+            0,
+            int(quotas.get("current_child_level1", 0) or 0)
+            - int(source_counts.get("current_child_level1", 0) or 0),
+        )
+        slack = max(0, int(remaining_tasks) - rem_p - rem_c)
+        if slack > 0:
+            has_parent = bool(parent_failure_trajectories)
+            has_child = bool(current_child_level1_trajectories)
+            parent_at = int(source_counts.get("parent_failure", 0) or 0) >= int(
+                quotas.get("parent_failure", 0) or 0
+            )
+            child_at = int(source_counts.get("current_child_level1", 0) or 0) >= int(
+                quotas.get("current_child_level1", 0) or 0
+            )
+            child_quota_zero = int(quotas.get("current_child_level1", 0) or 0) == 0
+            parent_quota_zero = int(quotas.get("parent_failure", 0) or 0) == 0
+            if has_parent and (child_at or child_quota_zero or not has_child):
+                rem_p += slack
+            elif has_child and (parent_at or parent_quota_zero or not has_parent):
+                rem_c += slack
+            elif has_parent:
+                rem_p += slack
+            elif has_child:
+                rem_c += slack
+        return {"parent_failure": rem_p, "current_child_level1": rem_c}
 
     @staticmethod
     def _accepts_source(

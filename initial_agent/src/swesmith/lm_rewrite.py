@@ -293,8 +293,15 @@ class LMRewrite:
     def _call_agent(self, system_prompt: str, user_prompt: str) -> str:
         """Call the LLM via the agent adapter."""
         if hasattr(self.agent_adapter, "chat"):
+            model = str(getattr(self.agent_adapter, "default_model", "") or "")
             try:
-                return self.agent_adapter.chat(system_prompt, user_prompt, temperature=0)
+                if model:
+                    return self.agent_adapter.chat(
+                        system_prompt, user_prompt, temperature=0, model=model
+                    )
+                return self.agent_adapter.chat(
+                    system_prompt, user_prompt, temperature=0
+                )
             except TypeError:
                 return self.agent_adapter.chat(system_prompt, user_prompt)
 

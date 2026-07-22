@@ -19,6 +19,7 @@ from ..schemas.node import NodeRecord, NodeStatus
 from ..storage.atomic import read_json
 from ..storage.atomic import atomic_write_json
 from ..storage.event_log import log_event
+from ..schemas.repo_chain_stats import empty_repo_chain_stats, merge_repo_chain_stats
 from ..tree.archive import NodeArchive
 from ..tree.selection import ParentSelector
 from .budget import Budget
@@ -155,6 +156,25 @@ class EvolutionOrchestrator:
         repo_pool = RepoPool(Path(config.paths.repo_pool))
         task_store = TaskStore(Path(config.paths.task_store))
         workspace_manager = WorkspaceManager(Path(config.execution.scratch_root))
+
+        # P0-8.1: build ExecutionBackendFactory *before* the agent adapter so
+        # Solver / Self-edit / Diagnoser share the same Apptainer agent backend
+        # instead of silently defaulting to Host SubprocessRunner.
+        from ..execution.apptainer import ExecutionBackendFactory
+
+        use_apptainer = config.execution.backend == "apptainer" and (
+            bool(config.execution.agent_image)
+            or bool(config.execution.repo_image_dir)
+        )
+        backend_factory = ExecutionBackendFactory(
+            agent_image=Path(config.execution.agent_image) if config.execution.agent_image else None,
+            repo_image_dir=Path(config.execution.repo_image_dir) if config.execution.repo_image_dir else None,
+            apptainer_bin=config.execution.apptainer_bin,
+            use_apptainer=use_apptainer,
+        )
+        agent_backend = backend_factory.agent_backend()
+        agent_adapter = cls._build_agent_adapter(execution_backend=agent_backend)
+
         validator = CandidateValidator(
             workspace_root=Path(config.execution.scratch_root) / run_context.run_id / "validator",
             test_timeout_sec=config.proposer.candidate_timeout_sec,
@@ -164,41 +184,13 @@ class EvolutionOrchestrator:
             require_causal_ablation=bool(
                 config.proposer.repo_chain.require_causal_ablation
             ),
-            # BUG-15/10.8: trusted repository tests run through the repo
-            # backend so the chain is end-to-end Apptainer. The backend is
-            # built later from the ExecutionBackendFactory; we patch it in
-            # after the factory is constructed below.
+            # P0-8.2: hold the factory so each task resolves
+            # repo_backend(repo_id) → repo_image_dir/<repo_id>.sif.
+            backend_factory=backend_factory,
         )
         task_committer = TaskCommitter(task_store)
 
-        agent_adapter = cls._build_agent_adapter()
         from ..tasks.node_proposer import NodeProposerRunner
-        from ..execution.subprocess_runner import SubprocessRunner
-
-        # Phase 9 / BUG-13~17: build the unified execution backend. Default is
-        # subprocess; when config.execution.backend == "apptainer" and an
-        # agent_image is configured, use ApptainerRunner for HPC container
-        # isolation. The ExecutionBackendFactory exposes separate agent-facing
-        # (network enabled) and repo-facing (network disabled) backends so the
-        # whole chain is end-to-end Apptainer.
-        from ..execution.apptainer import ExecutionBackendFactory
-
-        backend_factory = ExecutionBackendFactory(
-            agent_image=Path(config.execution.agent_image) if config.execution.agent_image else None,
-            repo_image_dir=Path(config.execution.repo_image_dir) if config.execution.repo_image_dir else None,
-            apptainer_bin=config.execution.apptainer_bin,
-            use_apptainer=(
-                config.execution.backend == "apptainer"
-                and bool(config.execution.agent_image)
-            ),
-        )
-        # BUG-16: agent-facing backend keeps network enabled so online LLM
-        # API calls work. Repo-facing backend (trusted tests) disables network.
-        execution_backend = backend_factory.agent_backend()
-        repo_backend = backend_factory.repo_backend()
-        # BUG-15/10.8: inject the repo backend into the validator so trusted
-        # repository tests also run inside Apptainer.
-        validator.execution_backend = repo_backend
 
         proposer_runner = NodeProposerRunner(
             agent_repo=Path(config.paths.agent_repo),
@@ -207,7 +199,8 @@ class EvolutionOrchestrator:
             / "node_proposer",
             timeout_sec=config.proposer.candidate_timeout_sec
             * config.tasks.max_generation_candidates,
-            execution_backend=execution_backend,
+            execution_backend=agent_backend,
+            project_root=Path(__file__).resolve().parents[3],
         )
 
         from ..evolution.cycle_builder import NodeCycleBuilder
@@ -236,14 +229,19 @@ class EvolutionOrchestrator:
                 max_total_evidence_chars=config.diagnosis.max_total_evidence_chars,
                 include_success_contrast=config.diagnosis.include_success_contrast,
             ),
-            "diagnoser": CycleDiagnoser(chat_adapter=agent_adapter),
+            "diagnoser": CycleDiagnoser(
+                chat_adapter=agent_adapter,
+                model=config.models.diagnose_model,
+            ),
             "level1_evaluator": Level1Evaluator(
                 regression_threshold=config.scoring.regression_threshold
             ),
             "task_batch_builder": TaskBatchBuilder(
                 batch_size=config.tasks.batch_size,
                 max_candidates=config.tasks.max_generation_candidates,
-                strategy_weights=config.proposer.repo_chain.mutation_backends,
+                # P1-2: RepoChain Stage 5 is fixed trajectory_conditioned_chain_mutation;
+                # do not misuse removed mutation_backends weights as planner strategy.
+                strategy_weights={},
                 contract_test_renderer=config.proposer.contract_test_renderer,
                 source_quotas={
                     "parent_failure": config.tasks.sources.parent_failure.quota,
@@ -257,7 +255,7 @@ class EvolutionOrchestrator:
                 batch_builder=TaskBatchBuilder(
                     batch_size=config.tasks.batch_size,
                     max_candidates=config.tasks.max_generation_candidates,
-                    strategy_weights=config.proposer.repo_chain.mutation_backends,
+                    strategy_weights={},
                     contract_test_renderer=config.proposer.contract_test_renderer,
                     source_quotas={
                         "parent_failure": config.tasks.sources.parent_failure.quota,
@@ -285,6 +283,8 @@ class EvolutionOrchestrator:
                 repo_pool=repo_pool,
                 agent_repo=Path(config.paths.agent_repo),
                 agent_adapter=agent_adapter,
+                execution_backend=agent_backend,
+                backend_factory=backend_factory,
                 model=config.models.solver_model,
                 solver_timeout_sec=max(
                     config.evaluation.level1_timeout_sec,
@@ -295,8 +295,13 @@ class EvolutionOrchestrator:
         }
 
     @staticmethod
-    def _build_agent_adapter():
-        """Create a coding-agent adapter only when LLM configuration is present."""
+    def _build_agent_adapter(execution_backend=None):
+        """Create a coding-agent adapter only when LLM configuration is present.
+
+        P0-8.1: when an ExecutionBackend is supplied (Apptainer or Subprocess),
+        inject it so Solver / Self-edit / Diagnoser do not silently construct
+        their own Host SubprocessRunner.
+        """
         env_keys = [
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",
@@ -310,8 +315,7 @@ class EvolutionOrchestrator:
             return None
         from experiment_adapters.common_agent_adapter import CommonAgentAdapter
 
-        return CommonAgentAdapter()
-
+        return CommonAgentAdapter(execution_backend=execution_backend)
     @staticmethod
     def _build_selector(config: "Godel0Config"):
         """Build the parent selector from config.
@@ -904,9 +908,24 @@ class EvolutionOrchestrator:
                 if "context" in error_type or "token" in error_type:
                     stats["context_overflow_count"] += 1
 
-        # BUG-21 / P1-4: collect per-task rollout outcomes so stochasticity
-        # only fires when the SAME task has inconsistent resolved outcomes
-        # across rollouts (not merely because it was rolled out multiple times).
+            # P1-4: prefer structured Level2 outcomes for rollout / stochasticity
+            # (trajectory parsing is a fallback when outcomes are absent).
+            by_task: dict[str, list[bool]] = {}
+            for outcome in level2.outcomes:
+                by_task.setdefault(outcome.task_id, []).append(bool(outcome.resolved))
+            if by_task:
+                stats["solver_rollouts"] = max(len(flags) for flags in by_task.values())
+                stats["tasks_with_multiple_rollouts"] = sum(
+                    1 for flags in by_task.values() if len(flags) >= 2
+                )
+                stats["stochastic_task_count"] = sum(
+                    1
+                    for flags in by_task.values()
+                    if len(flags) >= 2 and (True in flags) and (False in flags)
+                )
+
+        # BUG-21 / P1-4: trajectory signals (localization / tool loops) plus
+        # fallback rollout counting when Level2 outcomes were not provided.
         rollout_counts: dict[str, int] = {}
         rollout_outcomes: dict[str, list[bool]] = {}
         excerpts = self._trajectory_excerpts(node.node_id)
@@ -924,15 +943,14 @@ class EvolutionOrchestrator:
                 resolved = self._trajectory_resolved(excerpt)
                 if resolved is not None:
                     rollout_outcomes.setdefault(task_id, []).append(resolved)
-        if rollout_counts:
+        if stats["solver_rollouts"] == 0 and rollout_counts:
             stats["solver_rollouts"] = max(rollout_counts.values())
             stats["tasks_with_multiple_rollouts"] = sum(
                 1 for c in rollout_counts.values() if c >= 2
             )
-            # P1-4: only count tasks with inconsistent outcomes across rollouts.
             stochastic = 0
-            for task_id, outcomes in rollout_outcomes.items():
-                if len(outcomes) >= 2 and (True in outcomes) and (False in outcomes):
+            for task_id, flags in rollout_outcomes.items():
+                if len(flags) >= 2 and (True in flags) and (False in flags):
                     stochastic += 1
             stats["stochastic_task_count"] = stochastic
         return stats
@@ -1024,57 +1042,24 @@ class EvolutionOrchestrator:
     def _extended_proposer_stats(self, node, base_stats: dict) -> dict:
         """Extend proposer stats with RepoChain-specific counters.
 
-        Reads the extended generation_summary.json written by the proposer,
-        which now includes causal_ablation_failure_count,
-        contract_generation_failure_count, clean_contract_failure_count,
-        no_f2p_count, no_p2p_count, duplicate_count, statement_leakage_count.
-        Falls back to 0 for each counter that the proposer has not yet emitted.
+        P1-3: read only structured ``repo_chain_stats`` (or top-level mirrors)
+        from generation_summary.json. Do NOT substring-match rejection_reasons
+        — that double-counts stages already aggregated at emit time.
         """
         path = self.run_context.paths.proposer_dir(node.node_id) / "generation_summary.json"
-        extended = {
-            "causal_ablation_failure_count": 0,
-            "contract_generation_failure_count": 0,
-            "clean_contract_failure_count": 0,
-            "no_f2p_count": 0,
-            "no_p2p_count": 0,
-            "duplicate_count": 0,
-            "statement_leakage_count": 0,
-        }
-        if path.is_file():
-            data = read_json(path)
-            # P1-3: prefer structured repo_chain_stats when the proposer emitted it.
-            structured = data.get("repo_chain_stats") or {}
-            if isinstance(structured, dict):
-                for key in extended:
-                    if key in structured:
-                        extended[key] = int(structured.get(key, 0) or 0)
-            for key in extended:
-                if key in data:
-                    extended[key] = int(data.get(key, extended[key]) or 0)
-            # Also derive no_f2p / no_p2p from rejection_reasons if present.
-            rejections = data.get("rejection_reasons") or {}
-            for reason, count in rejections.items():
-                reason_lower = str(reason).lower()
-                if "no_f2p" in reason_lower or "f2p" in reason_lower:
-                    extended["no_f2p_count"] += int(count)
-                if "no_p2p" in reason_lower or "p2p" in reason_lower:
-                    extended["no_p2p_count"] += int(count)
-                if "duplicate" in reason_lower:
-                    extended["duplicate_count"] += int(count)
-                if "leakage" in reason_lower or "leak" in reason_lower:
-                    extended["statement_leakage_count"] += int(count)
-                if any(
-                    token in reason_lower
-                    for token in (
-                        "causal_ablation",
-                        "single_file_repair",
-                        "independently_active",
-                        "not_multi_file",
-                        "trusted_causal_ablation",
-                    )
-                ):
-                    extended["causal_ablation_failure_count"] += int(count)
-        return extended
+        extended = empty_repo_chain_stats()
+        if not path.is_file():
+            return extended
+        data = read_json(path)
+        structured = data.get("repo_chain_stats")
+        if isinstance(structured, dict) and any(
+            int(structured.get(k, 0) or 0) for k in extended
+        ):
+            return merge_repo_chain_stats(structured)
+        # Older summaries may only have flat mirrored counters.
+        return merge_repo_chain_stats(
+            {key: data.get(key) for key in extended if key in data}
+        )
 
     def _tool_events(self, node_id: str) -> list[dict]:
         """Extract tool-call events from solver trajectories for shared detection."""
@@ -1374,30 +1359,15 @@ class EvolutionOrchestrator:
                 validation_reports=list(legacy.validation_reports),
                 proposer_error=legacy.proposer_error,
                 engine_rejections=list(legacy.engine_rejections),
+                repo_chain_stats=dict(getattr(legacy, "repo_chain_stats", None) or {}),
             )
         child.generated_task_batch_id = result.batch_id
         summary_path = self.run_context.paths.proposer_dir(child.node_id) / "generation_summary.json"
-        # BUG-20: persist RepoChain-specific counters as structured fields so
-        # the special detectors can read them directly instead of substring
-        # matching on rejection_reasons.
-        rejection_reasons = dict(result.rejection_reasons)
-        def _count(*keys: str) -> int:
-            total = 0
-            for reason, count in rejection_reasons.items():
-                reason_lower = str(reason).lower()
-                if any(k in reason_lower for k in keys):
-                    total += int(count)
-            return total
-        repo_chain_stats = {
-            "contract_generation_failure_count": _count("contract_generation", "contract_not_restored", "contract_not_built"),
-            "clean_contract_failure_count": _count("clean_contract"),
-            "mutation_materialization_failure_count": _count("mutation_materialization", "mutation_failed", "engine_returned_no_candidates"),
-            "causal_ablation_failure_count": _count("causal_ablation", "single_file_repair", "independently_active"),
-            "no_f2p_count": _count("no_f2p", "f2p"),
-            "no_p2p_count": _count("no_p2p", "p2p"),
-            "duplicate_count": _count("duplicate"),
-            "statement_leakage_count": _count("leakage", "leak", "statement_audit"),
-        }
+        # P1-3: persist stage counters emitted by batch/validator/RepoChain —
+        # never re-infer by substring-matching rejection_reasons.
+        repo_chain_stats = merge_repo_chain_stats(
+            getattr(result, "repo_chain_stats", None) or empty_repo_chain_stats()
+        )
         atomic_write_json(
             summary_path,
             {
@@ -1412,9 +1382,6 @@ class EvolutionOrchestrator:
                 "validation_reports": result.validation_reports,
                 "proposer_error": result.proposer_error,
                 "engine_rejections": result.engine_rejections,
-                # BUG-20: structured RepoChain counters (also available as a
-                # nested ``repo_chain_stats`` object for consumers that prefer
-                # the grouped shape from the bugfix guide).
                 "repo_chain_stats": repo_chain_stats,
                 **repo_chain_stats,
             },
@@ -1425,16 +1392,23 @@ class EvolutionOrchestrator:
         if self.level2_evaluator is None or self.solver_runner is None or batch_result is None:
             return None
         tasks = list(getattr(batch_result, "tasks", []))
-        outcomes = [
-            self.solver_runner.run_task(
-                node=child,
-                task=task,
-                level=2,
-                seed=self.config.run.seed,
-                run_id=self.run_context.run_id,
-            )
-            for task in tasks
-        ]
+        # P1-4: honor evaluation.solver_rollouts — each task is solved N times
+        # with distinct seeds / artifact dirs so stochasticity has real data.
+        rollouts = max(1, int(getattr(self.config.evaluation, "solver_rollouts", 1) or 1))
+        base_seed = int(getattr(self.config.run, "seed", 0) or 0)
+        outcomes = []
+        for task in tasks:
+            for rollout_index in range(rollouts):
+                outcomes.append(
+                    self.solver_runner.run_task(
+                        node=child,
+                        task=task,
+                        level=2,
+                        seed=base_seed + rollout_index,
+                        run_id=self.run_context.run_id,
+                        rollout_index=rollout_index,
+                    )
+                )
         result = self.level2_evaluator.compute_accuracy(
             child.node_id,
             getattr(batch_result, "batch_id", ""),

@@ -47,12 +47,8 @@ proposer:
     context_file_budget: 10
     require_generated_contracts: true
     require_causal_ablation: true
-    mutation_backends:
-      lm_modify: 1.0
-  candidate_timeout_sec: 900
-  max_patch_lines: 200
-  forbid_test_file_edits: true
-  require_f2p: true
+    # P1-2: Stage 5 is fixed; weights were never a real selector.
+    mutation_operator: "trajectory_conditioned_chain_mutation"
 
 execution:
   backend: "subprocess"

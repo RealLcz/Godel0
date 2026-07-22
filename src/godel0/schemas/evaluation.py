@@ -19,6 +19,8 @@ class EvaluationOutcome(BaseModel):
     test_summary_path: str = ""
     runtime_sec: float = 0.0
     error_type: Optional[str] = None
+    # P1-4: which of N solver_rollouts this outcome belongs to (0-indexed).
+    rollout_index: int = 0
 
 
 class Level1Result(BaseModel):
@@ -57,10 +59,14 @@ class CandidateValidationReport(BaseModel):
     p2p_tests: list[str] = []
     reverse_restored: bool = False
 
-    # P0-7 / P0-8: trusted causal ablation. Only Trusted Validator results
-    # may set these; proposer-declared causal_ablation metadata is advisory.
+    # P0-7 / P0-8 / P0-6: trusted causal ablation. Only Trusted Validator
+    # results may set these; proposer-declared causal_ablation metadata is
+    # advisory.
     trusted_causal_ablation_pass: bool = True
     repair_one_file_results: dict = Field(default_factory=dict)
+    # Clean + only File_i → contract fails. This is the true independent
+    # activity signal (leave-one-out "still fail" is necessity, not activity).
+    isolated_file_triggers: dict = Field(default_factory=dict)
     independently_active_file_count: int = 0
 
     syntax_valid: bool = False
@@ -71,3 +77,6 @@ class CandidateValidationReport(BaseModel):
     relevance_valid: bool = False
 
     rejection_reasons: list[str] = []
+    # P1-3: structured stage codes emitted by validator / causal ablation.
+    # Aggregators must count these — not substring-match rejection_reasons.
+    failure_stages: list[str] = []

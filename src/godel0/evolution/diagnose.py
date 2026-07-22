@@ -19,10 +19,19 @@ class CycleDiagnoser:
     rules when no LLM is available.
     """
 
-    def __init__(self, llm_client=None, chat_adapter=None, max_retries: int = 2):
+    def __init__(
+        self,
+        llm_client=None,
+        chat_adapter=None,
+        max_retries: int = 2,
+        model: str = "",
+    ):
         self.llm_client = llm_client
         self.chat_adapter = chat_adapter
         self.max_retries = max_retries
+        # P1-1: explicit diagnose_model; must not rely on GODEL0_MODEL / shared
+        # adapter default (that adapter is also used by Solver / Self-edit).
+        self.model = str(model or "").strip()
 
     def diagnose(
         self,
@@ -53,12 +62,7 @@ class CycleDiagnoser:
         prompt = build_diagnosis_prompt(summary, evidence, agent_code_summary)
         for attempt in range(self.max_retries + 1):
             try:
-                response = self.chat_adapter.chat(
-                    DIAGNOSIS_SYSTEM_PROMPT,
-                    prompt,
-                    temperature=0,
-                    max_tokens=4096,
-                )
+                response = self._call_chat(prompt)
                 diagnosis = self._parse_llm_response(response, node_id, evidence)
                 self._validate(diagnosis, evidence)
                 return diagnosis
@@ -66,6 +70,25 @@ class CycleDiagnoser:
                 if attempt >= self.max_retries:
                     break
         return self._diagnose_deterministic(node_id, summary, evidence)
+
+    def _call_chat(self, prompt: str) -> str:
+        """P1-1: always pass diagnose_model when configured."""
+        chat = self.chat_adapter.chat
+        kwargs = {
+            "temperature": 0,
+            "max_tokens": 4096,
+        }
+        if self.model:
+            kwargs["model"] = self.model
+        try:
+            return chat(DIAGNOSIS_SYSTEM_PROMPT, prompt, **kwargs)
+        except TypeError:
+            # Older adapters without model= — retry without it.
+            kwargs.pop("model", None)
+            try:
+                return chat(DIAGNOSIS_SYSTEM_PROMPT, prompt, **kwargs)
+            except TypeError:
+                return chat(DIAGNOSIS_SYSTEM_PROMPT, prompt)
 
     def _diagnose_with_llm(
         self,
