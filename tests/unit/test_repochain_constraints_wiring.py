@@ -38,10 +38,27 @@ class TestRepoChainConstraintsWiring:
         assert plan.constraints.min_mutation_sites == 3
         assert plan.constraints.max_mutation_sites == 8
         assert plan.constraints.context_file_budget == 10
-        assert plan.constraints.require_generated_tests is True
+        assert plan.constraints.require_generated_tests is False
         # Blueprint metadata stays in sync, but is not the algorithm source.
         assert plan.task_blueprint["constraints"]["min_modified_files"] == 2
         assert plan.task_blueprint["constraints"]["max_modified_files"] == 6
+
+    def test_require_generated_contracts_can_be_enabled(self):
+        wf = RepoChainWorkflow(
+            config=SimpleNamespace(
+                min_files=2,
+                max_files=6,
+                min_mutation_sites=3,
+                max_mutation_sites=8,
+                context_file_budget=10,
+                require_generated_contracts=True,
+                require_causal_ablation=True,
+                mutation_operator="trajectory_conditioned_chain_mutation",
+            )
+        )
+        plan = _plan()
+        wf._apply_constraints_to_plan(plan)
+        assert plan.constraints.require_generated_tests is True
 
     def test_generator_readable_attrs_match_config(self):
         """Mimic RepoChainGenerator's constraint reads after stamping."""

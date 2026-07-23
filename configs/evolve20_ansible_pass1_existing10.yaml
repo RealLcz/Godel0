@@ -1,0 +1,68 @@
+run:
+  seed: 7302
+  run_name: "ansible_evolve20_existing10"
+  max_nodes: 10
+  max_expansions: 100
+
+models:
+  agent_model: "Qwen/Qwen3.6-35B-A3B"
+  diagnose_model: "Qwen/Qwen3.6-35B-A3B"
+  temperature: 0.0
+  max_tokens: 8192
+
+agent:
+  max_steps: 100
+  max_tool_errors: 5
+  trajectory_format: "jsonl"
+  self_evolve_timeout_sec: 1800
+
+tasks:
+  batch_size: 10
+  max_generation_candidates: 50
+  candidates_per_signature: 5
+  allow_same_repo_transfer: true
+  allow_cross_repo_transfer: false
+
+scoring:
+  regression_threshold: 0.8
+  regression_weight: 0.5
+  proposer_target_accuracy: 0.5
+  min_parent_solved_tasks: 3
+  mode: hgm
+  selection:
+    strategy: thompson_sampling
+    num_pseudo_descendant_evals: 10
+
+evaluation:
+  solver_rollouts: 1
+  deterministic: true
+  level1_timeout_sec: 1200
+  level2_timeout_sec: 1200
+  max_workers: 1
+
+proposer:
+  initial_workflow: repo_chain
+  # Slightly higher per-candidate budget: existing-test probes + mutation.
+  candidate_timeout_sec: 180
+  repo_chain:
+    min_files: 2
+    max_files: 6
+    min_mutation_sites: 3
+    max_mutation_sites: 8
+    context_file_budget: 10
+    # Primary oracle = existing passing repo tests; generated contracts optional.
+    require_generated_contracts: false
+    require_causal_ablation: true
+    mutation_operator: "trajectory_conditioned_chain_mutation"
+
+execution:
+  backend: "subprocess"
+  scratch_root: "./scratch_ansible_evolve20_existing10"
+  clean_env: true
+  network_disabled: true
+
+paths:
+  agent_repo: "./agent_repo_ansible_evolve20_pass1"
+  repo_pool: "./repo_pool"
+  runs: "./runs_ansible_evolve20_existing10"
+  task_store: "./task_store_ansible_evolve20_existing10"

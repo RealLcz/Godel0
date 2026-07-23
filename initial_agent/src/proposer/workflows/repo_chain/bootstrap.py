@@ -286,7 +286,7 @@ def build_bootstrap_plans(
                     min_mutation_sites=3,
                     max_mutation_sites=8,
                     context_file_budget=10,
-                    require_generated_tests=True,
+                    require_generated_tests=False,
                 ),
                 rationale=(
                     f"bootstrap plan for capability {capability} "

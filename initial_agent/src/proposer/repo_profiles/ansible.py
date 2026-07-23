@@ -20,7 +20,7 @@ from .base import RepoProfile
 class AnsibleProfile(RepoProfile):
     name: str = "ansible"
     source_roots: List[str] = field(default_factory=lambda: ["lib", "test/lib"])
-    test_roots: List[str] = field(default_factory=lambda: ["test/lib"])
+    test_roots: List[str] = field(default_factory=lambda: ["test/units", "test/lib"])
     contract_renderer: str = "ansible_playbook_cli"
     public_entrypoints: List[str] = field(default_factory=lambda: ["ansible-playbook CLI"])
     environment: str = "python"

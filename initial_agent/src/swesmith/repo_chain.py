@@ -61,6 +61,9 @@ The following {context_count} related repository files are the complete code
 context for this planning call:
 {source_bundle}
 
+# Existing Test Grounding (API / fixtures / expected behavior ONLY)
+{existing_test_grounding}
+
 Return one JSON object and no prose:
 {{
   "chain_plan": {{
@@ -109,6 +112,12 @@ Requirements:
 - Generate focused tests before any mutation. They must pass on the current
   repository and assert public behavior, not source text or implementation
   line numbers.
+- Ground constructors, imports, fixtures, and public call patterns on the
+  Existing Test Grounding above. Inventing APIs that conflict with those
+  examples is a hard failure mode (clean_contract_failure).
+- The final contract must still be NEW supervision: never copy an existing
+  test file path or paste an existing test class/function as the delivered
+  contract. Emit a newly named generated test under `test/units/`.
 - Include at least one test crossing three production modules or layers.
 - Include layer contracts so repairing only one mutated file remains incomplete.
 - Generate at least two pytest test functions, including one nearby compatibility
@@ -128,6 +137,75 @@ Requirements:
   substring. Never use regular expressions, glob syntax, `.*`, anchors, or
   escaped regex metacharacters in those keys.
 - Do not expose the planned mutations in test names or comments.
+"""
+
+
+EXISTING_CONTRACT_CHAIN_PROMPT = """\
+# Plan one cross-file mutation against EXISTING passing repository tests
+
+Capability gap inferred from prior solver behavior:
+{trajectory_evidence}
+
+Blueprint:
+```json
+{blueprint}
+```
+
+Allowed production paths (this is an exhaustive whitelist):
+```json
+{allowed_production_paths}
+```
+
+Allowed AST mutation symbols by production path (also exhaustive):
+```json
+{allowed_symbols}
+```
+
+The following {context_count} related repository files are the complete code
+context for this planning call:
+{source_bundle}
+
+# Existing Passing Contract Tests (already verified on the clean repo)
+These repository tests ARE the task oracle. Do NOT invent new test files.
+Corrupt production behavior so these tests fail after mutation, while remaining
+repairable via a multi-file fix of the planned chain.
+{existing_contract_tests}
+
+Return one JSON object and no prose:
+{{
+  "chain_plan": {{
+    "root_invariant": "one user-visible semantic invariant covered by the tests",
+    "entrypoint": "module.symbol",
+    "endpoint": "module.symbol or observable behavior",
+    "capability_gap": "reasoning skill exercised",
+    "context_files": ["paths actually used"],
+    "mutation_sites": [
+      {{
+        "file": "production path",
+        "symbol": "symbol",
+        "role": "producer|carrier|identity|consumer|error-boundary",
+        "change": "specific behavior to corrupt so the existing tests fail"
+      }}
+    ],
+    "contract_tests": ["which existing tests / behaviors are expected to fail"],
+    "rationale": "why all sites belong to one chain exercised by those tests"
+  }},
+  "tests": [],
+  "contract_source": "existing_tests"
+}}
+
+Requirements:
+- Plan {min_sites} to {max_sites} mutation sites in {min_files} to {max_files}
+  production files selected from the exhaustive whitelist.
+- Every mutation-site `symbol` must be copied exactly from the AST symbol
+  whitelist for its file.
+- Transfer only the solver's abstract capability gap from trajectory evidence.
+  Do not reuse forbidden trajectory domain nouns from the blueprint.
+- Do NOT generate new tests, rewrite existing tests, or change test paths.
+- Mutations must stay in production files only. The existing tests above are
+  the sole FAIL_TO_PASS oracle after mutation.
+- Prefer corruptions that require coordinated multi-file repair (single-file
+  revert should leave at least one existing contract still failing).
 """
 
 
@@ -235,6 +313,9 @@ class RepoChainGenerator:
             return []
 
         constraints = plan.constraints
+        require_generated = bool(
+            getattr(constraints, "require_generated_tests", False)
+        )
         min_files = max(2, int(getattr(constraints, "min_modified_files", 2) or 2))
         max_files = max(min_files, int(getattr(constraints, "max_modified_files", 6) or 6))
         min_sites = max(min_files, int(getattr(constraints, "min_mutation_sites", min_files) or min_files))
@@ -259,6 +340,13 @@ class RepoChainGenerator:
         source_bundle = self._source_bundle(Path(source_repo), context_files)
         trajectory_evidence = self._trajectory_evidence(plan)
         blueprint = dict(getattr(plan, "task_blueprint", None) or {})
+        production_context = [
+            path for path in context_files if not is_test_path(path)
+        ]
+        existing_test_grounding, grounding_tests = self._existing_test_grounding(
+            Path(source_repo),
+            production_context,
+        )
 
         output_root = Path(output_dir or source_repo)
         output_root.mkdir(parents=True, exist_ok=True)
@@ -269,11 +357,73 @@ class RepoChainGenerator:
                 parent_dir=str(output_root),
                 prefix=f"repo_chain_{plan.plan_id}_",
             ) as workspace:
-                contract_prompt = CONTRACT_PROMPT.format(
+                (output_root / "existing_test_grounding.json").write_text(
+                    json.dumps(
+                        {
+                            "production_files": production_context,
+                            "grounding_tests": grounding_tests,
+                            "require_generated_tests": require_generated,
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                contract_payload: Dict[str, Any] = {}
+                contract_error = ""
+                tests: List[Dict[str, Any]] = []
+                contract_patch = ""
+                test_files: List[str] = []
+                test_command = ""
+                clean_result: subprocess.CompletedProcess[str] | None = None
+                contract_source = (
+                    "generated_tests" if require_generated else "existing_tests"
+                )
+
+                if not require_generated:
+                    # Primary path: Existing Passing Tests → Semantic Chain → Mutation
+                    selected, select_error, clean_result = self._select_passing_existing_tests(
+                        plan=plan,
+                        repo_spec=repo_spec,
+                        workspace=workspace,
+                        production_files=production_context,
+                        timeout_sec=constraints.generation_timeout_sec,
+                        budget=4,
+                    )
+                    if select_error or not selected:
+                        self._reject(
+                            "contract_generation_failure",
+                            f"no_existing_passing_tests:{select_error or 'empty'}",
+                        )
+                        return []
+                    test_files = list(selected)
+                    test_command = self._contract_test_command(
+                        plan, repo_spec, test_files
+                    )
+                    (output_root / "existing_contract_tests.json").write_text(
+                        json.dumps(
+                            {
+                                "test_files": test_files,
+                                "test_command": test_command,
+                                "clean_returncode": getattr(
+                                    clean_result, "returncode", None
+                                ),
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    existing_contract_text = self._format_existing_contract_tests(
+                        Path(workspace), test_files
+                    )
+                    chain_prompt = EXISTING_CONTRACT_CHAIN_PROMPT.format(
                         trajectory_evidence=trajectory_evidence,
                         blueprint=json.dumps(blueprint, indent=2, ensure_ascii=False),
                         allowed_production_paths=json.dumps(
-                            [path for path in context_files if not is_test_path(path)],
+                            production_context,
                             indent=2,
                         ),
                         allowed_symbols=json.dumps(
@@ -282,131 +432,232 @@ class RepoChainGenerator:
                         ),
                         context_count=len(context_files),
                         source_bundle=source_bundle,
+                        existing_contract_tests=existing_contract_text,
                         min_sites=min_sites,
                         max_sites=max_sites,
                         min_files=min_files,
                         max_files=max_files,
                     )
-                contract_payload: Dict[str, Any] = {}
-                contract_error = ""
-                tests: List[Dict[str, Any]] = []
-                contract_patch = ""
-                test_files: List[str] = []
-                test_command = ""
-                clean_result: subprocess.CompletedProcess[str] | None = None
-                for attempt in range(3):
-                    retry_prompt = contract_prompt
-                    if contract_error:
-                        retry_prompt += (
-                            "\n\n# Previous response rejected\n"
-                            f"Reason: {contract_error}\n"
-                            "Regenerate the complete JSON from scratch. Fix the stated "
-                            "problem while preserving the abstract capability target."
+                    for attempt in range(3):
+                        retry_prompt = chain_prompt
+                        if contract_error:
+                            retry_prompt += (
+                                "\n\n# Previous response rejected\n"
+                                f"Reason: {contract_error}\n"
+                                "Regenerate the complete JSON from scratch. Do not "
+                                "emit new tests; only revise the chain_plan."
+                            )
+                        contract_response = self._call_contract_agent(
+                            plan=plan,
+                            workspace=workspace,
+                            prompt=retry_prompt,
                         )
-                    contract_response = self._call_contract_agent(
-                        plan=plan,
-                        workspace=workspace,
-                        prompt=retry_prompt,
-                    )
-                    response_text = (
-                        json.dumps(contract_response, indent=2, ensure_ascii=False)
-                        if isinstance(contract_response, dict)
-                        else str(contract_response or "")
-                    )
-                    contract_payload = self._parse_contract_payload(contract_response)
-                    stored_contract = json.dumps(
-                        contract_payload
-                        if contract_payload
-                        else {"invalid_response": response_text},
-                        indent=2,
-                        ensure_ascii=False,
-                    )
-                    (output_root / f"contract_response_attempt_{attempt + 1}.json").write_text(
-                        stored_contract, encoding="utf-8"
-                    )
-                    (output_root / "contract_response.json").write_text(
-                        stored_contract, encoding="utf-8"
-                    )
-                    contract_error = self._chain_plan_rejection(
-                        contract_payload,
-                        context_files=context_files,
-                        min_files=min_files,
-                        max_files=max_files,
-                        min_sites=min_sites,
-                        max_sites=max_sites,
-                        forbidden_terms=list(blueprint.get("forbidden_terms") or []),
-                    )
-                    if not contract_error:
-                        contract_error = self._mutation_symbols_rejection(
-                            Path(workspace), contract_payload["chain_plan"]
+                        response_text = (
+                            json.dumps(
+                                contract_response, indent=2, ensure_ascii=False
+                            )
+                            if isinstance(contract_response, dict)
+                            else str(contract_response or "")
                         )
-                    if contract_error:
-                        (output_root / f"contract_rejection_attempt_{attempt + 1}.txt").write_text(
-                            contract_error + "\n", encoding="utf-8"
+                        contract_payload = self._parse_contract_payload(
+                            contract_response
                         )
-                        continue
-                    tests = self._materialize_contract_tests(plan, contract_payload)
-                    if not tests:
-                        contract_error = (
-                            "contract_cases must contain at least one target case and "
-                            "one compatibility_control case with complete observable "
-                            "expectations"
+                        contract_payload["contract_source"] = "existing_tests"
+                        contract_payload["tests"] = []
+                        stored_contract = json.dumps(
+                            contract_payload
+                            if contract_payload
+                            else {"invalid_response": response_text},
+                            indent=2,
+                            ensure_ascii=False,
                         )
-                        (output_root / f"contract_rejection_attempt_{attempt + 1}.txt").write_text(
-                            contract_error + "\n", encoding="utf-8"
+                        (output_root / f"contract_response_attempt_{attempt + 1}.json").write_text(
+                            stored_contract, encoding="utf-8"
                         )
-                        continue
-                    if not self._write_tests(Path(workspace), tests):
-                        contract_error = (
-                            "generated tests must use one new .py path under test/units"
+                        (output_root / "contract_response.json").write_text(
+                            stored_contract, encoding="utf-8"
                         )
-                        (output_root / f"contract_rejection_attempt_{attempt + 1}.txt").write_text(
-                            contract_error + "\n", encoding="utf-8"
+                        contract_error = self._chain_plan_rejection(
+                            contract_payload,
+                            context_files=context_files,
+                            min_files=min_files,
+                            max_files=max_files,
+                            min_sites=min_sites,
+                            max_sites=max_sites,
+                            forbidden_terms=list(
+                                blueprint.get("forbidden_terms") or []
+                            ),
+                            require_generated_tests=False,
                         )
-                        self._discard_tests(Path(workspace), tests)
-                        continue
-                    contract_patch = self._test_patch(repository_diff(workspace, "HEAD"))
-                    if not contract_patch or not self._contract_quality_valid(contract_patch):
-                        contract_error = (
-                            "generated test patch lacks behavioral assertions or uses "
-                            "forbidden source inspection"
-                        )
-                        (output_root / f"contract_rejection_attempt_{attempt + 1}.txt").write_text(
-                            contract_error + "\n", encoding="utf-8"
-                        )
-                        self._discard_tests(Path(workspace), tests)
-                        continue
-                    test_files = self._changed_test_files(contract_patch)
-                    test_command = self._contract_test_command(plan, repo_spec, test_files)
-                    clean_result = self._run_command(
-                        workspace, test_command, constraints.generation_timeout_sec
-                    )
-                    if clean_result.returncode == 0:
+                        if not contract_error:
+                            contract_error = self._mutation_symbols_rejection(
+                                Path(workspace), contract_payload["chain_plan"]
+                            )
+                        if contract_error:
+                            (output_root / f"contract_rejection_attempt_{attempt + 1}.txt").write_text(
+                                contract_error + "\n", encoding="utf-8"
+                            )
+                            continue
                         break
-                    self._save_diagnostic(
-                        output_root,
-                        f"clean_contract_failure_attempt_{attempt + 1}.txt",
-                        clean_result,
-                    )
-                    failure_tail = (clean_result.stdout + "\n" + clean_result.stderr)[-5000:]
-                    contract_error = (
-                        "generated tests failed on the unmodified repository; correct "
-                        f"their API assumptions and collection errors:\n{failure_tail}"
-                    )
-                    self._discard_tests(Path(workspace), tests)
-                if contract_error:
-                    # P1-3: emit stage at source (clean vs contract generation).
-                    if "unmodified repository" in contract_error.lower():
-                        self._reject(
-                            "clean_contract_failure",
-                            f"clean_contract:{contract_error}",
-                        )
-                    else:
+                    if contract_error:
                         self._reject(
                             "contract_generation_failure",
                             f"invalid_chain_plan:{contract_error}",
                         )
-                    return []
+                        return []
+                    # Snapshot existing tests for mutation-guard + prompt context.
+                    tests = [
+                        {
+                            "path": path,
+                            "content": (Path(workspace) / path).read_text(
+                                encoding="utf-8", errors="replace"
+                            ),
+                        }
+                        for path in test_files
+                        if (Path(workspace) / path).is_file()
+                    ]
+                    contract_patch = ""
+                    contract_payload["existing_contract_tests"] = test_files
+                    contract_payload["contract_source"] = "existing_tests"
+                else:
+                    # Optional enhancement: LLM-generated contracts (clean_contract gate).
+                    contract_prompt = CONTRACT_PROMPT.format(
+                        trajectory_evidence=trajectory_evidence,
+                        blueprint=json.dumps(blueprint, indent=2, ensure_ascii=False),
+                        allowed_production_paths=json.dumps(
+                            production_context,
+                            indent=2,
+                        ),
+                        allowed_symbols=json.dumps(
+                            self._symbol_catalog(Path(source_repo), context_files),
+                            indent=2,
+                        ),
+                        context_count=len(context_files),
+                        source_bundle=source_bundle,
+                        existing_test_grounding=existing_test_grounding,
+                        min_sites=min_sites,
+                        max_sites=max_sites,
+                        min_files=min_files,
+                        max_files=max_files,
+                    )
+                    for attempt in range(3):
+                        retry_prompt = contract_prompt
+                        if contract_error:
+                            retry_prompt += (
+                                "\n\n# Previous response rejected\n"
+                                f"Reason: {contract_error}\n"
+                                "Regenerate the complete JSON from scratch. Fix the stated "
+                                "problem while preserving the abstract capability target. "
+                                "If this was a clean-contract / unmodified-repository "
+                                "failure, re-ground constructors, imports, fixtures, and "
+                                "call patterns on the Existing Test Grounding section "
+                                "instead of inventing APIs."
+                            )
+                        contract_response = self._call_contract_agent(
+                            plan=plan,
+                            workspace=workspace,
+                            prompt=retry_prompt,
+                        )
+                        response_text = (
+                            json.dumps(contract_response, indent=2, ensure_ascii=False)
+                            if isinstance(contract_response, dict)
+                            else str(contract_response or "")
+                        )
+                        contract_payload = self._parse_contract_payload(contract_response)
+                        stored_contract = json.dumps(
+                            contract_payload
+                            if contract_payload
+                            else {"invalid_response": response_text},
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                        (output_root / f"contract_response_attempt_{attempt + 1}.json").write_text(
+                            stored_contract, encoding="utf-8"
+                        )
+                        (output_root / "contract_response.json").write_text(
+                            stored_contract, encoding="utf-8"
+                        )
+                        contract_error = self._chain_plan_rejection(
+                            contract_payload,
+                            context_files=context_files,
+                            min_files=min_files,
+                            max_files=max_files,
+                            min_sites=min_sites,
+                            max_sites=max_sites,
+                            forbidden_terms=list(blueprint.get("forbidden_terms") or []),
+                            require_generated_tests=True,
+                        )
+                        if not contract_error:
+                            contract_error = self._mutation_symbols_rejection(
+                                Path(workspace), contract_payload["chain_plan"]
+                            )
+                        if contract_error:
+                            (output_root / f"contract_rejection_attempt_{attempt + 1}.txt").write_text(
+                                contract_error + "\n", encoding="utf-8"
+                            )
+                            continue
+                        tests = self._materialize_contract_tests(plan, contract_payload)
+                        if not tests:
+                            contract_error = (
+                                "contract_cases must contain at least one target case and "
+                                "one compatibility_control case with complete observable "
+                                "expectations"
+                            )
+                            (output_root / f"contract_rejection_attempt_{attempt + 1}.txt").write_text(
+                                contract_error + "\n", encoding="utf-8"
+                            )
+                            continue
+                        if not self._write_tests(Path(workspace), tests):
+                            contract_error = (
+                                "generated tests must use one new .py path under test/units"
+                            )
+                            (output_root / f"contract_rejection_attempt_{attempt + 1}.txt").write_text(
+                                contract_error + "\n", encoding="utf-8"
+                            )
+                            self._discard_tests(Path(workspace), tests)
+                            continue
+                        contract_patch = self._test_patch(repository_diff(workspace, "HEAD"))
+                        if not contract_patch or not self._contract_quality_valid(contract_patch):
+                            contract_error = (
+                                "generated test patch lacks behavioral assertions or uses "
+                                "forbidden source inspection"
+                            )
+                            (output_root / f"contract_rejection_attempt_{attempt + 1}.txt").write_text(
+                                contract_error + "\n", encoding="utf-8"
+                            )
+                            self._discard_tests(Path(workspace), tests)
+                            continue
+                        test_files = self._changed_test_files(contract_patch)
+                        test_command = self._contract_test_command(plan, repo_spec, test_files)
+                        clean_result = self._run_command(
+                            workspace, test_command, constraints.generation_timeout_sec
+                        )
+                        if clean_result.returncode == 0:
+                            break
+                        self._save_diagnostic(
+                            output_root,
+                            f"clean_contract_failure_attempt_{attempt + 1}.txt",
+                            clean_result,
+                        )
+                        failure_tail = (clean_result.stdout + "\n" + clean_result.stderr)[-5000:]
+                        contract_error = (
+                            "generated tests failed on the unmodified repository; correct "
+                            f"their API assumptions and collection errors:\n{failure_tail}"
+                        )
+                        self._discard_tests(Path(workspace), tests)
+                    if contract_error:
+                        if "unmodified repository" in contract_error.lower():
+                            self._reject(
+                                "clean_contract_failure",
+                                f"clean_contract:{contract_error}",
+                            )
+                        else:
+                            self._reject(
+                                "contract_generation_failure",
+                                f"invalid_chain_plan:{contract_error}",
+                            )
+                        return []
+
                 assert clean_result is not None
                 contract_contents = {
                     path: (Path(workspace) / path).read_text(
@@ -513,11 +764,22 @@ class RepoChainGenerator:
                 observed_test_files = self._changed_test_files(
                     self._test_patch(full_patch)
                 )
-                if changed_contract_contents or set(observed_test_files) != set(test_files):
+                if require_generated:
+                    if changed_contract_contents or set(observed_test_files) != set(
+                        test_files
+                    ):
+                        self._reject_detail(
+                            "mutation_modified_contract_tests:"
+                            f"changed={changed_contract_contents}:"
+                            f"observed={observed_test_files}:expected={test_files}"
+                        )
+                        return []
+                elif changed_contract_contents or observed_test_files:
+                    # Existing-test path: mutation must not touch any tests.
                     self._reject_detail(
-                        "mutation_modified_contract_tests:"
+                        "mutation_modified_existing_contract_tests:"
                         f"changed={changed_contract_contents}:"
-                        f"observed={observed_test_files}:expected={test_files}"
+                        f"observed={observed_test_files}"
                     )
                     return []
                 bug_patch = self._source_patch(full_patch)
@@ -538,7 +800,11 @@ class RepoChainGenerator:
                     workspace, test_command, constraints.generation_timeout_sec
                 )
                 if bugged_result.returncode == 0:
-                    self._reject_detail("generated_contract_did_not_fail")
+                    self._reject_detail(
+                        "existing_contract_did_not_fail"
+                        if not require_generated
+                        else "generated_contract_did_not_fail"
+                    )
                     return []
                 provisional_taxonomy = self._contract_test_taxonomy(
                     contract_payload, test_files
@@ -654,6 +920,7 @@ class RepoChainGenerator:
                 "generated_test_patch": contract_patch,
                 "generated_test_files": test_files,
                 "generated_test_command": test_command,
+                "contract_source": contract_source,
                 "contract_test": test_files[0] if test_files else "",
                 "causal_ablation": causal,
                 "semantic_coupling": {
@@ -663,9 +930,17 @@ class RepoChainGenerator:
                     # duplicate, and safety checks from the specification.
                     "valid": bool(causal.get("repair_only_one_file_all_fail")),
                     "tier": (
-                        "generated_cross_layer_contract"
+                        (
+                            "existing_test_cross_layer_contract"
+                            if not require_generated
+                            else "generated_cross_layer_contract"
+                        )
                         if causal.get("repair_only_one_file_all_fail")
-                        else "generated_contract_with_partial_coupling"
+                        else (
+                            "existing_test_contract_with_partial_coupling"
+                            if not require_generated
+                            else "generated_contract_with_partial_coupling"
+                        )
                     ),
                     "root_invariant": chain_plan.get("root_invariant", ""),
                     "entrypoint": chain_plan.get("entrypoint", ""),
@@ -816,6 +1091,7 @@ class RepoChainGenerator:
         min_sites: int,
         max_sites: int,
         forbidden_terms: Sequence[str] = (),
+        require_generated_tests: bool = True,
     ) -> bool:
         return not self._chain_plan_rejection(
             payload,
@@ -825,6 +1101,7 @@ class RepoChainGenerator:
             min_sites=min_sites,
             max_sites=max_sites,
             forbidden_terms=forbidden_terms,
+            require_generated_tests=require_generated_tests,
         )
 
     def _chain_plan_rejection(
@@ -837,10 +1114,15 @@ class RepoChainGenerator:
         min_sites: int,
         max_sites: int,
         forbidden_terms: Sequence[str] = (),
+        require_generated_tests: bool = True,
     ) -> str:
         chain = payload.get("chain_plan")
         tests = payload.get("tests")
-        if not isinstance(chain, dict) or not isinstance(tests, list) or not tests:
+        if not isinstance(chain, dict):
+            return "missing chain_plan or tests"
+        if require_generated_tests and (
+            not isinstance(tests, list) or not tests
+        ):
             return "missing chain_plan or tests"
         payload_text = json.dumps(payload, ensure_ascii=False).lower()
         leaked_terms = [
@@ -869,6 +1151,8 @@ class RepoChainGenerator:
         invalid_files = sorted(files - allowed_files)
         if invalid_files:
             return f"mutation files outside whitelist: {invalid_files}"
+        if not require_generated_tests:
+            return ""
         tests_valid = len(tests) == 1 and all(
             isinstance(row, dict)
             and is_safe_repo_path(str(row.get("path") or ""))
@@ -1268,6 +1552,37 @@ class RepoChainGenerator:
             chunks.append(f"\n## FILE: {relative}\n```python\n{source}\n```")
         return "\n".join(chunks)
 
+    def _existing_test_grounding(
+        self,
+        root: Path,
+        production_files: Sequence[str],
+        *,
+        budget: int = 4,
+    ) -> tuple[str, List[str]]:
+        """Hybrid: nearby existing tests ground APIs; contracts stay generated."""
+        from .test_grounding import build_existing_test_grounding
+
+        test_roots: List[str] | None = None
+        try:
+            from proposer.repo_profiles import get_profile
+
+            profile = get_profile(str(getattr(self, "_current_repo_id", "") or ""))
+            roots = list(getattr(profile, "test_roots", None) or [])
+            # Always include unit-test mirrors for grounding even when the
+            # profile's install/test command uses a different root.
+            for extra in ("test/units", "tests/units", "test", "tests"):
+                if extra not in roots:
+                    roots.append(extra)
+            test_roots = roots
+        except Exception:
+            test_roots = None
+        return build_existing_test_grounding(
+            root,
+            production_files,
+            budget=budget,
+            test_roots=test_roots,
+        )
+
     def _symbol_catalog(
         self, root: Path, files: Sequence[str]
     ) -> Dict[str, List[str]]:
@@ -1580,6 +1895,12 @@ class RepoChainGenerator:
     def _contract_test_taxonomy(
         self, payload: Dict[str, Any], test_files: Sequence[str]
     ) -> Dict[str, List[str]]:
+        if str(payload.get("contract_source") or "") == "existing_tests":
+            nodeids = self._nodeids_from_test_rows(
+                payload.get("tests") or [],
+                fallback_files=test_files,
+            )
+            return {"FAIL_TO_PASS": nodeids, "PASS_TO_PASS": []}
         cases = payload.get("contract_cases") or []
         if cases and test_files:
             base = f"{test_files[0]}::test_generated_repo_contract"
@@ -1613,6 +1934,139 @@ class RepoChainGenerator:
                 and node.name.startswith("test_")
             )
         return {"FAIL_TO_PASS": nodeids, "PASS_TO_PASS": []}
+
+    def _nodeids_from_test_rows(
+        self,
+        tests: Sequence[Any],
+        *,
+        fallback_files: Sequence[str] = (),
+    ) -> List[str]:
+        nodeids: List[str] = []
+        for row in tests:
+            if not isinstance(row, dict):
+                continue
+            path = str(row.get("path") or "")
+            content = str(row.get("content") or "")
+            if not path or not content:
+                continue
+            try:
+                tree = ast.parse(content)
+            except SyntaxError:
+                nodeids.append(path)
+                continue
+            found = False
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith(
+                    "test_"
+                ):
+                    nodeids.append(f"{path}::{node.name}")
+                    found = True
+                elif isinstance(node, ast.ClassDef):
+                    for child in node.body:
+                        if isinstance(
+                            child, (ast.FunctionDef, ast.AsyncFunctionDef)
+                        ) and child.name.startswith("test_"):
+                            nodeids.append(f"{path}::{node.name}::{child.name}")
+                            found = True
+            if not found:
+                nodeids.append(path)
+        if nodeids:
+            return nodeids
+        return [str(path) for path in fallback_files if str(path).strip()]
+
+    def _format_existing_contract_tests(
+        self, root: Path, test_files: Sequence[str]
+    ) -> str:
+        from .test_grounding import excerpt_existing_test
+
+        chunks: List[str] = []
+        for relative in test_files:
+            path = root / relative
+            if not path.is_file():
+                continue
+            try:
+                source = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            excerpt = excerpt_existing_test(source)
+            chunks.append(
+                f"## EXISTING CONTRACT TEST: {relative}\n```python\n{excerpt}\n```"
+            )
+        if not chunks:
+            return "(no existing contract tests available)"
+        return "\n\n".join(chunks)
+
+    def _select_passing_existing_tests(
+        self,
+        *,
+        plan: BugGenerationPlan,
+        repo_spec: RepoSpec,
+        workspace: str,
+        production_files: Sequence[str],
+        timeout_sec: int,
+        budget: int = 4,
+    ) -> tuple[List[str], str, subprocess.CompletedProcess[str] | None]:
+        """Retrieve nearby existing tests and keep those that pass on clean repo."""
+        from .test_grounding import retrieve_nearby_existing_tests
+
+        test_roots: List[str] | None = None
+        try:
+            from proposer.repo_profiles import get_profile
+
+            profile = get_profile(str(getattr(self, "_current_repo_id", "") or ""))
+            roots = list(getattr(profile, "test_roots", None) or [])
+            for extra in ("test/units", "tests/units", "test", "tests"):
+                if extra not in roots:
+                    roots.append(extra)
+            test_roots = roots
+        except Exception:
+            test_roots = None
+
+        candidates = retrieve_nearby_existing_tests(
+            Path(workspace),
+            production_files,
+            budget=max(budget * 3, 6),
+            test_roots=test_roots,
+        )
+        if not candidates:
+            return [], "no_nearby_existing_tests", None
+
+        passing: List[str] = []
+        last_result: subprocess.CompletedProcess[str] | None = None
+        # Prefer a small contract set: 1–2 files for F2P; keep probing until budget.
+        for relative in candidates:
+            if not (Path(workspace) / relative).is_file():
+                continue
+            command = self._contract_test_command(plan, repo_spec, [relative])
+            # Cap per-file probe so bootstrap does not burn the whole proposer budget.
+            probe_timeout = min(int(timeout_sec or 120), 180)
+            result = self._run_command(workspace, command, probe_timeout)
+            last_result = result
+            if result.returncode != 0:
+                continue
+            passing.append(relative)
+            if len(passing) >= max(1, budget):
+                break
+
+        if not passing:
+            return [], "nearby_existing_tests_failed_clean", last_result
+
+        # Use up to 2 files as the mutation oracle (keeps runtime bounded).
+        selected = passing[:2]
+        combined = self._contract_test_command(plan, repo_spec, selected)
+        combined_result = self._run_command(
+            workspace, combined, min(int(timeout_sec or 120), 300)
+        )
+        if combined_result.returncode != 0:
+            # Fall back to the single strongest (first) passer.
+            selected = passing[:1]
+            combined = self._contract_test_command(plan, repo_spec, selected)
+            combined_result = self._run_command(
+                workspace, combined, min(int(timeout_sec or 120), 300)
+            )
+            if combined_result.returncode != 0:
+                return [], "selected_existing_tests_failed_combined", combined_result
+        return selected, "", combined_result
 
     def _reverse_worktree_diff(
         self, workspace: str, changed_files: Sequence[str]

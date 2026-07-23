@@ -171,7 +171,7 @@ class RepoChainWorkflowConfig:
     min_mutation_sites: int = 3
     max_mutation_sites: int = 8
     context_file_budget: int = 10
-    require_generated_contracts: bool = True
+    require_generated_contracts: bool = False
     require_causal_ablation: bool = True
     # Fixed v1 Stage-5 operator (not a weight table).
     mutation_operator: str = "trajectory_conditioned_chain_mutation"

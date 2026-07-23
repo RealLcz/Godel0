@@ -117,6 +117,11 @@ class RepoChainWorkflow:
             if config is None and not hasattr(cfg, "require_causal_ablation")
             else _cfg_get("require_causal_ablation", require_causal_ablation)
         )
+        # Existing passing tests are the default oracle; generated contracts
+        # remain an optional enhancement when this flag is True.
+        self.require_generated_contracts = bool(
+            _cfg_get("require_generated_contracts", False)
+        )
 
         self.weakness_stage = WeaknessAnalysisStage(trajectory_analyzer)
         self.transfer_stage = RepositoryTransferStage(code_locator)
@@ -154,7 +159,7 @@ class RepoChainWorkflow:
             "min_mutation_sites": self.min_mutation_sites,
             "max_mutation_sites": self.max_mutation_sites,
             "context_file_budget": self.context_file_budget,
-            "require_generated_tests": True,
+            "require_generated_tests": bool(self.require_generated_contracts),
         }
         constraints = getattr(plan, "constraints", None)
         if constraints is not None and hasattr(constraints, "model_copy"):
