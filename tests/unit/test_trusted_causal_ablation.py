@@ -41,6 +41,7 @@ class TestTrustedCausalAblationIsolation:
         validator = CandidateValidator(
             workspace_root=tmp_path,
             require_causal_ablation=True,
+            causal_ablation_hard_gate=True,
             min_independently_active=2,
         )
         report = CandidateValidationReport(candidate_id="c1", passed=True)
@@ -120,6 +121,7 @@ class TestTrustedCausalAblationIsolation:
         validator = CandidateValidator(
             workspace_root=tmp_path,
             require_causal_ablation=True,
+            causal_ablation_hard_gate=True,
             min_independently_active=2,
         )
         report = CandidateValidationReport(candidate_id="c1", passed=True)
@@ -184,6 +186,7 @@ class TestTrustedCausalAblationIsolation:
         validator = CandidateValidator(
             workspace_root=tmp_path,
             require_causal_ablation=True,
+            causal_ablation_hard_gate=True,
             min_independently_active=2,
         )
         report = CandidateValidationReport(candidate_id="c1", passed=True)

@@ -2022,10 +2022,12 @@ class RepoChainGenerator:
         except Exception:
             test_roots = None
 
+        # Cap probed files at 8 so one plan's discovery phase stays well
+        # inside the proposer batch timeout even when pytest startup is slow.
         candidates = retrieve_nearby_existing_tests(
             Path(workspace),
             production_files,
-            budget=max(budget * 3, 6),
+            budget=min(max(budget * 2, 4), 8),
             test_roots=test_roots,
         )
         if not candidates:
@@ -2033,19 +2035,20 @@ class RepoChainGenerator:
 
         passing: List[str] = []
         last_result: subprocess.CompletedProcess[str] | None = None
-        # Prefer a small contract set: 1–2 files for F2P; keep probing until budget.
+        # Prefer a small contract set: 1–2 files for F2P; stop at 2 passers —
+        # only the first two are ever used as the mutation oracle below.
         for relative in candidates:
             if not (Path(workspace) / relative).is_file():
                 continue
             command = self._contract_test_command(plan, repo_spec, [relative])
             # Cap per-file probe so bootstrap does not burn the whole proposer budget.
-            probe_timeout = min(int(timeout_sec or 120), 180)
+            probe_timeout = min(int(timeout_sec or 120), 120)
             result = self._run_command(workspace, command, probe_timeout)
             last_result = result
             if result.returncode != 0:
                 continue
             passing.append(relative)
-            if len(passing) >= max(1, budget):
+            if len(passing) >= 2:
                 break
 
         if not passing:

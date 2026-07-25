@@ -133,6 +133,17 @@ class TaskBatchBuilder:
         self.allow_workflow_fallback = bool(allow_workflow_fallback)
         self.allow_human_curated_data = bool(allow_human_curated_data)
 
+    def _plans_per_call(self) -> int:
+        """Chunk size for one proposer subprocess call, 0 when uncapped."""
+        for key in ("plans_per_call", "bootstrap_plans_per_call"):
+            try:
+                value = int(self.workflow_config.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+        return 0
+
     def build_for_node(
         self,
         node_id: str,
@@ -306,6 +317,7 @@ class TaskBatchBuilder:
         )
 
         attempt = 0
+        plans_per_call = self._plans_per_call()
         while (
             len(result.tasks) < self.batch_size
             and result.candidates_generated < self.max_candidates
@@ -328,6 +340,12 @@ class TaskBatchBuilder:
             attempt_target = min(remaining_tasks, remaining_candidates)
             if quota_budget > 0:
                 attempt_target = min(attempt_target, quota_budget)
+            # Chunk every path, not just bootstrap: one call asking for the
+            # whole batch cannot finish inside the proposer subprocess
+            # timeout, and the SIGTERM throws away everything it produced.
+            if plans_per_call > 0:
+                attempt_target = max(1, min(attempt_target, plans_per_call))
+                remaining_quotas = self._chunk_quotas(remaining_quotas, attempt_target)
             attempt_request = replace(
                 request,
                 output_dir=str(attempt_dir),
@@ -336,7 +354,17 @@ class TaskBatchBuilder:
                 generation_attempt=attempt,
                 generation_quotas=dict(remaining_quotas),
             )
-            proposer_result = proposer_runner.generate_batch(attempt_request)
+            try:
+                proposer_result = proposer_runner.generate_batch(attempt_request)
+            except Exception as exc:
+                # One timed-out / crashed proposer chunk must not abort the
+                # whole batch (Job 211728: a single SIGTERM'd chunk killed
+                # root bootstrap after 6 candidates had already been
+                # validated). Consume this attempt's budget and continue.
+                result.proposer_error = f"{type(exc).__name__}: {exc}"
+                result.candidates_generated += max(1, attempt_target)
+                attempt += 1
+                continue
             proposer_error = str(getattr(proposer_result, "error", "") or "")
             if proposer_error:
                 result.proposer_error = proposer_error
@@ -784,6 +812,28 @@ class TaskBatchBuilder:
         if current_child_level1_trajectories:
             return "current_child_level1", str(current_child_level1_trajectories[0])
         return "bootstrap", ""
+
+    @staticmethod
+    def _chunk_quotas(quotas: dict, limit: int) -> dict:
+        """Scale per-source plan budgets down to one chunk's worth of plans.
+
+        The quotas describe the whole batch. Passing them through unchanged
+        makes the proposer build a full batch of plans in a single call even
+        when the caller only asked for one.
+        """
+        parent = max(0, int(quotas.get("parent_failure", 0) or 0))
+        child = max(0, int(quotas.get("current_child_level1", 0) or 0))
+        total = parent + child
+        if limit <= 0 or total <= limit:
+            return {"parent_failure": parent, "current_child_level1": child}
+        take_parent = min(parent, max(0, round(limit * parent / total)))
+        take_child = min(child, limit - take_parent)
+        shortfall = limit - take_parent - take_child
+        if shortfall > 0:
+            added = min(shortfall, parent - take_parent)
+            take_parent += added
+            take_child += min(shortfall - added, child - take_child)
+        return {"parent_failure": take_parent, "current_child_level1": take_child}
 
     @staticmethod
     def _remaining_generation_quotas(

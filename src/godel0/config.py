@@ -20,6 +20,8 @@ class RunConfig:
     max_nodes: int = 200
     max_expansions: int = 200
     resume_from: Optional[str] = None
+    # When True, stop after Root Bootstrap + Root Level2 (no evolution loop).
+    bootstrap_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,9 @@ class AgentConfig:
     max_tool_errors: int = 5
     trajectory_format: str = "jsonl"
     self_evolve_timeout_sec: int = 3600
+    # Retries for a self-edit that ends with no diff or a broken source file,
+    # so one context-exhausted attempt does not waste a whole expansion.
+    self_evolve_max_attempts: int = 3
 
 
 @dataclass(frozen=True)
@@ -152,6 +157,10 @@ class EvaluationConfig:
     level1_timeout_sec: int = 3600
     level2_timeout_sec: int = 3600
     max_workers: int = 8
+    # Phase-1: record leave-one-out / isolation diagnostics without admitting
+    # or rejecting candidates on causal ablation alone.
+    record_causal_diagnostics: bool = True
+    causal_ablation_hard_gate: bool = False
 
 
 @dataclass(frozen=True)
@@ -172,7 +181,16 @@ class RepoChainWorkflowConfig:
     max_mutation_sites: int = 8
     context_file_budget: int = 10
     require_generated_contracts: bool = False
+    # Local causal analysis still runs when True; admission uses
+    # ``local_causal_ablation_mode`` (diagnostic vs hard_gate).
     require_causal_ablation: bool = True
+    local_causal_ablation_mode: str = "diagnostic"
+    bootstrap_plans_per_call: int = 2
+    # Plans per proposer subprocess call on every generation path, not only
+    # bootstrap. A whole batch in one call cannot finish inside
+    # ``batch_timeout_sec`` and the SIGTERM discards the chunk's work.
+    # 0 falls back to ``bootstrap_plans_per_call``.
+    plans_per_call: int = 0
     # Fixed v1 Stage-5 operator (not a weight table).
     mutation_operator: str = "trajectory_conditioned_chain_mutation"
 
@@ -181,7 +199,9 @@ class RepoChainWorkflowConfig:
 class ProposerConfig:
     initial_workflow: str = "repo_chain"
     repo_chain: RepoChainWorkflowConfig = field(default_factory=RepoChainWorkflowConfig)
-    candidate_timeout_sec: int = 120
+    candidate_timeout_sec: int = 180
+    # Per NodeProposerRunner subprocess timeout (one bootstrap/generation chunk).
+    batch_timeout_sec: int = 900
     max_patch_lines: int = 80
     forbid_test_file_edits: bool = True
     require_f2p: bool = True

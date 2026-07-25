@@ -193,12 +193,19 @@ class ProposerRunner:
 
             if not signatures:
                 if getattr(request, "bootstrap", False):
-                    candidates = self._bootstrap_candidates(request)
-                    self._write_candidates(request, candidates, [])
+                    candidates, plans = self._bootstrap_candidates(request)
+                    self._write_candidates(request, candidates, plans)
+                    # Bootstrap emissions are pending until trusted validation.
+                    # Do NOT mark accepted=True here (avoids double validation).
                     for cand in candidates:
-                        result.add_candidate(cand, accepted=True)
                         result.add_pending_candidate(cand)
-                    result.completed = len(candidates) > 0
+                    result.plans = [
+                        p.model_dump() if hasattr(p, "model_dump") else dict(p)
+                        for p in plans
+                    ]
+                    # Chunk completed even on zero yield so TaskBatchBuilder
+                    # advances generation_attempt via len(result.plans).
+                    result.completed = True
                     result.workflow_fallback = bool(self._workflow_fallback_used)
                     return result
                 result.completed = True
@@ -331,7 +338,11 @@ class ProposerRunner:
                 100,
             )
         )
-        return plans
+        # The quotas describe the whole batch; one call must still stay within
+        # the chunk the caller asked for, or the subprocess times out before
+        # any candidate is written.
+        chunk_limit = max(1, int(getattr(request, "target_batch_size", 0) or 1))
+        return plans[:chunk_limit]
 
     def _stamp_plan_source_provenance(
         self,
@@ -557,7 +568,9 @@ class ProposerRunner:
                 outcomes.append(EvaluationOutcomeView(trajectory_id=traj.trajectory_id))
         return outcomes
 
-    def _bootstrap_candidates(self, request: ProposerRequest) -> List[CandidateArtifact]:
+    def _bootstrap_candidates(
+        self, request: ProposerRequest
+    ) -> tuple:
         """Generate bootstrap candidates from a capability prior.
 
         Used when ``request.bootstrap`` is True and there are no solver
@@ -567,6 +580,9 @@ class ProposerRunner:
         ``build_bootstrap_plans([], repo_spec)`` (empty prior -> 0 plans) and
         then ran each plan through ``engine.generate`` (lm_modify backend),
         bypassing RepoChain entirely.
+
+        Returns ``(candidates, plans_attempted)`` so zero-yield chunks still
+        consume ``generation_attempt`` budget via ``result.plans``.
         """
         try:
             from proposer.workflows.repo_chain.bootstrap import (
@@ -578,9 +594,9 @@ class ProposerRunner:
                     "RepoChain bootstrap unavailable in production mode"
                 ) from exc
             self._workflow_fallback_used = True
-            return []
+            return [], []
         if not request.repo_specs:
-            return []
+            return [], []
         spec = request.repo_specs[0]
         repo_spec = RepoSpec(
             repo_id=spec.repo_id,
@@ -597,19 +613,101 @@ class ProposerRunner:
                     "RepoChainWorkflow required for bootstrap but unavailable"
                 )
             self._workflow_fallback_used = True
-            return []
+            return [], []
         cand_dir = os.path.join(request.output_dir, "proposer_candidates", "bootstrap")
         os.makedirs(cand_dir, exist_ok=True)
-        candidates = workflow.bootstrap(
+
+        cfg = getattr(request, "workflow_config", None) or self.workflow_config or {}
+        if not isinstance(cfg, dict):
+            cfg = {
+                key: getattr(cfg, key)
+                for key in (
+                    "plans_per_call",
+                    "bootstrap_plans_per_call",
+                    "local_causal_ablation_mode",
+                    "require_generated_contracts",
+                    "require_causal_ablation",
+                )
+                if hasattr(cfg, key)
+            }
+        plans_per_call = max(
+            1,
+            int(cfg.get("plans_per_call") or cfg.get("bootstrap_plans_per_call", 2) or 2),
+        )
+        plan_offset = int(getattr(request, "generation_attempt", 0) or 0) * plans_per_call
+        target = min(int(request.target_batch_size or 1), plans_per_call)
+
+        boot_result = workflow.bootstrap(
             repo_spec=repo_spec,
             output_dir=cand_dir,
             capability_prior=BOOTSTRAP_CAPABILITY_PRIOR,
-            target_count=int(request.target_batch_size or 10),
-            max_candidates=int(request.max_candidates or 50),
+            target_count=target,
+            max_candidates=plans_per_call,
+            plan_offset=plan_offset,
+            plan_limit=plans_per_call,
         )
+        if isinstance(boot_result, tuple):
+            candidates, plans = boot_result
+        else:
+            # Backward compatibility with older workflow.bootstrap signatures.
+            candidates, plans = list(boot_result or []), []
         # Stamp each candidate with the request model / plan id metadata so the
         # downstream commit step has the provenance it expects.
+        plan_by_id = {getattr(p, "plan_id", ""): p for p in plans}
+        normalized: List[CandidateArtifact] = []
         for index, cand in enumerate(candidates):
+            plan = plan_by_id.get(getattr(cand, "plan_id", ""), None)
+            if plan is None and plans:
+                plan = plans[min(index, len(plans) - 1)]
+            if plan is None:
+                # Minimal plan stub for normalization when chunk emitted orphans.
+                from proposer.schemas import BugGenerationPlan, FailureSignature
+
+                plan = BugGenerationPlan(
+                    plan_id=getattr(cand, "plan_id", None) or f"bootstrap-{index}",
+                    failure_signature=FailureSignature(signature_id="bootstrap"),
+                    strategy="repo_chain",
+                    target_repo_id=repo_spec.repo_id,
+                    target_base_commit=repo_spec.base_commit,
+                )
+            try:
+                cand = self._coerce_candidate(cand, plan, repo_spec)
+            except Exception:
+                # Fall back to best-effort field mapping for swesmith artifacts.
+                bug_patch = (
+                    getattr(cand, "bug_patch", None)
+                    or getattr(cand, "patch", None)
+                    or ""
+                )
+                meta = dict(getattr(cand, "generation_metadata", None) or {})
+                cand = CandidateArtifact(
+                    candidate_id=str(
+                        getattr(cand, "candidate_id", None) or new_candidate_id()
+                    ),
+                    plan_id=str(getattr(cand, "plan_id", None) or plan.plan_id),
+                    repo_id=repo_spec.repo_id,
+                    base_commit=repo_spec.base_commit,
+                    file_path=str(
+                        getattr(cand, "target_file", None)
+                        or getattr(cand, "file_path", None)
+                        or ""
+                    ),
+                    symbol_name=str(
+                        getattr(cand, "target_symbol", None)
+                        or getattr(cand, "symbol_name", None)
+                        or ""
+                    ),
+                    strategy=str(getattr(cand, "strategy", None) or "repo_chain"),
+                    operator=str(getattr(cand, "operator", None) or ""),
+                    patch=str(bug_patch),
+                    issue_draft=str(meta.get("problem_statement") or ""),
+                    modified_files=list(getattr(cand, "modified_files", None) or []),
+                    modified_entities=list(
+                        getattr(cand, "modified_entities", None) or []
+                    ),
+                    generation_metadata=meta,
+                    status="pending_validation",
+                )
             if hasattr(cand, "plan_id") and not cand.plan_id:
                 cand.plan_id = f"bootstrap-{index}"
             if hasattr(cand, "generation_metadata") and isinstance(
@@ -623,7 +721,8 @@ class ProposerRunner:
                 cand.generation_metadata.setdefault(
                     "source_failure_stage", "bootstrap"
                 )
-        return candidates
+            normalized.append(cand)
+        return normalized, list(plans or [])
 
     def _build_repo_index(self, request: ProposerRequest) -> RepoIndex:
         """Build a RepoIndex from the repo_specs carried in the request.
@@ -885,9 +984,10 @@ class ProposerRunner:
                 import json
 
                 json.dump(cand.to_dict(), f, indent=2, ensure_ascii=False)
-            if cand.patch:
+            bug_patch = getattr(cand, "bug_patch", None) or getattr(cand, "patch", None) or ""
+            if bug_patch:
                 with open(os.path.join(cand_dir, "bug.patch"), "w", encoding="utf-8") as f:
-                    f.write(cand.patch)
+                    f.write(bug_patch)
             plan = plan_by_id.get(cand.plan_id)
             if cand.issue_draft:
                 statement = cand.issue_draft.rstrip() + "\n"

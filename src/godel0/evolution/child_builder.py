@@ -16,30 +16,16 @@ from ..schemas.mutation import MutationManifest
 from ..schemas.node import NodeRecord, NodeStatus
 from ..git.repository import get_head_sha, diff_vs_commit
 from ..git.worktree import NodeWorktree, commit_child
-from .patch_guard import PatchGuard
+from .patch_guard import PatchGuard, validate_changed_python_syntax
 from .mutation_manifest import build_mutation_manifest
 from .self_edit import SelfEditRunner, SelfEditResult
 from ..storage.atomic import atomic_write_json, atomic_write_text
 
-
-def validate_changed_python_syntax(worktree: Path, patch: str) -> list[str]:
-    """Compile changed Python sources without importing or writing bytecode."""
-    from ..git.patch import extract_changed_files
-
-    errors: list[str] = []
-    for relative_path in extract_changed_files(patch):
-        if not relative_path.endswith(".py"):
-            continue
-        source_path = worktree / relative_path
-        if not source_path.is_file():
-            continue
-        try:
-            compile(source_path.read_bytes(), str(source_path), "exec")
-        except (SyntaxError, ValueError) as exc:
-            line = getattr(exc, "lineno", None)
-            location = f":{line}" if line else ""
-            errors.append(f"Invalid Python syntax in {relative_path}{location}: {exc.msg if isinstance(exc, SyntaxError) else exc}")
-    return errors
+__all__ = [
+    "ChildBuildResult",
+    "ChildBuilder",
+    "validate_changed_python_syntax",
+]
 
 
 @dataclass
@@ -101,11 +87,12 @@ class ChildBuilder:
 
         try:
             with NodeWorktree(self.agent_repo, self.scratch_root, child_id, parent_commit) as worktree:
-                self_edit_result = self.self_edit_runner.run(
+                self_edit_result = self._run_self_edit(
                     diagnosis=diagnosis,
                     worktree=worktree,
                     output_dir=output_dir,
                     model=model,
+                    base_commit=parent_commit,
                 )
 
                 if not self_edit_result.success and self_edit_result.error:
@@ -192,6 +179,31 @@ class ChildBuilder:
             return ChildBuildResult(
                 passed=False,
                 errors=[f"Child build error: {str(e)}"],
+            )
+
+    def _run_self_edit(
+        self,
+        diagnosis: CycleDiagnosis,
+        worktree: Path,
+        output_dir: Path,
+        model: str,
+        base_commit: str,
+    ) -> SelfEditResult:
+        """Invoke the self-edit runner, tolerating runners without base_commit."""
+        try:
+            return self.self_edit_runner.run(
+                diagnosis=diagnosis,
+                worktree=worktree,
+                output_dir=output_dir,
+                model=model,
+                base_commit=base_commit,
+            )
+        except TypeError:
+            return self.self_edit_runner.run(
+                diagnosis=diagnosis,
+                worktree=worktree,
+                output_dir=output_dir,
+                model=model,
             )
 
     def _run_child_gates(self, worktree: Path, gates_dir: Path) -> list[str]:

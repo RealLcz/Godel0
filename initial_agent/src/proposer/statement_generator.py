@@ -83,10 +83,11 @@ class StatementGenerator:
         test_source_code: str = "",
     ) -> IssueDraft:
         # Try LLM-based generation if adapter is available
-        if self.agent_adapter is not None and candidate.patch:
+        bug_patch = getattr(candidate, "bug_patch", None) or getattr(candidate, "patch", None) or ""
+        if self.agent_adapter is not None and bug_patch:
             try:
                 system_prompt, user_prompt = build_issue_prompt(
-                    patch=candidate.patch,
+                    patch=bug_patch,
                     test_output=test_output,
                     test_source_code=test_source_code,
                 )

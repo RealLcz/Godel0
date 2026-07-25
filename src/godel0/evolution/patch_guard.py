@@ -12,6 +12,27 @@ from ..constants import ALLOWED_PATCH_PREFIXES, FORBIDDEN_PATCH_PATTERNS
 from ..git.patch import extract_changed_files
 
 
+def validate_changed_python_syntax(worktree: Path, patch: str) -> list[str]:
+    """Compile changed Python sources without importing or writing bytecode."""
+    errors: list[str] = []
+    for relative_path in extract_changed_files(patch):
+        if not relative_path.endswith(".py"):
+            continue
+        source_path = Path(worktree) / relative_path
+        if not source_path.is_file():
+            continue
+        try:
+            compile(source_path.read_bytes(), str(source_path), "exec")
+        except (SyntaxError, ValueError) as exc:
+            line = getattr(exc, "lineno", None)
+            location = f":{line}" if line else ""
+            detail = exc.msg if isinstance(exc, SyntaxError) else exc
+            errors.append(
+                f"Invalid Python syntax in {relative_path}{location}: {detail}"
+            )
+    return errors
+
+
 @dataclass
 class PatchGuardReport:
     passed: bool

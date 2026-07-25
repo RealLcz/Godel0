@@ -443,24 +443,21 @@ class BackendAwareTestRunner:
         timeout_sec: int = 120,
         repo_id: str = "",
     ) -> dict:
-        import shlex
-
         from ..execution.apptainer import ApptainerRunner
+        from ..execution.command_env import split_env_assignments
 
         backend = self.backend_factory.repo_backend(str(repo_id or ""))
         try:
-            parts = (
-                shlex.split(test_command)
-                if isinstance(test_command, str)
-                else list(test_command)
-            )
+            # Same env-prefix handling as CandidateValidator._run_tests:
+            # argv execution must not treat ``PYTHONPATH=...`` as argv[0].
+            env_prefix, parts = split_env_assignments(test_command)
             binds = None
             if isinstance(backend, ApptainerRunner):
                 binds = {Path(repo_path): "/workspace"}
             result = backend.run(
                 command=parts,
                 cwd=Path(repo_path),
-                env={},
+                env=env_prefix,
                 timeout_sec=timeout_sec,
                 binds=binds,
             )

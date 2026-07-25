@@ -54,6 +54,8 @@ class CandidateValidator:
         backend_factory=None,
         require_causal_ablation: bool = False,
         min_independently_active: int = 2,
+        record_causal_diagnostics: bool = True,
+        causal_ablation_hard_gate: bool = False,
     ):
         self.workspace_root = Path(workspace_root)
         self.workspace_root.mkdir(parents=True, exist_ok=True)
@@ -70,10 +72,12 @@ class CandidateValidator:
         # repo_image_dir/<repo_id>.sif dynamically.
         self.backend_factory = backend_factory
         self._active_repo_id = ""
-        # P0-7: authoritative trusted causal ablation gate. Default False so
-        # unit tests / ablations that inject a bare validator keep working;
-        # EvolutionOrchestrator.from_config enables it from RepoChain config.
+        # Phase-1: causal ablation is recorded as diagnostics by default.
+        # ``causal_ablation_hard_gate`` restores the old admission behavior
+        # for later ablation experiments.
         self.require_causal_ablation = require_causal_ablation
+        self.record_causal_diagnostics = bool(record_causal_diagnostics)
+        self.causal_ablation_hard_gate = bool(causal_ablation_hard_gate)
         self.min_independently_active = max(1, int(min_independently_active))
 
     def validate(
@@ -196,9 +200,13 @@ class CandidateValidator:
                 and report.relevance_valid
             )
 
-            # P0-7: Trusted Causal Ablation (authoritative). Local RepoChain
-            # metadata is advisory only; this re-executes per-file repairs.
-            if report.passed and self.require_causal_ablation:
+            # Phase-1: causal ablation is soft diagnostics unless hard_gate.
+            run_causal = report.passed and (
+                self.causal_ablation_hard_gate
+                or self.record_causal_diagnostics
+                or self.require_causal_ablation
+            )
+            if run_causal:
                 ablation_ok = self._run_trusted_causal_ablation(
                     candidate_patch=candidate_patch,
                     repo_path=repo_path,
@@ -211,10 +219,14 @@ class CandidateValidator:
                     command_test_id=command_test_id,
                     control_test_command=control_test_command,
                 )
-                if not ablation_ok:
+                if self.causal_ablation_hard_gate and not ablation_ok:
                     report.passed = False
                     if "trusted_causal_ablation_failed" not in report.rejection_reasons:
-                        self._add_rejection(report, "trusted_causal_ablation_failed", stage="trusted_causal_failure")
+                        self._add_rejection(
+                            report,
+                            "trusted_causal_ablation_failed",
+                            stage="trusted_causal_failure",
+                        )
 
             if report.passed:
                 report.duplicate_valid = self.duplicate_detector.record(
@@ -289,7 +301,8 @@ class CandidateValidator:
             report.independently_active_file_count = 0
             report.repair_one_file_results = {f: False for f in source_files}
             report.isolated_file_triggers = {f: False for f in source_files}
-            self._add_rejection(report, "not_multi_file", stage="trusted_causal_failure")
+            if self.causal_ablation_hard_gate:
+                self._add_rejection(report, "not_multi_file", stage="trusted_causal_failure")
             return False
 
         per_file = split_patch_by_file(candidate_patch)
@@ -391,7 +404,7 @@ class CandidateValidator:
             and independently_active >= self.min_independently_active
         )
         report.trusted_causal_ablation_pass = bool(passed)
-        if not passed:
+        if not passed and self.causal_ablation_hard_gate:
             if any(repair_results.values()):
                 self._add_rejection(report, "single_file_repair_restored_contract", stage="trusted_causal_failure")
             if independently_active < self.min_independently_active:
@@ -769,14 +782,18 @@ class CandidateValidator:
         backend = self._resolve_repo_backend()
         if backend is not None:
             try:
-                import shlex as _shlex
+                from ..execution.command_env import split_env_assignments
 
-                parts = _shlex.split(test_command) if isinstance(test_command, str) else list(test_command)
+                # Shell-style env prefixes (PYTHONPATH=... pytest ...) must
+                # become backend env vars — argv execution has no shell to
+                # interpret them, and misreading them as the executable made
+                # every clean run fail as ``clean_tests_unusable``.
+                env_prefix, parts = split_env_assignments(test_command)
                 binds = {Path(repo_path): "/workspace"}
                 result = backend.run(
                     command=parts,
                     cwd=Path(repo_path),
-                    env={},
+                    env=env_prefix,
                     timeout_sec=self.test_timeout_sec,
                     binds=binds,
                 )

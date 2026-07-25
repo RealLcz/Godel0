@@ -122,6 +122,13 @@ class RepoChainWorkflow:
         self.require_generated_contracts = bool(
             _cfg_get("require_generated_contracts", False)
         )
+        # Local causal ablation: diagnostic (default) or hard_gate (ablation only).
+        self.local_causal_ablation_mode = str(
+            _cfg_get("local_causal_ablation_mode", "diagnostic")
+        ).strip().lower() or "diagnostic"
+        self.bootstrap_plans_per_call = max(
+            1, int(_cfg_get("bootstrap_plans_per_call", 2) or 2)
+        )
 
         self.weakness_stage = WeaknessAnalysisStage(trajectory_analyzer)
         self.transfer_stage = RepositoryTransferStage(code_locator)
@@ -208,6 +215,9 @@ class RepoChainWorkflow:
         already-formed ``BugGenerationPlan`` and delegates to the backing
         ``RepoChainGenerator`` for the chain discovery, contract generation,
         and mutation materialization (fixed operator, not backend weights).
+
+        Local causal ablation is diagnostic by default: candidates are still
+        returned so the trusted controller can judge admission.
         """
         self._apply_constraints_to_plan(plan)
         backing = self._load_backing_generator()
@@ -215,9 +225,27 @@ class RepoChainWorkflow:
             return []
         candidates = backing.generate(plan, node_code_dir, repo_spec, output_dir)
 
-        if self.require_causal_ablation:
-            ablation = self.ablation_stage.run(plan, repo_spec, candidates, contracts=None)
-            if not ablation.passed:
+        if self.require_causal_ablation and candidates:
+            ablation = self.ablation_stage.run(
+                plan, repo_spec, candidates, contracts=None
+            )
+            for candidate in candidates:
+                metadata = getattr(candidate, "generation_metadata", None)
+                if not isinstance(metadata, dict):
+                    continue
+                details = getattr(ablation, "details", None)
+                metadata["local_causal_ablation"] = {
+                    "passed": bool(ablation.passed),
+                    "details": details,
+                }
+                metadata["causal_analysis"] = {
+                    "passed_under_old_rule": bool(ablation.passed),
+                    "details": details,
+                }
+            if (
+                self.local_causal_ablation_mode == "hard_gate"
+                and not ablation.passed
+            ):
                 return []
         return candidates
 
@@ -228,37 +256,55 @@ class RepoChainWorkflow:
         capability_prior: Optional[List[str]] = None,
         target_count: int = 10,
         max_candidates: Optional[int] = None,
-    ) -> List:
+        plan_offset: int = 0,
+        plan_limit: Optional[int] = None,
+    ) -> tuple:
         """Root bootstrap mode: generate T_0 without solver trajectory conditioning.
 
-        Builds capability-prior plans then runs each through the same generate()
-        path (fixed Stage-5 operator).
+        Builds capability-prior plans then runs a *chunk* through generate().
+        Returns ``(candidates, plans_attempted)`` so zero-yield chunks still
+        consume generation budget via ``result.plans``.
         """
         from .bootstrap import BOOTSTRAP_CAPABILITY_PRIOR, build_bootstrap_plans
 
         prior = capability_prior or BOOTSTRAP_CAPABILITY_PRIOR
         backing = self._load_backing_generator()
         if backing is None:
-            return []
-        limit = max_candidates if max_candidates is not None else max(target_count * 3, 21)
-        plans = build_bootstrap_plans(
+            return [], []
+        chunk_size = max(
+            1,
+            int(
+                plan_limit
+                if plan_limit is not None
+                else self.bootstrap_plans_per_call
+            ),
+        )
+        offset = max(0, int(plan_offset or 0))
+        needed = offset + chunk_size
+        # Keep a generous upper bound so later chunks can still be built.
+        build_limit = max(needed, int(max_candidates or chunk_size), int(target_count or 1))
+        all_plans = build_bootstrap_plans(
             prior,
             repo_spec,
-            target_count=target_count,
-            max_plans=limit,
+            target_count=max(int(target_count or 1), needed),
+            max_plans=build_limit,
             code_locator=self.code_locator,
         )
+        plans = all_plans[offset : offset + chunk_size]
         candidates: List = []
+        emit_limit = (
+            int(max_candidates)
+            if max_candidates is not None
+            else max(int(target_count or 1), chunk_size)
+        )
         for plan in plans:
-            if len(candidates) >= target_count:
-                break
-            if max_candidates is not None and len(candidates) >= max_candidates:
+            if len(candidates) >= emit_limit:
                 break
             produced = self.generate(
                 plan, "", repo_spec, os.path.join(output_dir, plan.plan_id)
             )
             candidates.extend(produced)
-        return candidates
+        return candidates, plans
 
 
 __all__ = ["RepoChainWorkflow", "DEFAULT_MUTATION_OPERATOR"]

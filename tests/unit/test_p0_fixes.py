@@ -82,6 +82,7 @@ class TestTrustedCausalAblationSingleFile:
         validator = CandidateValidator(
             workspace_root=tmp_path,
             require_causal_ablation=True,
+            causal_ablation_hard_gate=True,
         )
         report = CandidateValidationReport(candidate_id="c1", passed=True)
         # Bypass full validation; exercise the ablation gate directly.
@@ -108,6 +109,38 @@ class TestTrustedCausalAblationSingleFile:
         assert report.trusted_causal_ablation_pass is False
         assert "not_multi_file" in report.rejection_reasons
 
+    def test_single_file_soft_mode_records_fail_without_rejection(self, tmp_path):
+        from godel0.proposer_trusted.candidate_validator import CandidateValidator
+        from godel0.schemas.evaluation import CandidateValidationReport
+
+        validator = CandidateValidator(
+            workspace_root=tmp_path,
+            require_causal_ablation=True,
+            causal_ablation_hard_gate=False,
+        )
+        report = CandidateValidationReport(candidate_id="c1", passed=True)
+        ok = validator._run_trusted_causal_ablation(
+            candidate_patch=(
+                "diff --git a/foo.py b/foo.py\n"
+                "--- a/foo.py\n"
+                "+++ b/foo.py\n"
+                "@@ -1 +1 @@\n"
+                "-a\n"
+                "+b\n"
+            ),
+            repo_path=tmp_path,
+            base_commit="HEAD",
+            test_command="true",
+            setup_patch="",
+            f2p_tests=["t1"],
+            report=report,
+            validation_mode="pytest",
+            command_test_id="",
+            control_test_command=None,
+        )
+        assert ok is False
+        assert report.trusted_causal_ablation_pass is False
+        assert report.rejection_reasons == []
 
 class TestEffectiveQuota:
     def test_parent_capped_by_available_sources(self):

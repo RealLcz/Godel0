@@ -180,9 +180,16 @@ class EvolutionOrchestrator:
             test_timeout_sec=config.proposer.candidate_timeout_sec,
             max_patch_lines=config.proposer.max_patch_lines,
             forbid_test_file_edits=config.proposer.forbid_test_file_edits,
-            # P0-7: authoritative trusted causal ablation gate.
+            # Local RepoChain metadata is advisory; trusted diagnostics may still
+            # run. Hard admission via causal ablation is phase-2 only.
             require_causal_ablation=bool(
                 config.proposer.repo_chain.require_causal_ablation
+            ),
+            record_causal_diagnostics=bool(
+                getattr(config.evaluation, "record_causal_diagnostics", True)
+            ),
+            causal_ablation_hard_gate=bool(
+                getattr(config.evaluation, "causal_ablation_hard_gate", False)
             ),
             # P0-8.2: hold the factory so each task resolves
             # repo_backend(repo_id) → repo_image_dir/<repo_id>.sif.
@@ -197,8 +204,10 @@ class EvolutionOrchestrator:
             scratch_root=Path(config.execution.scratch_root)
             / run_context.run_id
             / "node_proposer",
-            timeout_sec=config.proposer.candidate_timeout_sec
-            * config.tasks.max_generation_candidates,
+            timeout_sec=int(
+                getattr(config.proposer, "batch_timeout_sec", None)
+                or config.proposer.candidate_timeout_sec
+            ),
             execution_backend=agent_backend,
             project_root=Path(__file__).resolve().parents[3],
         )
@@ -216,6 +225,7 @@ class EvolutionOrchestrator:
                 self_edit_runner=SelfEditRunner(
                     agent_adapter=agent_adapter,
                     timeout_sec=config.agent.self_evolve_timeout_sec,
+                    max_attempts=config.agent.self_evolve_max_attempts,
                 ),
                 output_root=run_context.paths.nodes_dir,
             ),
@@ -424,6 +434,10 @@ class EvolutionOrchestrator:
                 "Root bootstrap failed: no complete K-task proposer/solver cycle; "
                 "evolution was not started"
             )
+
+        if bool(getattr(self.config.run, "bootstrap_only", False)):
+            print("Bootstrap-only mode completed successfully; skipping evolution loop")
+            return
 
         while not self.budget.exhausted():
             self.budget.record_expansion()
