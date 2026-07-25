@@ -1239,22 +1239,43 @@ class EvolutionOrchestrator:
             parent, diagnosis, self.config.models.self_improve_model
         )
 
+    def _run_solver_tasks(self, calls: list[dict]) -> list:
+        """Solve every (task, rollout) call, in parallel when configured.
+
+        Each solver run is a subprocess talking to the model over HTTP, so the
+        work is I/O bound and threads are enough. Results keep submission
+        order so a run stays reproducible.
+        """
+        if not calls:
+            return []
+        workers = max(1, int(getattr(self.config.evaluation, "max_workers", 1) or 1))
+        workers = min(workers, len(calls))
+        if workers == 1:
+            return [self.solver_runner.run_task(**call) for call in calls]
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(lambda call: self.solver_runner.run_task(**call), calls))
+
     def _evaluate_level1(self, parent, child):
         if self.level1_evaluator is None or self.solver_runner is None:
             return None
         parent_task_ids = self._parent_solved_task_ids(parent)
         tasks = [self.task_store.get(tid) for tid in parent_task_ids] if self.task_store else []
         tasks = [t for t in tasks if t is not None]
-        outcomes = [
-            self.solver_runner.run_task(
-                node=child,
-                task=task,
-                level=1,
-                seed=self.config.run.seed,
-                run_id=self.run_context.run_id,
-            )
-            for task in tasks
-        ]
+        outcomes = self._run_solver_tasks(
+            [
+                {
+                    "node": child,
+                    "task": task,
+                    "level": 1,
+                    "seed": self.config.run.seed,
+                    "run_id": self.run_context.run_id,
+                }
+                for task in tasks
+            ]
+        )
         result = self.level1_evaluator.compute_retention(parent_task_ids, outcomes)
         result.parent_node_id = parent.node_id
         result.child_node_id = child.node_id
@@ -1410,19 +1431,20 @@ class EvolutionOrchestrator:
         # with distinct seeds / artifact dirs so stochasticity has real data.
         rollouts = max(1, int(getattr(self.config.evaluation, "solver_rollouts", 1) or 1))
         base_seed = int(getattr(self.config.run, "seed", 0) or 0)
-        outcomes = []
-        for task in tasks:
-            for rollout_index in range(rollouts):
-                outcomes.append(
-                    self.solver_runner.run_task(
-                        node=child,
-                        task=task,
-                        level=2,
-                        seed=base_seed + rollout_index,
-                        run_id=self.run_context.run_id,
-                        rollout_index=rollout_index,
-                    )
-                )
+        outcomes = self._run_solver_tasks(
+            [
+                {
+                    "node": child,
+                    "task": task,
+                    "level": 2,
+                    "seed": base_seed + rollout_index,
+                    "run_id": self.run_context.run_id,
+                    "rollout_index": rollout_index,
+                }
+                for task in tasks
+                for rollout_index in range(rollouts)
+            ]
+        )
         result = self.level2_evaluator.compute_accuracy(
             child.node_id,
             getattr(batch_result, "batch_id", ""),

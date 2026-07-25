@@ -40,7 +40,9 @@ evaluation:
   deterministic: true
   level1_timeout_sec: 1200
   level2_timeout_sec: 1200
-  max_workers: 1
+  # Level1/Level2 were fully serial at ~25 min per task, which alone put a
+  # 20-epoch run past the 7-day wall clock.
+  max_workers: 4
   record_causal_diagnostics: true
   causal_ablation_hard_gate: false
 

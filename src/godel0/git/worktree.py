@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +12,11 @@ from .repository import run_git, create_ref, get_head_sha
 
 
 NODE_REF_PREFIX = "refs/godel0/nodes"
+
+# ``git worktree add/remove`` mutates shared bookkeeping under .git, so
+# concurrent evaluation workers must not run them at the same time. The lock
+# covers only the git calls, not the agent run inside the worktree.
+_WORKTREE_GIT_LOCK = threading.Lock()
 
 
 class NodeWorktree:
@@ -36,12 +42,13 @@ class NodeWorktree:
         if self.worktree_path.exists():
             shutil.rmtree(self.worktree_path)
 
-        result = run_git(
-            self.agent_repo,
-            "worktree", "add", "--detach",
-            str(self.worktree_path),
-            self.base_commit,
-        )
+        with _WORKTREE_GIT_LOCK:
+            result = run_git(
+                self.agent_repo,
+                "worktree", "add", "--detach",
+                str(self.worktree_path),
+                self.base_commit,
+            )
         if result.returncode != 0:
             raise WorkspaceError(
                 f"Failed to create worktree: {result.stderr}"
@@ -51,7 +58,11 @@ class NodeWorktree:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if self.worktree_path and self.worktree_path.exists():
             try:
-                run_git(self.agent_repo, "worktree", "remove", "--force", str(self.worktree_path))
+                with _WORKTREE_GIT_LOCK:
+                    run_git(
+                        self.agent_repo,
+                        "worktree", "remove", "--force", str(self.worktree_path),
+                    )
             except Exception:
                 shutil.rmtree(self.worktree_path, ignore_errors=True)
 

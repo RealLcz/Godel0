@@ -362,7 +362,13 @@ class SolverEvaluationRunner:
         outdir.mkdir(parents=True, exist_ok=True)
 
         try:
-            with NodeWorktree(self.agent_repo, workspace_root, f"eval_{node.node_id}", node.code_commit) as agent_src:
+            # The worktree name must be unique per task and rollout: the
+            # solver workspace root is shared by every task of a node, and
+            # NodeWorktree wipes any directory already at its path.
+            worktree_name = f"eval_{node.node_id}_{solve_task_id}"
+            with NodeWorktree(
+                self.agent_repo, workspace_root, worktree_name, node.code_commit
+            ) as agent_src:
                 request = CommonAgentRequest(
                     problem_statement=self.task_store.get_problem_statement(task.task_id),
                     git_dir=repo,
