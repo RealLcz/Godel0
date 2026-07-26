@@ -172,6 +172,55 @@ class TaskStore:
                 tasks.append(task)
         return tasks
 
+    def tasks_for_proposer_node(self, proposer_node_id: str) -> List[TaskRecord]:
+        """List every committed task emitted by a proposer node."""
+        tasks: List[TaskRecord] = []
+        for task_id in self.all_task_ids():
+            task = self.get(task_id)
+            if task is not None and task.proposer_node_id == proposer_node_id:
+                tasks.append(task)
+        return tasks
+
+    def latest_batch_for_node(
+        self,
+        proposer_node_id: str,
+        *,
+        prefer_incomplete_below: Optional[int] = None,
+    ) -> Optional[str]:
+        """Recover the batch_id a crashed proposer was filling.
+
+        Tasks are committed incrementally before the archive learns the
+        batch id (job 216679 left ``generated_task_batch_id=null`` while
+        five ``batch_097216cb`` tasks already sat in the store). Prefer an
+        incomplete batch when ``prefer_incomplete_below`` is set (typically
+        the configured ``batch_size``); otherwise return the newest batch.
+        """
+        by_batch: dict[str, List[TaskRecord]] = {}
+        for task in self.tasks_for_proposer_node(proposer_node_id):
+            if not task.batch_id:
+                continue
+            by_batch.setdefault(task.batch_id, []).append(task)
+        if not by_batch:
+            return None
+
+        def _newest_key(batch_id: str) -> tuple:
+            tasks = by_batch[batch_id]
+            stamps = [getattr(t, "created_at", None) for t in tasks]
+            stamps = [s for s in stamps if s is not None]
+            newest = max(stamps) if stamps else None
+            return (newest is not None, newest, len(tasks), batch_id)
+
+        if prefer_incomplete_below is not None:
+            incomplete = [
+                batch_id
+                for batch_id, tasks in by_batch.items()
+                if 0 < len(tasks) < int(prefer_incomplete_below)
+            ]
+            if incomplete:
+                return max(incomplete, key=_newest_key)
+
+        return max(by_batch.keys(), key=_newest_key)
+
     def exists(self, task_id: str) -> bool:
         """Check if a task exists."""
         return (self.store_dir / task_id / "task.json").exists()

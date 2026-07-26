@@ -49,6 +49,12 @@ class TaskGenerationContext:
     model: str = "deepseek/deepseek-chat"
     task_store_dir: str = "./task_store"
     bootstrap: bool = False
+    # Crash-resume: keep filling the same batch_id / seed already-committed
+    # tasks instead of minting a fresh batch_* (see job 216679).
+    resume_batch_id: Optional[str] = None
+    seed_tasks: List[TaskRecord] = field(default_factory=list)
+    resume_attempt: int = 0
+    resume_candidates_generated: int = 0
 
 
 @dataclass

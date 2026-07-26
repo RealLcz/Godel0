@@ -161,6 +161,10 @@ class TaskBatchBuilder:
         bootstrap: bool = False,
         parent_failure_trajectories: Optional[List[str]] = None,
         current_child_level1_trajectories: Optional[List[str]] = None,
+        resume_batch_id: Optional[str] = None,
+        seed_tasks: Optional[List] = None,
+        resume_attempt: int = 0,
+        resume_candidates_generated: int = 0,
     ) -> TaskBatchResult:
         """Build a task batch from the repo pool through validation.
 
@@ -183,13 +187,47 @@ class TaskBatchBuilder:
             current_child_level1_trajectories: BUG-08/09 current-child Level1
                 unresolved/forgotten trajectories. When populated, the builder
                 enforces the ``current_child_level1`` quota against this bucket.
+            resume_batch_id: Reuse an in-progress batch id after a crash
+                instead of minting a new UUID (job 216679 orphaned five
+                committed tasks by restarting with a fresh batch_*).
+            seed_tasks: Already-committed TaskRecords for ``resume_batch_id``
+                that must count toward the K-task target.
+            resume_attempt: Next ``attempt_NNN`` index so prior attempt
+                directories are not overwritten.
+            resume_candidates_generated: Prior generation budget already
+                consumed on this batch.
 
         Returns:
             TaskBatchResult with committed tasks and statistics.
         """
-        batch_id = f"batch_{uuid.uuid4().hex[:8]}"
+        batch_id = str(resume_batch_id or "").strip() or f"batch_{uuid.uuid4().hex[:8]}"
         result = TaskBatchResult(batch_id=batch_id, node_id=node_id)
         result.repo_chain_stats = empty_repo_chain_stats()
+        from ..git.patch import patch_hash as _patch_hash
+
+        seed_patch_hashes: set[str] = set()
+        if seed_tasks:
+            result.tasks = list(seed_tasks)
+            result.candidates_validated = len(result.tasks)
+        result.candidates_generated = max(0, int(resume_candidates_generated or 0))
+        if result.tasks and task_store_dir:
+            from .store import TaskStore as _TaskStore
+
+            try:
+                _store_for_seed = _TaskStore(Path(task_store_dir))
+            except Exception:
+                _store_for_seed = None
+            if _store_for_seed is not None:
+                for task in result.tasks:
+                    try:
+                        patch_text = _store_for_seed.get_bug_patch(task.task_id)
+                    except Exception:
+                        patch_text = ""
+                    if patch_text:
+                        seed_patch_hashes.add(_patch_hash(patch_text))
+                    content_hash = str(getattr(task, "content_hash", "") or "")
+                    if content_hash:
+                        seed_patch_hashes.add(content_hash)
 
         # BUG-08/09: 5+5 quota with dynamic fallback. Prefer the split
         # trajectory buckets when available; otherwise fall back to the flat
@@ -234,8 +272,17 @@ class TaskBatchBuilder:
             )
 
         source_counts = {"parent_failure": 0, "current_child_level1": 0, "bootstrap": 0}
+        for task in result.tasks:
+            source = str(getattr(task, "source_type", "") or "")
+            if source in source_counts:
+                source_counts[source] += 1
+            elif bootstrap:
+                source_counts["bootstrap"] += 1
         quota_fallback_log: list[dict] = []
 
+        if len(result.tasks) >= self.batch_size:
+            result.complete = True
+            return result
 
         if repo_pool is None or proposer_runner is None:
             # Without a repo pool or proposer, return empty batch
@@ -272,6 +319,20 @@ class TaskBatchBuilder:
         for value in parent_failure_trajectories + current_child_level1_trajectories:
             if value not in combined_trajectories:
                 combined_trajectories.append(value)
+        # Continue numbering after any attempt_* dirs left by a prior crash so
+        # resume does not clobber diagnostics or confuse generation_attempt
+        # offsets used for bootstrap plan chunking.
+        attempt = max(0, int(resume_attempt or 0))
+        if attempt <= 0:
+            existing_attempts = []
+            for path in output_dir.glob("attempt_*"):
+                if not path.is_dir():
+                    continue
+                suffix = path.name.split("_", 1)[-1]
+                if suffix.isdigit():
+                    existing_attempts.append(int(suffix))
+            if existing_attempts:
+                attempt = max(existing_attempts) + 1
         request = ProposerRequest(
             node_id=node_id,
             run_id=run_id,
@@ -316,7 +377,6 @@ class TaskBatchBuilder:
             allow_human_curated_data=self.allow_human_curated_data,
         )
 
-        attempt = 0
         plans_per_call = self._plans_per_call()
         while (
             len(result.tasks) < self.batch_size
@@ -430,6 +490,15 @@ class TaskBatchBuilder:
                 if not cand.patch:
                     result.rejected_candidates += 1
                     result.rejection_reasons["empty_patch"] = result.rejection_reasons.get("empty_patch", 0) + 1
+                    continue
+
+                # Already-committed seed tasks (resume) must not be revalidated
+                # and re-committed under a new task_id.
+                if seed_patch_hashes and _patch_hash(cand.patch) in seed_patch_hashes:
+                    result.rejected_candidates += 1
+                    result.rejection_reasons["resume_seed_duplicate"] = (
+                        result.rejection_reasons.get("resume_seed_duplicate", 0) + 1
+                    )
                     continue
 
                 repo_spec = None

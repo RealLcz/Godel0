@@ -87,6 +87,12 @@ class ProposerTaskProvider:
             # can enforce the 5+5 quota and record provenance.
             parent_failure_trajectories=list(context.parent_failure_trajectories),
             current_child_level1_trajectories=list(context.current_child_level1_trajectories),
+            resume_batch_id=getattr(context, "resume_batch_id", None),
+            seed_tasks=list(getattr(context, "seed_tasks", None) or []),
+            resume_attempt=int(getattr(context, "resume_attempt", 0) or 0),
+            resume_candidates_generated=int(
+                getattr(context, "resume_candidates_generated", 0) or 0
+            ),
         )
         return _result_to_batch(result)
 

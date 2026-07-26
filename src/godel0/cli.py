@@ -29,7 +29,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def _cmd_resume(args: argparse.Namespace) -> int:
     from .controller.resume import ResumeManager
 
-    rm = ResumeManager(Path(args.run_dir))
+    rm = ResumeManager(Path(args.run_dir).resolve())
     rm.resume()
     return 0
 

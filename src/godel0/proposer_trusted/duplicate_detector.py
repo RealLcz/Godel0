@@ -61,6 +61,27 @@ class DuplicateDetector:
             self._seen_component_hashes.update(component_hashes)
             return True
 
+    def seed_from_patches(
+        self,
+        patches=None,
+    ) -> int:
+        """Register already-committed bug patches so resume rejects duplicates.
+
+        ``patches`` is a list of ``(patch_text, repo_id)`` pairs.
+        """
+        seeded = 0
+        for item in patches or []:
+            if isinstance(item, (tuple, list)) and len(item) >= 1:
+                patch = item[0]
+                repo_id = item[1] if len(item) > 1 else ""
+            else:
+                continue
+            if not patch:
+                continue
+            self.record(str(patch), repo_id=str(repo_id or ""))
+            seeded += 1
+        return seeded
+
     def check(
         self,
         patch: str,

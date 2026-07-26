@@ -105,12 +105,31 @@ class EvolutionOrchestrator:
     def from_config(cls, config: Godel0Config) -> "EvolutionOrchestrator":
         """Create an orchestrator from config."""
         from ..config import assert_no_human_curated_data
+        from ..storage.paths import RunPaths
 
         # P0-23: zero out PR-replay weights in the main experiment.
         config = assert_no_human_curated_data(config)
 
         runs_dir = Path(config.paths.runs)
-        run_context = RunContext.create(config, runs_dir)
+        resume_from = getattr(config.run, "resume_from", None)
+        if resume_from:
+            run_dir = Path(resume_from).resolve()
+            if not run_dir.is_dir():
+                raise FileNotFoundError(f"resume_from directory not found: {run_dir}")
+            # Keep the crashed run's identity so archive / proposer / level
+            # artifacts are reused instead of minting a sibling run_id.
+            config.run.run_name = run_dir.name
+            config.paths.runs = str(run_dir.parent)
+            run_context = RunContext(
+                run_id=run_dir.name,
+                config=config,
+                paths=RunPaths(run_dir.parent, run_dir.name),
+                seed=config.run.seed,
+            )
+            run_context.paths.ensure_dirs()
+            print(f"Resuming evolution run from: {run_dir}")
+        else:
+            run_context = RunContext.create(config, runs_dir)
 
         atomic_write_yaml(run_context.paths.config_path, config_to_dict(config))
 
@@ -120,10 +139,23 @@ class EvolutionOrchestrator:
         # epsilon-greedy. EpsilonGreedySelector is kept for ablations only and
         # must be selected explicitly via config.selection.strategy.
         selector = cls._build_selector(config)
-        budget = Budget(
-            max_nodes=config.run.max_nodes,
-            max_expansions=config.run.max_expansions,
-        )
+        if resume_from:
+            budget = Budget.from_archive(
+                archive,
+                max_nodes=config.run.max_nodes,
+                max_expansions=config.run.max_expansions,
+            )
+            print(
+                "Restored budget from archive: "
+                f"successful_epochs={budget.nodes_created}/"
+                f"{budget.max_nodes}, "
+                f"attempts={budget.expansions_attempted}/{budget.max_expansions}"
+            )
+        else:
+            budget = Budget(
+                max_nodes=config.run.max_nodes,
+                max_expansions=config.run.max_expansions,
+            )
 
         components = cls._build_components(config, run_context)
 
@@ -571,28 +603,58 @@ class EvolutionOrchestrator:
         root = self.archive.get(ROOT_NODE_ID)
         if root is None:
             return False
-        existing = (
-            self.task_store.tasks_for_batch(root.generated_task_batch_id)
-            if self.task_store is not None and root.generated_task_batch_id
-            else []
-        )
+
+        batch_id, existing = self._recover_node_batch(root)
+        if batch_id and root.generated_task_batch_id != batch_id:
+            root.generated_task_batch_id = batch_id
+            self.archive.update(root)
+            self.archive.save_node_json(
+                root, self.run_context.paths.node_json(root.node_id)
+            )
+            print(
+                f"Recovered in-progress root batch {batch_id} "
+                f"({len(existing)}/{self.config.tasks.batch_size} tasks)"
+            )
+
         if (
             root.status == NodeStatus.COMPLETE
             and len(existing) == self.config.tasks.batch_size
             and root.level2_result_path
             and Path(root.level2_result_path).is_file()
         ):
+            print("Root bootstrap already complete; skipping")
             return True
 
-        print(
-            f"Bootstrapping root with {self.config.tasks.batch_size} "
-            "trusted-valid tasks before any self-edit"
-        )
-        batch = self._generate_batch(root, parent=None, level1_result=None)
-        if not batch.complete or len(batch.tasks) != self.config.tasks.batch_size:
-            root.status = NodeStatus.PROPOSER_FAILED
-            self.archive.update(root)
-            return False
+        if len(existing) == self.config.tasks.batch_size:
+            print(
+                f"Root batch {batch_id} already has "
+                f"{len(existing)} trusted-valid tasks; running Level2"
+            )
+            from ..tasks.provider import TaskBatch
+
+            batch = TaskBatch(
+                batch_id=batch_id or (root.generated_task_batch_id or ""),
+                node_id=root.node_id,
+                tasks=list(existing),
+                complete=True,
+                candidates_validated=len(existing),
+            )
+            root.generated_task_batch_id = batch.batch_id
+        else:
+            print(
+                f"Bootstrapping root with {self.config.tasks.batch_size} "
+                "trusted-valid tasks before any self-edit"
+                + (
+                    f" (resuming {len(existing)} already committed)"
+                    if existing
+                    else ""
+                )
+            )
+            batch = self._generate_batch(root, parent=None, level1_result=None)
+            if not batch.complete or len(batch.tasks) != self.config.tasks.batch_size:
+                root.status = NodeStatus.PROPOSER_FAILED
+                self.archive.update(root)
+                return False
 
         level2 = self._evaluate_level2(root, batch)
         if level2 is None or len(level2.outcomes) != self.config.tasks.batch_size:
@@ -659,6 +721,52 @@ class EvolutionOrchestrator:
         self.archive.update(root)
         self.archive.save_node_json(root, self.run_context.paths.node_json(root.node_id))
         return True
+
+    def _recover_node_batch(self, node) -> tuple[Optional[str], list]:
+        """Recover ``(batch_id, tasks)`` for a node after a crash.
+
+        Prefers the archive field; falls back to scanning the task store for
+        the newest incomplete batch emitted by this proposer node (job 216679
+        left ``generated_task_batch_id=null`` while five tasks were already
+        committed).
+        """
+        batch_id = getattr(node, "generated_task_batch_id", None) or None
+        tasks: list = []
+        if self.task_store is None:
+            return batch_id, tasks
+        if batch_id:
+            tasks = list(self.task_store.tasks_for_batch(batch_id))
+            return batch_id, tasks
+        recovered = self.task_store.latest_batch_for_node(
+            node.node_id,
+            prefer_incomplete_below=self.config.tasks.batch_size,
+        )
+        if not recovered:
+            # Also accept a completed batch that never got linked (full K tasks
+            # sitting in the store with no archive pointer).
+            recovered = self.task_store.latest_batch_for_node(node.node_id)
+        if recovered:
+            tasks = list(self.task_store.tasks_for_batch(recovered))
+            return recovered, tasks
+        return None, []
+
+    def _seed_duplicate_detector(self, tasks) -> None:
+        """Teach the validator about already-committed patches on resume."""
+        if self.validator is None or self.task_store is None:
+            return
+        detector = getattr(self.validator, "duplicate_detector", None)
+        if detector is None or not hasattr(detector, "seed_from_patches"):
+            return
+        patches = []
+        for task in tasks or []:
+            try:
+                patch = self.task_store.get_bug_patch(task.task_id)
+            except Exception:
+                patch = ""
+            if patch:
+                patches.append((patch, getattr(task, "repo_id", "") or ""))
+        if patches:
+            detector.seed_from_patches(patches)
 
     def _hgm_quality_from_batch(self, node, batch) -> dict:
         """P0-3: compute HGM gate inputs from a real generation batch.
@@ -1353,6 +1461,30 @@ class EvolutionOrchestrator:
             task_store_dir=self.config.paths.task_store,
             bootstrap=parent is None,
         )
+        # Crash-resume: keep filling the same batch when the archive lost the
+        # pointer (or the process died mid-bootstrap). Persist the batch_id
+        # *before* the long generation loop so a second crash cannot orphan
+        # newly committed tasks again (job 216679).
+        resume_batch_id, seed_tasks = self._recover_node_batch(child)
+        if not resume_batch_id:
+            import uuid as _uuid
+
+            resume_batch_id = f"batch_{_uuid.uuid4().hex[:8]}"
+            seed_tasks = []
+        context.resume_batch_id = resume_batch_id
+        context.seed_tasks = list(seed_tasks)
+        child.generated_task_batch_id = resume_batch_id
+        self.archive.update(child)
+        self.archive.save_node_json(
+            child, self.run_context.paths.node_json(child.node_id)
+        )
+        if seed_tasks:
+            self._seed_duplicate_detector(seed_tasks)
+            print(
+                f"Resuming proposer batch {resume_batch_id} for "
+                f"{child.node_id}: {len(seed_tasks)}/"
+                f"{self.config.tasks.batch_size} tasks already committed"
+            )
         if self.task_provider is not None:
             result = self.task_provider.get_tasks(child, context)
         else:
@@ -1379,6 +1511,12 @@ class EvolutionOrchestrator:
                 # BUG-08/09: forward split buckets for the legacy path too.
                 parent_failure_trajectories=parent_failure_trajectories,
                 current_child_level1_trajectories=current_child_level1_trajectories,
+                resume_batch_id=context.resume_batch_id,
+                seed_tasks=list(context.seed_tasks),
+                resume_attempt=int(context.resume_attempt or 0),
+                resume_candidates_generated=int(
+                    context.resume_candidates_generated or 0
+                ),
             )
             from ..tasks.provider import TaskBatch
 
@@ -1396,7 +1534,13 @@ class EvolutionOrchestrator:
                 engine_rejections=list(legacy.engine_rejections),
                 repo_chain_stats=dict(getattr(legacy, "repo_chain_stats", None) or {}),
             )
+        # Persist batch_id as soon as generation returns (or even if incomplete)
+        # so the next resume can find the same batch.
         child.generated_task_batch_id = result.batch_id
+        self.archive.update(child)
+        self.archive.save_node_json(
+            child, self.run_context.paths.node_json(child.node_id)
+        )
         summary_path = self.run_context.paths.proposer_dir(child.node_id) / "generation_summary.json"
         # P1-3: persist stage counters emitted by batch/validator/RepoChain —
         # never re-infer by substring-matching rejection_reasons.

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 from ..errors import ResumeError
 from ..storage.jsonl import read_all_jsonl
@@ -29,7 +28,12 @@ NODE_STAGES = [
 
 
 class ResumeManager:
-    """Manages resumption of interrupted runs."""
+    """Manages resumption of interrupted runs.
+
+    Reopens the same run directory (archive, proposer attempts, level results)
+    and lets ``EvolutionOrchestrator`` continue from committed task-store
+    progress and completed nodes — HGM-style crash recovery.
+    """
 
     def __init__(self, run_dir: Path):
         self.run_dir = Path(run_dir)
@@ -76,7 +80,7 @@ class ResumeManager:
             print(f"Found {len(records)} events in run log")
 
         if self.nodes_dir.exists():
-            for node_dir in self.nodes_dir.iterdir():
+            for node_dir in sorted(self.nodes_dir.iterdir()):
                 if node_dir.is_dir():
                     stage = self.get_node_stage(node_dir.name)
                     print(f"Node {node_dir.name}: stage={stage}")
@@ -88,11 +92,15 @@ class ResumeManager:
         from ..config import load_config
         from .orchestrator import EvolutionOrchestrator
 
+        # Point resume_from at this exact run directory so from_config reuses
+        # archive.jsonl / proposer artifacts / task_store progress instead of
+        # minting a sibling run_id.
         config = load_config(
             config_path,
             overrides={
                 "run.run_name": self.run_dir.name,
-                "paths.runs": str(self.run_dir.parent),
+                "run.resume_from": str(self.run_dir.resolve()),
+                "paths.runs": str(self.run_dir.parent.resolve()),
             },
         )
         orchestrator = EvolutionOrchestrator.from_config(config)
