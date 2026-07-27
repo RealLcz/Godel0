@@ -650,6 +650,9 @@ class TaskBatchBuilder:
                         f2p_tests=list(report.f2p_tests),
                         baseline_test_command=generated_test_command,
                         solver_test_command=str(repo_spec["test_command"]),
+                        failing_test_output=str(
+                            getattr(report, "failing_test_output", "") or ""
+                        ),
                         modified_files=cand.modified_files,
                         modified_entities=cand.modified_entities,
                         validation_report=report_data,

@@ -58,6 +58,9 @@ class CandidateValidationReport(BaseModel):
     f2p_tests: list[str] = []
     p2p_tests: list[str] = []
     reverse_restored: bool = False
+    # Truncated stdout+stderr from the bugged test run (for task_store
+    # failing_test_output.txt). Empty when validation never reached that stage.
+    failing_test_output: str = ""
 
     # P0-7 / P0-8 / P0-6: trusted causal ablation. Only Trusted Validator
     # results may set these; proposer-declared causal_ablation metadata is

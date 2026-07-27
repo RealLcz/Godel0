@@ -623,6 +623,7 @@ class CandidateValidator:
         report.import_valid = True
 
         bugged_result = self._run_tests(repo_copy, test_command)
+        report.failing_test_output = self._format_failing_test_output(bugged_result)
         if bugged_result.get("timed_out"):
             report.rejection_reasons.append("bugged_test_timeout")
             return report
@@ -865,6 +866,38 @@ class CandidateValidator:
         - Non-verbose: FAILED test_file.py::TestClass::test_method - error msg
         """
         return _parse_pytest_tests(result, {"FAILED", "ERROR"}, repo_path)
+
+    @staticmethod
+    def _format_failing_test_output(result: dict, max_chars: int = 50000) -> str:
+        """Persist a truncated bugged-run log for task_store consumers.
+
+        Keep enough pytest failure context for solvers / debugging without
+        writing multi-megabyte dumps into every accepted task.
+        """
+        stdout = str(result.get("stdout") or "")
+        stderr = str(result.get("stderr") or "")
+        parts: List[str] = []
+        if stdout.strip():
+            parts.append(stdout.rstrip())
+        if stderr.strip():
+            if parts:
+                parts.append("\n----- stderr -----\n")
+            parts.append(stderr.rstrip())
+        if result.get("timed_out"):
+            parts.append("\n[timed_out=true]")
+        rc = result.get("returncode")
+        if rc is not None:
+            parts.append(f"\n[returncode={rc}]")
+        text = "".join(parts).strip()
+        if not text:
+            return ""
+        if len(text) <= max_chars:
+            return text + ("\n" if not text.endswith("\n") else "")
+        omitted = len(text) - max_chars
+        return (
+            text[:max_chars]
+            + f"\n\n... [truncated {omitted} chars of bugged test output]\n"
+        )
 
     def _check_syntax(self, repo_path: Path, patch: str) -> bool:
         """Check that patched Python files have valid syntax."""
