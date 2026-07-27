@@ -113,13 +113,19 @@ class EvolutionOrchestrator:
         runs_dir = Path(config.paths.runs)
         resume_from = getattr(config.run, "resume_from", None)
         if resume_from:
+            from dataclasses import replace
+
             run_dir = Path(resume_from).resolve()
             if not run_dir.is_dir():
                 raise FileNotFoundError(f"resume_from directory not found: {run_dir}")
             # Keep the crashed run's identity so archive / proposer / level
             # artifacts are reused instead of minting a sibling run_id.
-            config.run.run_name = run_dir.name
-            config.paths.runs = str(run_dir.parent)
+            # Godel0Config is frozen — rebuild nested sections via replace().
+            config = replace(
+                config,
+                run=replace(config.run, run_name=run_dir.name, resume_from=str(run_dir)),
+                paths=replace(config.paths, runs=str(run_dir.parent)),
+            )
             run_context = RunContext(
                 run_id=run_dir.name,
                 config=config,
