@@ -120,6 +120,7 @@ class TaskBatchBuilder:
         workflow_config: Optional[dict] = None,
         allow_workflow_fallback: bool = False,
         allow_human_curated_data: bool = False,
+        max_concurrent_attempts: int = 1,
     ):
         self.batch_size = batch_size
         self.max_candidates = max_candidates
@@ -132,6 +133,36 @@ class TaskBatchBuilder:
         self.workflow_config = dict(workflow_config or {})
         self.allow_workflow_fallback = bool(allow_workflow_fallback)
         self.allow_human_curated_data = bool(allow_human_curated_data)
+        self.max_concurrent_attempts = max(1, int(max_concurrent_attempts or 1))
+
+    def _generate_wave(
+        self,
+        proposer_runner,
+        wave: list,
+    ) -> list:
+        """Generate every chunk in the wave, yielding results in wave order.
+
+        Only generation runs concurrently; the caller still validates and
+        commits serially so quota accounting and duplicate detection keep the
+        semantics they had when one chunk ran at a time.
+        """
+
+        def run(entry):
+            attempt_no, attempt_target, attempt_request = entry
+            try:
+                return attempt_no, attempt_target, proposer_runner.generate_batch(
+                    attempt_request
+                ), ""
+            except Exception as exc:  # noqa: BLE001 - reported per chunk
+                return attempt_no, attempt_target, None, f"{type(exc).__name__}: {exc}"
+
+        if len(wave) == 1:
+            return [run(wave[0])]
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(wave)) as pool:
+            return list(pool.map(run, wave))
 
     def _plans_per_call(self) -> int:
         """Chunk size for one proposer subprocess call, 0 when uncapped."""
@@ -382,298 +413,339 @@ class TaskBatchBuilder:
             len(result.tasks) < self.batch_size
             and result.candidates_generated < self.max_candidates
         ):
-            remaining_tasks = self.batch_size - len(result.tasks)
-            remaining_candidates = self.max_candidates - result.candidates_generated
-            attempt_dir = output_dir / f"attempt_{attempt:03d}"
-            # P0-4: pass *remaining* pre-generation quotas so ProposerRunner
-            # creates at most rem_parent + rem_child plans, not a mixed pool.
-            remaining_quotas = self._remaining_generation_quotas(
-                quotas=quotas,
-                source_counts=source_counts,
-                remaining_tasks=remaining_tasks,
-                parent_failure_trajectories=parent_failure_trajectories,
-                current_child_level1_trajectories=current_child_level1_trajectories,
-            )
-            quota_budget = int(remaining_quotas.get("parent_failure", 0) or 0) + int(
-                remaining_quotas.get("current_child_level1", 0) or 0
-            )
-            attempt_target = min(remaining_tasks, remaining_candidates)
-            if quota_budget > 0:
-                attempt_target = min(attempt_target, quota_budget)
-            # Chunk every path, not just bootstrap: one call asking for the
-            # whole batch cannot finish inside the proposer subprocess
-            # timeout, and the SIGTERM throws away everything it produced.
-            if plans_per_call > 0:
-                attempt_target = max(1, min(attempt_target, plans_per_call))
-                remaining_quotas = self._chunk_quotas(remaining_quotas, attempt_target)
-            attempt_request = replace(
-                request,
-                output_dir=str(attempt_dir),
-                target_batch_size=attempt_target,
-                max_candidates=remaining_candidates,
-                generation_attempt=attempt,
-                generation_quotas=dict(remaining_quotas),
-            )
-            try:
-                proposer_result = proposer_runner.generate_batch(attempt_request)
-            except Exception as exc:
-                # One timed-out / crashed proposer chunk must not abort the
-                # whole batch (Job 211728: a single SIGTERM'd chunk killed
-                # root bootstrap after 6 candidates had already been
-                # validated). Consume this attempt's budget and continue.
-                result.proposer_error = f"{type(exc).__name__}: {exc}"
-                result.candidates_generated += max(1, attempt_target)
+            # Build one wave of independent generation chunks. Chunk size still
+            # obeys plans_per_call; only the waiting is parallel. A single vLLM
+            # served one request at a time while eight GPUs sat idle, so wall
+            # clock per accepted task was dominated by serialization.
+            wave: list[tuple[int, int, Any]] = []
+            planned_tasks = len(result.tasks)
+            planned_candidates = result.candidates_generated
+            # Chunks in one wave are built before any of them commits, so the
+            # per-source budget has to be reserved here too. Sizing every chunk
+            # off the same committed source_counts would point the whole wave at
+            # whichever source is furthest from its quota.
+            planned_source_counts = dict(source_counts)
+            while len(wave) < self.max_concurrent_attempts:
+                if (
+                    planned_tasks >= self.batch_size
+                    or planned_candidates >= self.max_candidates
+                ):
+                    break
+                remaining_tasks = self.batch_size - planned_tasks
+                remaining_candidates = self.max_candidates - planned_candidates
+                # P0-4: pass *remaining* pre-generation quotas so ProposerRunner
+                # creates at most rem_parent + rem_child plans, not a mixed pool.
+                remaining_quotas = self._remaining_generation_quotas(
+                    quotas=quotas,
+                    source_counts=planned_source_counts,
+                    remaining_tasks=remaining_tasks,
+                    parent_failure_trajectories=parent_failure_trajectories,
+                    current_child_level1_trajectories=current_child_level1_trajectories,
+                )
+                quota_budget = int(remaining_quotas.get("parent_failure", 0) or 0) + int(
+                    remaining_quotas.get("current_child_level1", 0) or 0
+                )
+                attempt_target = min(remaining_tasks, remaining_candidates)
+                if quota_budget > 0:
+                    attempt_target = min(attempt_target, quota_budget)
+                # Chunk every path, not just bootstrap: one call asking for the
+                # whole batch cannot finish inside the proposer subprocess
+                # timeout, and the SIGTERM throws away everything it produced.
+                if plans_per_call > 0:
+                    attempt_target = max(1, min(attempt_target, plans_per_call))
+                    remaining_quotas = self._chunk_quotas(
+                        remaining_quotas, attempt_target
+                    )
+                attempt_request = replace(
+                    request,
+                    output_dir=str(output_dir / f"attempt_{attempt:03d}"),
+                    target_batch_size=attempt_target,
+                    max_candidates=remaining_candidates,
+                    generation_attempt=attempt,
+                    generation_quotas=dict(remaining_quotas),
+                )
+                wave.append((attempt, attempt_target, attempt_request))
                 attempt += 1
-                continue
-            proposer_error = str(getattr(proposer_result, "error", "") or "")
-            if proposer_error:
-                result.proposer_error = proposer_error
-            pending_candidates = getattr(proposer_result, "pending_candidates", [])
-            candidates_to_validate = (
-                list(proposer_result.accepted_candidates) + list(pending_candidates)
-            )
-            generated_this_attempt = (
-                len(proposer_result.accepted_candidates)
-                + len(proposer_result.rejected_candidates)
-                + len(pending_candidates)
-            )
-            # A plan consumed generation budget even when the evolvable engine
-            # rejected it before emitting a candidate. Counting only emitted
-            # artifacts made a zero-yield attempt terminate the whole batch
-            # immediately instead of using the configured retry budget.
-            generated_this_attempt = max(
-                generated_this_attempt,
-                len(getattr(proposer_result, "plans", []) or []),
-            )
-            result.candidates_generated += generated_this_attempt
+                # Reserve this chunk's share so the wave cannot collectively
+                # ask for more than the batch and candidate budgets allow.
+                planned_tasks += attempt_target
+                planned_candidates += attempt_target
+                for source, reserved in remaining_quotas.items():
+                    planned_source_counts[source] = planned_source_counts.get(
+                        source, 0
+                    ) + int(reserved or 0)
 
-            if validator is None:
-                result.complete = bool(proposer_result.completed)
-                return result
+            if not wave:
+                break
 
-            plans_by_id = {
-                p.get("plan_id"): p
-                for p in getattr(proposer_result, "plans", [])
-                if isinstance(p, dict) and p.get("plan_id")
-            }
-            for plan in plans_by_id.values():
-                blueprint = dict(plan.get("task_blueprint") or {})
-                rejection = str(blueprint.get("last_rejection") or "")
-                if rejection:
-                    stage = str(blueprint.get("last_rejection_stage") or "")
-                    if not stage:
-                        stage = stage_for_engine_rejection(rejection)
-                    rejection_record = {
-                        "attempt": attempt,
-                        "plan_id": plan.get("plan_id"),
-                        "reason": rejection,
-                        "stage": stage,
-                    }
-                    result.engine_rejections.append(rejection_record)
-                    increment_stage(result.repo_chain_stats, stage)
-                    feedback_id = f"engine-{attempt}-{plan.get('plan_id') or 'plan'}"
-                    atomic_write_json(
-                        output_dir / "trusted_feedback" / f"{feedback_id}.json",
-                        {
-                            "candidate_id": feedback_id,
-                            "accepted": False,
+            generated_in_wave = 0
+            completed_in_wave = 0
+            for attempt_no, attempt_target, proposer_result, gen_error in (
+                self._generate_wave(proposer_runner, wave)
+            ):
+                if gen_error:
+                    # One timed-out / crashed proposer chunk must not abort the
+                    # whole batch (Job 211728: a single SIGTERM'd chunk killed
+                    # root bootstrap after 6 candidates had already been
+                    # validated). Consume this attempt's budget and continue.
+                    result.proposer_error = gen_error
+                    result.candidates_generated += max(1, attempt_target)
+                    continue
+                completed_in_wave += 1
+                proposer_error = str(getattr(proposer_result, "error", "") or "")
+                if proposer_error:
+                    result.proposer_error = proposer_error
+                pending_candidates = getattr(proposer_result, "pending_candidates", [])
+                candidates_to_validate = (
+                    list(proposer_result.accepted_candidates) + list(pending_candidates)
+                )
+                generated_this_attempt = (
+                    len(proposer_result.accepted_candidates)
+                    + len(proposer_result.rejected_candidates)
+                    + len(pending_candidates)
+                )
+                # A plan consumed generation budget even when the evolvable engine
+                # rejected it before emitting a candidate. Counting only emitted
+                # artifacts made a zero-yield attempt terminate the whole batch
+                # immediately instead of using the configured retry budget.
+                generated_this_attempt = max(
+                    generated_this_attempt,
+                    len(getattr(proposer_result, "plans", []) or []),
+                )
+                result.candidates_generated += generated_this_attempt
+
+                if validator is None:
+                    result.complete = bool(proposer_result.completed)
+                    return result
+
+                plans_by_id = {
+                    p.get("plan_id"): p
+                    for p in getattr(proposer_result, "plans", [])
+                    if isinstance(p, dict) and p.get("plan_id")
+                }
+                for plan in plans_by_id.values():
+                    blueprint = dict(plan.get("task_blueprint") or {})
+                    rejection = str(blueprint.get("last_rejection") or "")
+                    if rejection:
+                        stage = str(blueprint.get("last_rejection_stage") or "")
+                        if not stage:
+                            stage = stage_for_engine_rejection(rejection)
+                        rejection_record = {
+                            "attempt": attempt_no,
+                            "plan_id": plan.get("plan_id"),
                             "reason": rejection,
                             "stage": stage,
-                            "notes": rejection_record,
+                        }
+                        result.engine_rejections.append(rejection_record)
+                        increment_stage(result.repo_chain_stats, stage)
+                        feedback_id = f"engine-{attempt_no}-{plan.get('plan_id') or 'plan'}"
+                        atomic_write_json(
+                            output_dir / "trusted_feedback" / f"{feedback_id}.json",
+                            {
+                                "candidate_id": feedback_id,
+                                "accepted": False,
+                                "reason": rejection,
+                                "stage": stage,
+                                "notes": rejection_record,
+                            },
+                        )
+                for raw_cand in candidates_to_validate:
+                    if len(result.tasks) >= self.batch_size:
+                        break
+                    cand = self._normalize_candidate(raw_cand, plans_by_id, repo_specs)
+
+                    if not cand.patch:
+                        result.rejected_candidates += 1
+                        result.rejection_reasons["empty_patch"] = result.rejection_reasons.get("empty_patch", 0) + 1
+                        continue
+
+                    # Already-committed seed tasks (resume) must not be revalidated
+                    # and re-committed under a new task_id.
+                    if seed_patch_hashes and _patch_hash(cand.patch) in seed_patch_hashes:
+                        result.rejected_candidates += 1
+                        result.rejection_reasons["resume_seed_duplicate"] = (
+                            result.rejection_reasons.get("resume_seed_duplicate", 0) + 1
+                        )
+                        continue
+
+                    repo_spec = None
+                    for r in repo_specs:
+                        if r["repo_id"] == cand.repo_id:
+                            repo_spec = r
+                            break
+                    if repo_spec is None:
+                        result.rejected_candidates += 1
+                        result.rejection_reasons["no_repo_spec"] = result.rejection_reasons.get("no_repo_spec", 0) + 1
+                        continue
+
+                    generation_metadata = dict(getattr(cand, "generation_metadata", {}) or {})
+                    setup_patch = str(generation_metadata.get("generated_test_patch") or "")
+                    generated_test_command = self._trusted_test_command(
+                        repo_spec,
+                        generation_metadata,
+                        setup_patch,
+                    )
+                    report = validator.validate(
+                        candidate_patch=cand.patch,
+                        repo_path=Path(repo_spec["path"]),
+                        base_commit=repo_spec["base_commit"],
+                        test_command=generated_test_command,
+                        candidate_id=cand.candidate_id,
+                        repo_id=repo_spec["repo_id"],
+                        target_file=getattr(cand, "file_path", ""),
+                        target_symbol=getattr(cand, "symbol_name", ""),
+                        operator=getattr(cand, "operator", ""),
+                        setup_patch=setup_patch,
+                    )
+                    result.candidates_validated += 1
+                    problem_statement = cand.issue_draft or "Bug found in repository."
+                    if report.passed:
+                        statement_valid, statement_issues = audit_statement(
+                            problem_statement,
+                            cand.patch,
+                            report.f2p_tests,
+                        )
+                        if not statement_valid:
+                            report.passed = False
+                            for issue in statement_issues:
+                                report.rejection_reasons.append(f"statement_audit:{issue}")
+                            if STATEMENT_LEAKAGE not in report.failure_stages:
+                                report.failure_stages.append(STATEMENT_LEAKAGE)
+                    report_data = report.model_dump(mode="json")
+                    result.validation_reports.append(report_data)
+                    if not report.passed:
+                        accumulate_stages(
+                            result.repo_chain_stats,
+                            list(getattr(report, "failure_stages", None) or []),
+                        )
+                    feedback_reason = "; ".join(report.rejection_reasons)
+                    atomic_write_json(
+                        output_dir / "trusted_feedback" / f"{cand.candidate_id}.json",
+                        {
+                            "candidate_id": cand.candidate_id,
+                            "accepted": bool(report.passed),
+                            "reason": feedback_reason,
+                            "notes": report_data,
                         },
                     )
-            for raw_cand in candidates_to_validate:
-                if len(result.tasks) >= self.batch_size:
-                    break
-                cand = self._normalize_candidate(raw_cand, plans_by_id, repo_specs)
 
-                if not cand.patch:
-                    result.rejected_candidates += 1
-                    result.rejection_reasons["empty_patch"] = result.rejection_reasons.get("empty_patch", 0) + 1
-                    continue
-
-                # Already-committed seed tasks (resume) must not be revalidated
-                # and re-committed under a new task_id.
-                if seed_patch_hashes and _patch_hash(cand.patch) in seed_patch_hashes:
-                    result.rejected_candidates += 1
-                    result.rejection_reasons["resume_seed_duplicate"] = (
-                        result.rejection_reasons.get("resume_seed_duplicate", 0) + 1
-                    )
-                    continue
-
-                repo_spec = None
-                for r in repo_specs:
-                    if r["repo_id"] == cand.repo_id:
-                        repo_spec = r
-                        break
-                if repo_spec is None:
-                    result.rejected_candidates += 1
-                    result.rejection_reasons["no_repo_spec"] = result.rejection_reasons.get("no_repo_spec", 0) + 1
-                    continue
-
-                generation_metadata = dict(getattr(cand, "generation_metadata", {}) or {})
-                setup_patch = str(generation_metadata.get("generated_test_patch") or "")
-                generated_test_command = self._trusted_test_command(
-                    repo_spec,
-                    generation_metadata,
-                    setup_patch,
-                )
-                report = validator.validate(
-                    candidate_patch=cand.patch,
-                    repo_path=Path(repo_spec["path"]),
-                    base_commit=repo_spec["base_commit"],
-                    test_command=generated_test_command,
-                    candidate_id=cand.candidate_id,
-                    repo_id=repo_spec["repo_id"],
-                    target_file=getattr(cand, "file_path", ""),
-                    target_symbol=getattr(cand, "symbol_name", ""),
-                    operator=getattr(cand, "operator", ""),
-                    setup_patch=setup_patch,
-                )
-                result.candidates_validated += 1
-                problem_statement = cand.issue_draft or "Bug found in repository."
-                if report.passed:
-                    statement_valid, statement_issues = audit_statement(
-                        problem_statement,
-                        cand.patch,
-                        report.f2p_tests,
-                    )
-                    if not statement_valid:
-                        report.passed = False
-                        for issue in statement_issues:
-                            report.rejection_reasons.append(f"statement_audit:{issue}")
-                        if STATEMENT_LEAKAGE not in report.failure_stages:
-                            report.failure_stages.append(STATEMENT_LEAKAGE)
-                report_data = report.model_dump(mode="json")
-                result.validation_reports.append(report_data)
-                if not report.passed:
-                    accumulate_stages(
-                        result.repo_chain_stats,
-                        list(getattr(report, "failure_stages", None) or []),
-                    )
-                feedback_reason = "; ".join(report.rejection_reasons)
-                atomic_write_json(
-                    output_dir / "trusted_feedback" / f"{cand.candidate_id}.json",
-                    {
-                        "candidate_id": cand.candidate_id,
-                        "accepted": bool(report.passed),
-                        "reason": feedback_reason,
-                        "notes": report_data,
-                    },
-                )
-
-                if report.passed and task_committer:
-                    # BUG-08/09: classify the candidate against the split
-                    # trajectory buckets and enforce the 5+5 quota with
-                    # dynamic fallback (5+5 -> 4+6 -> ...).
-                    source_type, source_trajectory = self._classify_source_v2(
-                        cand,
-                        parent_failure_trajectories,
-                        current_child_level1_trajectories,
-                        parent_task_ids or [],
-                        bootstrap=bootstrap,
-                    )
-                    if not self._accepts_source(
-                        source_type, source_counts, quotas, self.batch_size
-                    ):
-                        # Quota for this source is full and the other source
-                        # has not yet donated its fallback surplus. Skip but
-                        # record the candidate so a later fallback can accept
-                        # it if the other source underfills.
+                    if report.passed and task_committer:
+                        # BUG-08/09: classify the candidate against the split
+                        # trajectory buckets and enforce the 5+5 quota with
+                        # dynamic fallback (5+5 -> 4+6 -> ...).
+                        source_type, source_trajectory = self._classify_source_v2(
+                            cand,
+                            parent_failure_trajectories,
+                            current_child_level1_trajectories,
+                            parent_task_ids or [],
+                            bootstrap=bootstrap,
+                        )
+                        if not self._accepts_source(
+                            source_type, source_counts, quotas, self.batch_size
+                        ):
+                            # Quota for this source is full and the other source
+                            # has not yet donated its fallback surplus. Skip but
+                            # record the candidate so a later fallback can accept
+                            # it if the other source underfills.
+                            result.rejected_candidates += 1
+                            result.rejection_reasons[
+                                f"quota_full:{source_type}"
+                            ] = result.rejection_reasons.get(
+                                f"quota_full:{source_type}", 0
+                            ) + 1
+                            continue
+                        # Record fallback whenever we accept a source past its
+                        # nominal quota.
+                        nominal = quotas.get(source_type, 0)
+                        if nominal and source_counts[source_type] >= nominal:
+                            quota_fallback_log.append({
+                                "candidate_id": cand.candidate_id,
+                                "source_type": source_type,
+                                "nominal_quota": nominal,
+                                "accepted_so_far": source_counts[source_type] + 1,
+                                "reason": "other_source_underfilled",
+                            })
+                        # P0-5: stamp provenance only from candidate/plan metadata.
+                        # Never fall back to the current proposer node_id — that
+                        # mis-labels Parent-failure tasks as Current Child.
+                        meta = dict(getattr(cand, "generation_metadata", {}) or {})
+                        plan_meta = plans_by_id.get(getattr(cand, "plan_id", ""), {}) or {}
+                        blueprint = dict(plan_meta.get("task_blueprint") or {})
+                        source_node_id = str(
+                            meta.get("source_node_id")
+                            or blueprint.get("source_node_id")
+                            or meta.get("source_node")
+                            or ""
+                        )
+                        source_task_id = str(
+                            meta.get("source_task_id")
+                            or blueprint.get("source_task_id")
+                            or ""
+                        )
+                        source_failure_stage = str(
+                            meta.get("source_failure_stage")
+                            or blueprint.get("source_failure_stage")
+                            or blueprint.get("failure_stage")
+                            or ""
+                        )
+                        stamped_traj = str(
+                            meta.get("source_trajectory_id")
+                            or blueprint.get("source_trajectory_id")
+                            or ""
+                        )
+                        if stamped_traj:
+                            source_trajectory = stamped_traj
+                        stamped_type = str(
+                            meta.get("source_type") or blueprint.get("source_type") or ""
+                        )
+                        if stamped_type in {
+                            "parent_failure",
+                            "current_child_level1",
+                            "bootstrap",
+                        }:
+                            source_type = stamped_type
+                        # P0-8: f2p_tests come ONLY from trusted report, never from
+                        # candidate-declared metadata.
+                        task = task_committer.commit_task(
+                            batch_id=batch_id,
+                            proposer_node_id=node_id,
+                            repo_id=repo_spec["repo_id"],
+                            base_commit=repo_spec["base_commit"],
+                            bug_strategy=cand.strategy,
+                            bug_patch=cand.patch,
+                            problem_statement=problem_statement,
+                            f2p_tests=list(report.f2p_tests),
+                            baseline_test_command=generated_test_command,
+                            solver_test_command=str(repo_spec["test_command"]),
+                            failing_test_output=str(
+                                getattr(report, "failing_test_output", "") or ""
+                            ),
+                            modified_files=cand.modified_files,
+                            modified_entities=cand.modified_entities,
+                            validation_report=report_data,
+                            setup_patch=setup_patch,
+                            source_node=source_node_id,
+                            source_trajectory=source_trajectory,
+                            source_type=source_type,
+                            source_node_id=source_node_id,
+                            source_trajectory_id=source_trajectory,
+                            source_task_id=source_task_id,
+                            source_failure_stage=source_failure_stage,
+                        )
+                        result.tasks.append(task)
+                        source_counts[source_type] = source_counts.get(source_type, 0) + 1
+                    else:
                         result.rejected_candidates += 1
-                        result.rejection_reasons[
-                            f"quota_full:{source_type}"
-                        ] = result.rejection_reasons.get(
-                            f"quota_full:{source_type}", 0
-                        ) + 1
-                        continue
-                    # Record fallback whenever we accept a source past its
-                    # nominal quota.
-                    nominal = quotas.get(source_type, 0)
-                    if nominal and source_counts[source_type] >= nominal:
-                        quota_fallback_log.append({
-                            "candidate_id": cand.candidate_id,
-                            "source_type": source_type,
-                            "nominal_quota": nominal,
-                            "accepted_so_far": source_counts[source_type] + 1,
-                            "reason": "other_source_underfilled",
-                        })
-                    # P0-5: stamp provenance only from candidate/plan metadata.
-                    # Never fall back to the current proposer node_id — that
-                    # mis-labels Parent-failure tasks as Current Child.
-                    meta = dict(getattr(cand, "generation_metadata", {}) or {})
-                    plan_meta = plans_by_id.get(getattr(cand, "plan_id", ""), {}) or {}
-                    blueprint = dict(plan_meta.get("task_blueprint") or {})
-                    source_node_id = str(
-                        meta.get("source_node_id")
-                        or blueprint.get("source_node_id")
-                        or meta.get("source_node")
-                        or ""
-                    )
-                    source_task_id = str(
-                        meta.get("source_task_id")
-                        or blueprint.get("source_task_id")
-                        or ""
-                    )
-                    source_failure_stage = str(
-                        meta.get("source_failure_stage")
-                        or blueprint.get("source_failure_stage")
-                        or blueprint.get("failure_stage")
-                        or ""
-                    )
-                    stamped_traj = str(
-                        meta.get("source_trajectory_id")
-                        or blueprint.get("source_trajectory_id")
-                        or ""
-                    )
-                    if stamped_traj:
-                        source_trajectory = stamped_traj
-                    stamped_type = str(
-                        meta.get("source_type") or blueprint.get("source_type") or ""
-                    )
-                    if stamped_type in {
-                        "parent_failure",
-                        "current_child_level1",
-                        "bootstrap",
-                    }:
-                        source_type = stamped_type
-                    # P0-8: f2p_tests come ONLY from trusted report, never from
-                    # candidate-declared metadata.
-                    task = task_committer.commit_task(
-                        batch_id=batch_id,
-                        proposer_node_id=node_id,
-                        repo_id=repo_spec["repo_id"],
-                        base_commit=repo_spec["base_commit"],
-                        bug_strategy=cand.strategy,
-                        bug_patch=cand.patch,
-                        problem_statement=problem_statement,
-                        f2p_tests=list(report.f2p_tests),
-                        baseline_test_command=generated_test_command,
-                        solver_test_command=str(repo_spec["test_command"]),
-                        failing_test_output=str(
-                            getattr(report, "failing_test_output", "") or ""
-                        ),
-                        modified_files=cand.modified_files,
-                        modified_entities=cand.modified_entities,
-                        validation_report=report_data,
-                        setup_patch=setup_patch,
-                        source_node=source_node_id,
-                        source_trajectory=source_trajectory,
-                        source_type=source_type,
-                        source_node_id=source_node_id,
-                        source_trajectory_id=source_trajectory,
-                        source_task_id=source_task_id,
-                        source_failure_stage=source_failure_stage,
-                    )
-                    result.tasks.append(task)
-                    source_counts[source_type] = source_counts.get(source_type, 0) + 1
-                else:
-                    result.rejected_candidates += 1
-                    for reason in report.rejection_reasons:
-                        result.rejection_reasons[reason] = result.rejection_reasons.get(reason, 0) + 1
+                        for reason in report.rejection_reasons:
+                            result.rejection_reasons[reason] = result.rejection_reasons.get(reason, 0) + 1
 
-            attempt += 1
-            if generated_this_attempt == 0:
+                generated_in_wave += generated_this_attempt
+
+            if completed_in_wave and generated_in_wave == 0:
+                # Every chunk that actually returned came back without even a
+                # plan, so the proposer is broken rather than merely unlucky. A
+                # wave where all chunks crashed is not that case: it must keep
+                # going on the remaining budget (Job 211728).
                 if not result.proposer_error:
                     result.proposer_error = "proposer_generated_zero_candidates"
                 break

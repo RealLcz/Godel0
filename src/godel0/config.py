@@ -202,6 +202,10 @@ class ProposerConfig:
     candidate_timeout_sec: int = 180
     # Per NodeProposerRunner subprocess timeout (one bootstrap/generation chunk).
     batch_timeout_sec: int = 900
+    # Generation chunks to run at once against the shared vLLM. Chunks stay at
+    # plans_per_call so a slow one still cannot take the batch down with it;
+    # this only stops the others from waiting behind it.
+    max_concurrent_attempts: int = 1
     max_patch_lines: int = 80
     forbid_test_file_edits: bool = True
     require_f2p: bool = True

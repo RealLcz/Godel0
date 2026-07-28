@@ -298,6 +298,7 @@ class EvolutionOrchestrator:
                 workflow_config=config_to_dict(config)["proposer"]["repo_chain"],
                 allow_workflow_fallback=config.proposer.allow_workflow_fallback,
                 allow_human_curated_data=config.proposer.allow_human_curated_data,
+                max_concurrent_attempts=config.proposer.max_concurrent_attempts,
             ),
             "task_provider": ProposerTaskProvider(
                 batch_builder=TaskBatchBuilder(
@@ -312,6 +313,7 @@ class EvolutionOrchestrator:
                     workflow_config=config_to_dict(config)["proposer"]["repo_chain"],
                     allow_workflow_fallback=config.proposer.allow_workflow_fallback,
                     allow_human_curated_data=config.proposer.allow_human_curated_data,
+                    max_concurrent_attempts=config.proposer.max_concurrent_attempts,
                 ),
                 repo_pool=repo_pool,
                 validator=validator,

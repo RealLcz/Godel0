@@ -56,6 +56,9 @@ proposer:
   # One plan per proposer chunk × generous cap: a slow plan cannot take the
   # whole bootstrap down with it (211728 died on one 900s chunk timeout).
   batch_timeout_sec: 1800
+  # 217937 served one vLLM request at a time across eight GPUs (KV cache peaked
+  # at 0.5%), so ~38 min per accepted task was mostly waiting.
+  max_concurrent_attempts: 4
   repo_chain:
     min_files: 2
     max_files: 6

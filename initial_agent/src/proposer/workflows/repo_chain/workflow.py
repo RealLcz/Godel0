@@ -303,8 +303,37 @@ class RepoChainWorkflow:
             produced = self.generate(
                 plan, "", repo_spec, os.path.join(output_dir, plan.plan_id)
             )
+            if not produced:
+                # Bootstrap does not route through ProposerRunner's
+                # _generate_candidates, so nothing else stamps the engine
+                # rejection onto the plan. Without this the controller sees
+                # zero-yield chunks with no reason attached and its
+                # repo_chain_stats stay empty.
+                self._stamp_plan_rejection(plan, backing)
             candidates.extend(produced)
         return candidates, plans
+
+    @staticmethod
+    def _stamp_plan_rejection(plan, backing) -> None:
+        """Record why one plan produced no candidate onto its blueprint."""
+        blueprint = getattr(plan, "task_blueprint", None)
+        if not isinstance(blueprint, dict):
+            return
+        reason = str(getattr(backing, "last_rejection", "") or "")
+        if not reason:
+            reason = "engine_returned_no_candidates"
+        blueprint["last_rejection"] = reason
+        stage = str(getattr(backing, "last_rejection_stage", "") or "")
+        if not stage:
+            try:
+                from godel0.schemas.repo_chain_stats import (
+                    stage_for_engine_rejection,
+                )
+
+                stage = stage_for_engine_rejection(reason)
+            except Exception:
+                stage = "mutation_failure"
+        blueprint["last_rejection_stage"] = stage
 
 
 __all__ = ["RepoChainWorkflow", "DEFAULT_MUTATION_OPERATOR"]

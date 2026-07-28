@@ -541,7 +541,9 @@ def test_repo_chain_rejects_duplicate_planned_mutation_sites():
         max_sites=4,
     )
 
-    assert rejection == "mutation sites must be unique file/symbol pairs"
+    assert rejection.startswith("mutation sites must be unique file/symbol pairs")
+    # Naming the offender saves the model a retry spent guessing which one.
+    assert "a.py::f" in rejection
 
 
 def test_repo_chain_requires_edits_for_every_planned_site(tmp_path: Path):
@@ -574,7 +576,7 @@ def test_repo_chain_requires_edits_for_every_planned_site(tmp_path: Path):
     assert rejection == "edits must cover all 3 planned mutation sites exactly once"
 
 
-def test_repo_chain_rejects_new_comments_that_reveal_mutation(tmp_path: Path):
+def test_repo_chain_strips_new_comments_that_reveal_mutation(tmp_path: Path):
     generator = SWESmithEngine().repo_chain
     (tmp_path / "a.py").write_text("def f():\n    return 1\n")
     (tmp_path / "b.py").write_text("def g():\n    return 1\n")
@@ -611,8 +613,55 @@ def test_repo_chain_rejects_new_comments_that_reveal_mutation(tmp_path: Path):
         max_sites=4,
     )
 
+    assert rejection == ""
+    assert len(edits) == 2
+    # The mutation lands, but the comment never reaches the solver's repo.
+    assert (tmp_path / "a.py").read_text() == "def f():\n    return 0\n"
+    assert "#" not in edits[0]["after"]
+
+
+def test_repo_chain_rejects_comment_only_edit(tmp_path: Path):
+    """Stripping comments must not turn an edit into a silent no-op."""
+    generator = SWESmithEngine().repo_chain
+    (tmp_path / "a.py").write_text("def f():\n    return 1\n")
+    (tmp_path / "b.py").write_text("def g():\n    return 1\n")
+    chain = {
+        "mutation_sites": [
+            {"file": "a.py", "symbol": "f"},
+            {"file": "b.py", "symbol": "g"},
+        ]
+    }
+    payload = {
+        "edits": [
+            {
+                "file": "a.py",
+                "symbol": "f",
+                "before": "    return 1\n",
+                "after": "    # only a comment was added\n    return 1\n",
+            },
+            {
+                "file": "b.py",
+                "symbol": "g",
+                "before": "    return 1\n",
+                "after": "    return 0\n",
+            },
+        ]
+    }
+
+    edits, rejection = generator._materialize_symbol_edits(
+        tmp_path,
+        payload,
+        chain,
+        min_files=2,
+        max_files=4,
+        min_sites=2,
+        max_sites=4,
+    )
+
     assert edits == []
-    assert rejection == "edit 0 adds comments that may reveal the generated regression"
+    assert rejection == "edit 0 is a no-op once added comments are removed"
+    # Nothing may be written when any edit in the set is rejected.
+    assert (tmp_path / "b.py").read_text() == "def g():\n    return 1\n"
 
 
 def test_repo_chain_normalizes_only_unique_uniform_indentation_offsets():

@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+from collections import Counter
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Sequence
 
@@ -477,8 +478,9 @@ class RepoChainGenerator:
                         (output_root / "contract_response.json").write_text(
                             stored_contract, encoding="utf-8"
                         )
-                        contract_error = self._chain_plan_rejection(
+                        contract_error = self._contract_rejection(
                             contract_payload,
+                            workspace=Path(workspace),
                             context_files=context_files,
                             min_files=min_files,
                             max_files=max_files,
@@ -489,10 +491,6 @@ class RepoChainGenerator:
                             ),
                             require_generated_tests=False,
                         )
-                        if not contract_error:
-                            contract_error = self._mutation_symbols_rejection(
-                                Path(workspace), contract_payload["chain_plan"]
-                            )
                         if contract_error:
                             (output_root / f"contract_rejection_attempt_{attempt + 1}.txt").write_text(
                                 contract_error + "\n", encoding="utf-8"
@@ -577,8 +575,9 @@ class RepoChainGenerator:
                         (output_root / "contract_response.json").write_text(
                             stored_contract, encoding="utf-8"
                         )
-                        contract_error = self._chain_plan_rejection(
+                        contract_error = self._contract_rejection(
                             contract_payload,
+                            workspace=Path(workspace),
                             context_files=context_files,
                             min_files=min_files,
                             max_files=max_files,
@@ -587,10 +586,6 @@ class RepoChainGenerator:
                             forbidden_terms=list(blueprint.get("forbidden_terms") or []),
                             require_generated_tests=True,
                         )
-                        if not contract_error:
-                            contract_error = self._mutation_symbols_rejection(
-                                Path(workspace), contract_payload["chain_plan"]
-                            )
                         if contract_error:
                             (output_root / f"contract_rejection_attempt_{attempt + 1}.txt").write_text(
                                 contract_error + "\n", encoding="utf-8"
@@ -1104,6 +1099,41 @@ class RepoChainGenerator:
             require_generated_tests=require_generated_tests,
         )
 
+    def _contract_rejection(
+        self,
+        payload: Dict[str, Any],
+        *,
+        workspace: Path,
+        context_files: Sequence[str],
+        min_files: int,
+        max_files: int,
+        min_sites: int,
+        max_sites: int,
+        forbidden_terms: Sequence[str] = (),
+        require_generated_tests: bool = True,
+    ) -> str:
+        """Every reason this contract response is unusable, in one message.
+
+        Shape violations and hallucinated symbols were reported on separate
+        retries, so a plan needing both fixes could not converge inside the
+        three-attempt budget.
+        """
+        shape_error = self._chain_plan_rejection(
+            payload,
+            context_files=context_files,
+            min_files=min_files,
+            max_files=max_files,
+            min_sites=min_sites,
+            max_sites=max_sites,
+            forbidden_terms=forbidden_terms,
+            require_generated_tests=require_generated_tests,
+        )
+        chain = payload.get("chain_plan")
+        if not isinstance(chain, dict):
+            return shape_error
+        symbol_error = self._mutation_symbols_rejection(workspace, chain)
+        return "; ".join(part for part in (shape_error, symbol_error) if part)
+
     def _chain_plan_rejection(
         self,
         payload: Dict[str, Any],
@@ -1132,38 +1162,58 @@ class RepoChainGenerator:
         ]
         if leaked_terms:
             return f"copied forbidden trajectory domain terms: {leaked_terms}"
+
+        # Report every violation at once. Returning only the first one meant a
+        # model that fixed it then hit the next and burned another of its three
+        # retries on a plan that was one edit away from valid.
+        errors: List[str] = []
         if not all(str(chain.get(key) or "").strip() for key in ("root_invariant", "entrypoint", "endpoint")):
-            return "missing root_invariant, entrypoint, or endpoint"
+            errors.append("missing root_invariant, entrypoint, or endpoint")
         sites = chain.get("mutation_sites") or []
-        if not isinstance(sites, list) or not min_sites <= len(sites) <= max_sites:
-            return f"mutation site count must be between {min_sites} and {max_sites}"
+        if not isinstance(sites, list):
+            sites = []
+        if not min_sites <= len(sites) <= max_sites:
+            errors.append(
+                f"mutation site count must be between {min_sites} and {max_sites}, got {len(sites)}"
+            )
         site_keys = [
             (str(site.get("file") or ""), str(site.get("symbol") or ""))
             for site in sites
             if isinstance(site, dict)
         ]
         if len(site_keys) != len(sites) or len(set(site_keys)) != len(site_keys):
-            return "mutation sites must be unique file/symbol pairs"
+            duplicates = sorted(
+                f"{file}::{symbol}"
+                for (file, symbol), count in Counter(site_keys).items()
+                if count > 1
+            )
+            detail = "mutation sites must be unique file/symbol pairs"
+            if duplicates:
+                detail += "; duplicated: " + ", ".join(duplicates)
+            errors.append(detail)
         files = {str(site.get("file") or "") for site in sites if isinstance(site, dict)}
         if not min_files <= len(files) <= max_files:
-            return f"production file count must be between {min_files} and {max_files}"
+            errors.append(
+                f"production file count must be between {min_files} and {max_files}, got {len(files)}"
+            )
         allowed_files = {path for path in context_files if not is_test_path(path)}
         invalid_files = sorted(files - allowed_files)
         if invalid_files:
-            return f"mutation files outside whitelist: {invalid_files}"
-        if not require_generated_tests:
-            return ""
-        tests_valid = len(tests) == 1 and all(
-            isinstance(row, dict)
-            and is_safe_repo_path(str(row.get("path") or ""))
-            and str(row.get("path") or "").startswith("test/units/")
-            and str(row.get("path") or "").endswith(".py")
-            and str(row.get("content") or "").strip()
-            for row in tests
-        )
-        if not tests_valid:
-            return "tests must contain safe test paths and complete nonempty content"
-        return ""
+            errors.append(f"mutation files outside whitelist: {invalid_files}")
+        if require_generated_tests:
+            tests_valid = len(tests) == 1 and all(
+                isinstance(row, dict)
+                and is_safe_repo_path(str(row.get("path") or ""))
+                and str(row.get("path") or "").startswith("test/units/")
+                and str(row.get("path") or "").endswith(".py")
+                and str(row.get("content") or "").strip()
+                for row in tests
+            )
+            if not tests_valid:
+                errors.append(
+                    "tests must contain safe test paths and complete nonempty content"
+                )
+        return "; ".join(errors)
 
     def _write_tests(self, root: Path, tests: Sequence[Dict[str, Any]]) -> bool:
         if len(tests) != 1:
@@ -1709,18 +1759,11 @@ class RepoChainGenerator:
                 or edit["before"] == edit["after"]
             ):
                 return [], f"edit {index} has an unsafe path, empty before, or no-op replacement"
-            before_comments = {
-                line.strip()
-                for line in edit["before"].splitlines()
-                if line.strip().startswith("#")
-            }
-            added_comments = [
-                line.strip()
-                for line in edit["after"].splitlines()
-                if line.strip().startswith("#") and line.strip() not in before_comments
-            ]
-            if added_comments:
-                return [], f"edit {index} adds comments that may reveal the generated regression"
+            edit["after"] = self._strip_added_comment_lines(
+                edit["before"], edit["after"]
+            )
+            if edit["before"] == edit["after"]:
+                return [], f"edit {index} is a no-op once added comments are removed"
             path = root / edit["file"]
             if not path.is_file() or path.suffix != ".py":
                 return [], f"edit {index} target is not a Python production file"
@@ -1771,6 +1814,30 @@ class RepoChainGenerator:
         for relative, source in proposed_sources.items():
             (root / relative).write_text(source, encoding="utf-8")
         return normalized, ""
+
+    @staticmethod
+    def _strip_added_comment_lines(before: str, after: str) -> str:
+        """Drop whole-line comments the model added on top of ``before``.
+
+        Only standalone comment lines are matched, so removing them cannot
+        change behaviour, and the caller re-parses every edited file before
+        anything is written. Rejecting the whole edit instead used to end more
+        attempts than every other guard combined.
+        """
+        before_comments = {
+            line.strip()
+            for line in before.splitlines()
+            if line.strip().startswith("#")
+        }
+        kept = [
+            line
+            for line in after.splitlines(keepends=True)
+            if not (
+                line.strip().startswith("#")
+                and line.strip() not in before_comments
+            )
+        ]
+        return "".join(kept)
 
     def _align_edit_indentation(
         self,
