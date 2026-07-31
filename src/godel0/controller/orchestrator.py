@@ -497,8 +497,14 @@ class EvolutionOrchestrator:
                     payload={"score": parent.node_score},
                 )
 
-                diagnosis = self._prepare_diagnosis(parent)
-                child_result = self._build_child(parent, diagnosis)
+                diagnosis_mode = str(
+                    getattr(self.config.diagnosis, "mode", "hgm_dual") or "hgm_dual"
+                ).strip().lower()
+                if diagnosis_mode == "joint":
+                    diagnosis = self._prepare_diagnosis(parent)
+                    child_result = self._build_child(parent, diagnosis)
+                else:
+                    child_result = self._build_dual_hgm_child(parent)
                 if not child_result or not child_result.passed:
                     errs = child_result.errors if child_result else ["No result"]
                     print(f"Child build failed: {errs}")
@@ -1353,6 +1359,130 @@ class EvolutionOrchestrator:
             raise RuntimeError("A persisted joint-cycle diagnosis is required")
         return self.child_builder.build(
             parent, diagnosis, self.config.models.self_improve_model
+        )
+
+    def _build_dual_hgm_child(self, parent):
+        """HGM-style dual expansion: proposer failure then solver failure self-edit."""
+        from ..evolution.child_builder import ChildBuildResult
+        from ..evolution.entry_selector import (
+            choose_proposer_failure,
+            choose_solver_failure,
+        )
+        from ..evolution.hgm_diagnose import HgmDiagnoseClips, HgmEntryDiagnoser
+
+        if self.child_builder is None:
+            return ChildBuildResult(passed=True, node=None)
+
+        clips = HgmDiagnoseClips(
+            md_log_clip_chars=int(self.config.diagnosis.md_log_clip_chars),
+            eval_log_clip_chars=int(self.config.diagnosis.eval_log_clip_chars),
+            predicted_patch_clip_chars=int(
+                self.config.diagnosis.predicted_patch_clip_chars
+            ),
+            code_dump_clip_chars=int(self.config.diagnosis.code_dump_clip_chars),
+        )
+        chat_adapter = None
+        diagnose_model = self.config.models.diagnose_model
+        if getattr(self, "diagnoser", None) is not None:
+            chat_adapter = getattr(self.diagnoser, "chat_adapter", None)
+            diagnose_model = (
+                getattr(self.diagnoser, "model", None) or diagnose_model
+            )
+        diagnoser = HgmEntryDiagnoser(
+            chat_adapter=chat_adapter,
+            model=diagnose_model,
+            clips=clips,
+        )
+
+        agent_repo = Path(self.config.paths.agent_repo)
+        proposer_dir = self.run_context.paths.proposer_dir(parent.node_id)
+        scratch_solver_root = (
+            Path(self.config.execution.scratch_root)
+            / self.run_context.run_id
+            / "solver"
+            / parent.node_id
+        )
+        task_store_root = Path(self.config.paths.task_store)
+
+        proposer_entry = choose_proposer_failure(proposer_dir, rng=random)
+        solver_entry = choose_solver_failure(
+            level2_result_path=(
+                Path(parent.level2_result_path) if parent.level2_result_path else None
+            ),
+            level1_result_path=(
+                Path(parent.level1_result_path) if parent.level1_result_path else None
+            ),
+            scratch_solver_root=scratch_solver_root,
+            task_store_root=task_store_root,
+            rng=random,
+        )
+
+        proposer_diagnosis = None
+        solver_diagnosis = None
+        if proposer_entry is not None:
+            print(
+                f"HGM dual: proposer failure entry={proposer_entry.candidate_id} "
+                f"reason={proposer_entry.reason[:120]!r}"
+            )
+            proposer_diagnosis = diagnoser.diagnose_proposer(
+                node_id=parent.node_id,
+                entry=proposer_entry,
+                agent_repo=agent_repo,
+            )
+            # Persist on parent for lineage debugging.
+            self.run_context.paths.ensure_node_dirs(parent.node_id)
+            atomic_write_json(
+                self.run_context.paths.diagnosis_dir(parent.node_id)
+                / "hgm_proposer_entry.json",
+                proposer_entry.to_dict(),
+            )
+            atomic_write_json(
+                self.run_context.paths.diagnosis_dir(parent.node_id)
+                / "hgm_proposer_diagnosis.json",
+                proposer_diagnosis.model_dump(mode="json"),
+            )
+        else:
+            print("HGM dual: no proposer failure entry; skipping proposer phase")
+
+        if solver_entry is not None:
+            print(
+                f"HGM dual: solver failure entry={solver_entry.task_id} "
+                f"level={solver_entry.level}"
+            )
+            solver_diagnosis = diagnoser.diagnose_solver(
+                node_id=parent.node_id,
+                entry=solver_entry,
+                agent_repo=agent_repo,
+            )
+            self.run_context.paths.ensure_node_dirs(parent.node_id)
+            atomic_write_json(
+                self.run_context.paths.diagnosis_dir(parent.node_id)
+                / "hgm_solver_entry.json",
+                solver_entry.to_dict(),
+            )
+            atomic_write_json(
+                self.run_context.paths.diagnosis_dir(parent.node_id)
+                / "hgm_solver_diagnosis.json",
+                solver_diagnosis.model_dump(mode="json"),
+            )
+        else:
+            print("HGM dual: no solver failure entry; skipping solver phase")
+
+        if proposer_diagnosis is None and solver_diagnosis is None:
+            print(
+                "HGM dual: no failure entries available; falling back to joint diagnosis"
+            )
+            diagnosis = self._prepare_diagnosis(parent)
+            return self._build_child(parent, diagnosis)
+
+        return self.child_builder.build_dual(
+            parent,
+            self.config.models.self_improve_model,
+            proposer_diagnosis=proposer_diagnosis,
+            solver_diagnosis=solver_diagnosis,
+            proposer_entry=proposer_entry.to_dict() if proposer_entry else None,
+            solver_entry=solver_entry.to_dict() if solver_entry else None,
+            allow_empty_phase=True,
         )
 
     def _run_solver_tasks(self, calls: list[dict]) -> list:

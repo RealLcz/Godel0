@@ -3,7 +3,7 @@
 # Emits AGENT_LOOP_WAKE_evolve20 lines for Cursor agent wake-ups.
 set -uo pipefail
 
-GODEL0_ROOT="${GODEL0_ROOT:-/mnt/vast/workspaces/cot_pixel_prediction/jinhe/godel0}"
+GODEL0_ROOT="${GODEL0_ROOT:-/mnt/vast/workspaces/Emergent_Topology/Godel0}"
 INTERVAL_SEC="${WATCH_INTERVAL_SEC:-180}"
 WAKE_LOG="${GODEL0_ROOT}/logs/evolve20_watch_wake.log"
 STATUS_LOG="${GODEL0_ROOT}/logs/evolve20_watch_status.log"

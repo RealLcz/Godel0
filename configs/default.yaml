@@ -37,6 +37,7 @@ scoring:
     num_pseudo_descendant_evals: 10
 
 diagnosis:
+  mode: hgm_dual
   one_primary_root_cause: true
   max_solver_trajectories: 4
   max_proposer_candidates: 4
@@ -46,6 +47,10 @@ diagnosis:
   include_success_contrast: true
   prioritize_special_alerts: true
   special_alert_override_requires_reason: true
+  md_log_clip_chars: 60000
+  eval_log_clip_chars: 30000
+  predicted_patch_clip_chars: 20000
+  code_dump_clip_chars: 200000
 
 special_cases:
   solver_empty_patch_ratio: 0.10

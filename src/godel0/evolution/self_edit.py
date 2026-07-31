@@ -11,21 +11,24 @@ from ..git.repository import diff_vs_commit, run_git
 from ..schemas.diagnosis import CycleDiagnosis
 from .patch_guard import validate_changed_python_syntax
 
-# The coding agent explores with whole-file reads and its message history is
-# never compacted, so a long exploration phase exhausts the model context
-# before any edit is written. Job 213825 lost 31 of 33 self-edits that way.
-# The solver core is checksum-protected, so the budget has to be steered from
-# the instruction side instead.
+# HGM-aligned self-improve protocol: improve the agent for a *class* of
+# failures (not a one-line hotfix). Keep regional reads to protect context,
+# but do not force minimal/single-file edits.
 EDIT_PROTOCOL = """
-Editing protocol (follow it strictly, your context budget is limited):
-- Make the smallest change that addresses the problem. Touch at most 2 files.
-- Locate code with `grep -n` / `sed -n 'A,Bp'`. Never `cat` a file over 200
-  lines; read only the region you need.
-- Write the edit as soon as you have located the target. Do not survey the
-  whole repository first.
-- After editing, re-read only the lines you changed to confirm the file is
-  syntactically intact.
-- Do not create new modules, tests, or documentation.
+Editing protocol (HGM-style self-improve):
+- Implement the diagnosis fully enough to address this *class* of failures.
+  Multiple related files are allowed when needed; do not stop at a cosmetic
+  one-line change if the diagnosis calls for a real mechanism.
+- Prefer extending existing tools / workflows and wiring them into the live
+  path (`forward()`, proposer planners, swesmith helpers) over dead helpers.
+- Locate code with `grep -n` / `sed -n 'A,Bp'`. Prefer reading only the regions
+  you need; avoid dumping entire huge files into context.
+- Do NOT hard-code task-specific repo/file/module/instance names as constants.
+  Concrete names in the issue are illustrative examples only.
+- Do not edit frozen transport schemas (`proposer/request.py`,
+  `proposer/schemas.py`) or unrelated documentation.
+- After editing, re-read the changed regions to confirm they are syntactically
+  intact and actually invoked from the live path.
 """
 
 

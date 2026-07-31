@@ -1,9 +1,8 @@
 run:
-  seed: 7302
-  run_name: "ansible_evolve20_existing20"
-  max_nodes: 20
-  max_expansions: 200
-  bootstrap_only: false
+  seed: 7301
+  run_name: "ansible_evolve20_grounded10"
+  max_nodes: 10
+  max_expansions: 100
 
 models:
   agent_model: "Qwen/Qwen3.6-35B-A3B"
@@ -16,7 +15,6 @@ agent:
   max_tool_errors: 5
   trajectory_format: "jsonl"
   self_evolve_timeout_sec: 1800
-  self_evolve_max_attempts: 3
 
 tasks:
   batch_size: 10
@@ -35,30 +33,15 @@ scoring:
     strategy: thompson_sampling
     num_pseudo_descendant_evals: 10
 
-diagnosis:
-  mode: hgm_dual
-  md_log_clip_chars: 60000
-  eval_log_clip_chars: 30000
-  predicted_patch_clip_chars: 20000
-  code_dump_clip_chars: 200000
-
 evaluation:
   solver_rollouts: 1
   deterministic: true
   level1_timeout_sec: 1200
   level2_timeout_sec: 1200
-  # Level1/Level2 were fully serial at ~25 min per task, which alone put a
-  # 20-epoch run past the 7-day wall clock.
-  max_workers: 4
-  record_causal_diagnostics: true
-  causal_ablation_hard_gate: false
+  max_workers: 1
 
 proposer:
   initial_workflow: repo_chain
-  candidate_timeout_sec: 180
-  # One plan per proposer chunk × generous cap: a slow plan cannot take the
-  # whole bootstrap down with it (211728 died on one 900s chunk timeout).
-  batch_timeout_sec: 1800
   repo_chain:
     min_files: 2
     max_files: 6
@@ -67,21 +50,16 @@ proposer:
     context_file_budget: 10
     require_generated_contracts: false
     require_causal_ablation: true
-    local_causal_ablation_mode: diagnostic
-    bootstrap_plans_per_call: 1
-    # Child batches were asking for all 10 tasks in one call and every chunk
-    # was SIGTERM'd at batch_timeout_sec with nothing persisted (job 213825).
-    plans_per_call: 1
     mutation_operator: "trajectory_conditioned_chain_mutation"
 
 execution:
   backend: "subprocess"
-  scratch_root: "./scratch_ansible_evolve20_existing20"
+  scratch_root: "./scratch_ansible_evolve20_grounded10"
   clean_env: true
   network_disabled: true
 
 paths:
   agent_repo: "./agent_repo_ansible_evolve20_pass1"
   repo_pool: "./repo_pool"
-  runs: "./runs_ansible_evolve20_existing20"
-  task_store: "./task_store_ansible_evolve20_existing20"
+  runs: "./runs_ansible_evolve20_grounded10"
+  task_store: "./task_store_ansible_evolve20_grounded10"

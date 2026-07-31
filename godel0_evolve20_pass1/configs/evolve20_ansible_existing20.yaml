@@ -16,7 +16,6 @@ agent:
   max_tool_errors: 5
   trajectory_format: "jsonl"
   self_evolve_timeout_sec: 1800
-  self_evolve_max_attempts: 3
 
 tasks:
   batch_size: 10
@@ -47,9 +46,7 @@ evaluation:
   deterministic: true
   level1_timeout_sec: 1200
   level2_timeout_sec: 1200
-  # Level1/Level2 were fully serial at ~25 min per task, which alone put a
-  # 20-epoch run past the 7-day wall clock.
-  max_workers: 4
+  max_workers: 1
   record_causal_diagnostics: true
   causal_ablation_hard_gate: false
 
@@ -69,9 +66,6 @@ proposer:
     require_causal_ablation: true
     local_causal_ablation_mode: diagnostic
     bootstrap_plans_per_call: 1
-    # Child batches were asking for all 10 tasks in one call and every chunk
-    # was SIGTERM'd at batch_timeout_sec with nothing persisted (job 213825).
-    plans_per_call: 1
     mutation_operator: "trajectory_conditioned_chain_mutation"
 
 execution:

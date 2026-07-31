@@ -126,6 +126,9 @@ class ScoringConfig:
 
 @dataclass(frozen=True)
 class DiagnosisConfig:
+    # "hgm_dual": Proposer failure entry then Solver failure entry (default).
+    # "joint": legacy aggregate CycleDiagnoser path (ablation only).
+    mode: str = "hgm_dual"
     one_primary_root_cause: bool = True
     max_solver_trajectories: int = 4
     max_proposer_candidates: int = 4
@@ -135,6 +138,11 @@ class DiagnosisConfig:
     include_success_contrast: bool = True
     prioritize_special_alerts: bool = True
     special_alert_override_requires_reason: bool = True
+    # HGM-style diagnose clipping (Strategy A).
+    md_log_clip_chars: int = 60000
+    eval_log_clip_chars: int = 30000
+    predicted_patch_clip_chars: int = 20000
+    code_dump_clip_chars: int = 200000
 
 
 @dataclass(frozen=True)
