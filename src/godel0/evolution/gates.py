@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
 import importlib.util
 import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
-from ..errors import ToolRegistrationError
+REQUIRED_SCHEMA_CLASSES = {
+    "BugConstraints",
+    "FailureSignature",
+    "BugGenerationPlan",
+    "CodeTarget",
+}
+
+BYPASS_SCHEMA_FIELD_NAMES = {
+    "skip_validation",
+    "force_accept",
+    "accept_on_error",
+}
 
 
 def sha256_file(p: Path) -> str:
@@ -20,6 +30,80 @@ def sha256_file(p: Path) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return "sha256:" + h.hexdigest()
+
+
+def load_module_from_path(module_name: str, path: Path):
+    """Load a Python module from an arbitrary filesystem path."""
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def validate_proposer_schema_compatibility(node_code_dir: Path) -> list[str]:
+    """Ensure evolvable proposer/schemas.py stays compatible with legacy payloads."""
+    errors: list[str] = []
+    node_code_dir = Path(node_code_dir)
+    schemas_path = node_code_dir / "proposer" / "schemas.py"
+    if not schemas_path.is_file():
+        return ["proposer/schemas.py is missing"]
+
+    try:
+        module = load_module_from_path(
+            f"candidate_proposer_schemas_{schemas_path.stat().st_mtime_ns}",
+            schemas_path,
+        )
+    except Exception as exc:
+        return [f"proposer/schemas.py failed to import: {exc}"]
+
+    for class_name in REQUIRED_SCHEMA_CLASSES:
+        if not hasattr(module, class_name):
+            errors.append(f"missing schema class: {class_name}")
+
+    if errors:
+        return errors
+
+    for class_name in REQUIRED_SCHEMA_CLASSES:
+        cls = getattr(module, class_name)
+        model_fields = getattr(cls, "model_fields", {}) or {}
+        for forbidden in BYPASS_SCHEMA_FIELD_NAMES:
+            if forbidden in model_fields:
+                errors.append(
+                    f"{class_name} introduces trusted-validation bypass field: {forbidden}"
+                )
+
+    legacy_plan_payload = {
+        "plan_id": "compat-plan",
+        "target_repo_id": "repo",
+        "target_base_commit": "abc",
+        "target_file": "src/example.py",
+        "strategy": "repo_chain",
+    }
+
+    try:
+        module.BugGenerationPlan.model_validate(legacy_plan_payload)
+    except Exception as exc:
+        errors.append(
+            "BugGenerationPlan no longer accepts a legacy payload: " f"{exc}"
+        )
+
+    legacy_constraints_payload = {
+        "min_modified_files": 1,
+        "max_modified_files": 1,
+        "max_modified_lines": 20,
+    }
+
+    try:
+        module.BugConstraints.model_validate(legacy_constraints_payload)
+    except Exception as exc:
+        errors.append(
+            "BugConstraints no longer accepts a legacy payload: " f"{exc}"
+        )
+
+    return errors
 
 
 @dataclass
@@ -149,5 +233,10 @@ class ProposerExtensionGate:
                 report.passed = False
                 report.errors.append("Proposer reads trusted private inputs")
 
-        report.schemas_parseable = True
+        schema_errors = validate_proposer_schema_compatibility(node_code_dir)
+        report.schemas_parseable = not schema_errors
+        if schema_errors:
+            report.passed = False
+            report.errors.extend(schema_errors)
+
         return report

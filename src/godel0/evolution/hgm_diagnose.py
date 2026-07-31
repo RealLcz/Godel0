@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from ..errors import SchemaValidationError
 from ..schemas.diagnosis import CycleDiagnosis
@@ -26,56 +27,144 @@ def clip_text(text: str, max_chars: int) -> str:
     return text[:head] + marker + text[-tail:]
 
 
-DIAGNOSE_SYSTEM_TEMPLATE = """Here is the implementation of the agent.
+DIAGNOSE_SYSTEM_TEMPLATE = """You are diagnosing one observed failure of an
+evolvable software agent.
 
-{code_summary}
+Your goal is to identify exactly ONE general capability defect in the current
+agent implementation and propose exactly ONE coherent improvement.
 
-# Agent Implementation
+The observed failure is evidence for the diagnosis, not the target of the
+modification. Do not propose a task-specific fix, repository-specific rule,
+hard-coded identifier, expected patch, or benchmark-specific behavior.
+
+Prefer the smallest coherent mechanism that could plausibly have changed the
+observed trajectory. A general improvement may touch multiple production files
+when necessary, but breadth is not a virtue and a new subsystem is not required.
+
+Distinguish carefully between:
+
+1. a capability failure in the evolvable agent;
+2. an infrastructure or execution failure;
+3. a rejection produced by a trusted evaluator.
+
+Do not convert infrastructure failures into agent capability proposals.
+Do not weaken, bypass, redefine, or imitate trusted evaluation behavior.
+
+You will be shown a focused subset of the current agent implementation and one
+failure entry. Ground the root cause and proposed edit in the supplied evidence.
+
+{role_constraints}
+
+# Relevant Agent Implementation
 ----- Agent Implementation Start -----
 {code}
 ----- Agent Implementation End -----
+"""
 
-Your task is to identify ONE detailed plan that would help the agent actually
-handle failures like the ones shown in the logs. The improvement must be
-GENERAL (no task-specific hardcoding).
+PROPOSER_DIAGNOSIS_CONSTRAINTS = """You are diagnosing the Proposer.
+
+The trusted candidate validator defines the task specification. It is not an
+obstacle for the Proposer to bypass.
+
+Never propose or implement any of the following:
+
+- marking a candidate as passed after an exception;
+- accepting a candidate when causal isolation could not be executed;
+- skipping causal isolation or causal ablation;
+- lowering trusted acceptance thresholds;
+- fabricating validation metadata or causal statistics;
+- changing trusted pass/fail semantics;
+- hiding answer leakage through superficial lexical rewriting alone;
+- editing proposer/request.py;
+- editing trusted-controller code.
+
+A rejected candidate is negative evidence about upstream generation. Improve
+target selection, planning, patch construction, mutation execution, issue
+generation, or candidate robustness so that future candidates genuinely satisfy
+the existing validation contract.
+
+Choose one primary failure mechanism. If the candidate has multiple rejection
+reasons, select the earliest causal reason that explains the later failures.
+"""
+
+SOLVER_DIAGNOSIS_CONSTRAINTS = """You are diagnosing the Solver.
+
+Improve the Solver's general coding behavior. Relevant edit surfaces may include:
+
+- the live workflow in coding_agent.py;
+- prompts used by the live forward path;
+- existing tool descriptions or implementations;
+- context management and tool-loop behavior;
+- verification or testing behavior already present in the agent.
+
+Do not:
+
+- encode the observed task, repository, file, symbol, or expected patch;
+- copy private-test behavior into the agent;
+- force one particular tool on every task unless the evidence demonstrates a
+  general workflow failure;
+- build a large evaluation framework when a focused prompt, workflow, or
+  existing-tool change addresses the observed defect;
+- modify benchmark, trusted evaluation, or task-generation code.
+
+Choose exactly one capability defect supported by the trajectory. Prefer a
+focused change to the current live workflow over introducing a new subsystem.
 """
 
 DIAGNOSE_USER_TEMPLATE = """{intro}
 
-# Failure Case / Issue
------ Issue Start -----
+# Failure Case
+----- Failure Case Start -----
 {github_issue}
------ Issue End -----
+----- Failure Case End -----
 
 # Agent Run Log
 ----- Agent Run Log Start -----
 {md_log}
 ----- Agent Run Log End -----
 
-# Predicted / Generated Patch
+# Generated / Predicted Patch
 ----- Patch Start -----
 {predicted_patch}
 ----- Patch End -----
 
-# Evaluation / Validation Results
------ Eval Start -----
+# Evaluation / Validation Result
+----- Evaluation Start -----
 {eval_log}
------ Eval End -----
+----- Evaluation End -----
 
-Respond precisely in the following format including the JSON start and end markers:
+Return one JSON object between the required JSON markers.
 
-```json
-<JSON>
-```
+The JSON must contain:
 
-In <JSON>, provide a JSON response with the following fields:
-- "log_summarization": Analyze the run log, patch, and eval results. What went wrong?
-- "potential_improvements": Concrete improvements grounded in the evidence.
-- "improvement_proposal": ONE high-impact improvement in detail.
-- "implementation_suggestion": What to change in the agent code (wire into live paths; no hard-coded task constants).
-- "problem_description": Phrase the proposal as a GitHub-issue-style description an engineer can implement.
+- "failure_summary":
+  Briefly state what happened in this run.
 
-Your response will be automatically parsed. Do NOT include the `<JSON>` tag in your output.
+- "primary_root_cause":
+  Exactly one agent capability defect supported by the evidence.
+
+- "generalization":
+  Explain why the defect is broader than this one instance.
+
+- "single_improvement":
+  Exactly one coherent capability improvement.
+
+- "edit_scope":
+  A list of the live files or components most likely to require changes.
+  Keep this focused.
+
+- "implementation_suggestion":
+  A concrete implementation direction. Prefer adapting an existing workflow,
+  prompt, or tool over creating a new subsystem.
+
+- "expected_behavior_change":
+  State what should be observably different in a future run.
+
+- "problem_description":
+  A concise GitHub-issue-style task that another coding agent can implement.
+
+Do not include multiple alternative improvements. Do not include task-specific
+identifiers as implementation constants.
 """
 
 PROBLEM_DESCRIPTION_WRAP = """{code_summary}
@@ -88,11 +177,10 @@ PROBLEM_DESCRIPTION_WRAP = """{code_summary}
 
 ---
 
-**REMINDER — implement the full diagnosis:**
-- Do not leave helper functions or modules dead/unused. Wire changes into the live path.
-- Focus on making the agent handle **this class of failures** correctly.
-- FORBIDDEN: hard-coding task-specific identifiers (repo/file/module/instance names) as constants.
-- Prefer data-driven mechanisms computed from the problem statement and repo state.
+**Constraints:**
+- Wire changes into the live runtime path; do not leave unused helpers.
+- Keep the improvement general; do not hard-code task-specific identifiers.
+- Prefer adapting an existing workflow, prompt, or tool over a new subsystem.
 """
 
 PROPOSER_INTRO = (
@@ -104,13 +192,50 @@ SOLVER_INTRO = (
     "Here is the log for the coding agent trying to solve a repository issue but failed."
 )
 
+DANGEROUS_DIAGNOSIS_PATTERNS = (
+    "passed=true",
+    "passed = true",
+    "accept on exception",
+    "accept after exception",
+    "skip causal",
+    "bypass validation",
+    "lower the threshold",
+    "reduce the threshold",
+    "force accept",
+    "fabricate",
+    "proposer/request.py",
+)
+
+# Earliest causal rejection reasons preferred for proposer diagnosis.
+_PRIMARY_REJECTION_PRIORITY = (
+    "execution",
+    "setup",
+    "malformed",
+    "non-applicable",
+    "apply",
+    "syntax",
+    "import",
+    "no_f2p",
+    "fail_to_pass",
+    "fail-to-pass",
+    "f2p",
+    "causal",
+    "ablation",
+    "statement",
+    "leakage",
+    "duplicate",
+    "calibration",
+    "diversity",
+)
+
 
 @dataclass
 class HgmDiagnoseClips:
     md_log_clip_chars: int = 60_000
     eval_log_clip_chars: int = 30_000
     predicted_patch_clip_chars: int = 20_000
-    code_dump_clip_chars: int = 200_000
+    code_dump_clip_chars: int = 80_000
+    max_code_files: int = 12
 
 
 def wrap_problem_statement(
@@ -126,15 +251,77 @@ def wrap_problem_statement(
     ).strip()
 
 
+def select_primary_rejection_reason(reasons: Sequence[str]) -> str:
+    """Pick the earliest causal rejection reason from a list."""
+    cleaned = [str(r).strip() for r in reasons if str(r).strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+
+    def priority(reason: str) -> int:
+        lower = reason.lower()
+        for idx, token in enumerate(_PRIMARY_REJECTION_PRIORITY):
+            if token in lower:
+                return idx
+        return len(_PRIMARY_REJECTION_PRIORITY)
+
+    return sorted(cleaned, key=priority)[0]
+
+
+def _diagnosis_blob(data: Dict[str, Any]) -> str:
+    parts = []
+    for key in (
+        "failure_summary",
+        "primary_root_cause",
+        "generalization",
+        "single_improvement",
+        "implementation_suggestion",
+        "expected_behavior_change",
+        "problem_description",
+        "problem_statement",
+        "edit_scope",
+    ):
+        value = data.get(key)
+        if value is None:
+            continue
+        parts.append(str(value))
+    return "\n".join(parts).lower()
+
+
+def reject_dangerous_diagnosis(data: Dict[str, Any]) -> None:
+    """Raise if the diagnosis proposes trusted-validator bypasses."""
+    blob = _diagnosis_blob(data)
+    for pattern in DANGEROUS_DIAGNOSIS_PATTERNS:
+        if pattern in blob:
+            raise SchemaValidationError(
+                f"diagnosis proposes forbidden trusted-boundary change: {pattern}"
+            )
+    effect = str(data.get("trusted_boundary_effect") or "preserve").strip().lower()
+    if effect and effect != "preserve":
+        raise SchemaValidationError(
+            "trusted_boundary_effect must be 'preserve'"
+        )
+
+
 def build_proposer_diagnose_messages(
     entry: ProposerFailureEntry,
     code_dump: str,
     clips: HgmDiagnoseClips,
 ) -> tuple[str, str]:
+    reasons = []
+    if entry.validation_report:
+        raw = entry.validation_report.get("rejection_reasons") or []
+        if isinstance(raw, list):
+            reasons = [str(r) for r in raw]
+    primary_reason = select_primary_rejection_reason(reasons) or entry.reason
+
     issue_parts = [
         f"candidate_id: {entry.candidate_id}",
-        f"rejection_reason: {entry.reason or '(none)'}",
+        f"primary_rejection_reason: {primary_reason or '(none)'}",
     ]
+    if reasons:
+        issue_parts.append("all_rejection_reasons:\n- " + "\n- ".join(reasons))
     if entry.problem_statement.strip():
         issue_parts.append("generated_problem_statement:\n" + entry.problem_statement)
     elif entry.validation_report:
@@ -159,7 +346,6 @@ def build_proposer_diagnose_messages(
     predicted = entry.mutation_diff or entry.bug_patch or "(no patch artifact)"
     eval_log = entry.failing_test_output.strip()
     if not eval_log:
-        reasons = entry.validation_report.get("rejection_reasons") if entry.validation_report else None
         eval_log = (
             json.dumps(reasons, indent=2, default=str)
             if reasons
@@ -167,7 +353,7 @@ def build_proposer_diagnose_messages(
         )
 
     system = DIAGNOSE_SYSTEM_TEMPLATE.format(
-        code_summary=role_code_summary("proposer"),
+        role_constraints=PROPOSER_DIAGNOSIS_CONSTRAINTS.strip(),
         code=clip_text(code_dump, clips.code_dump_clip_chars),
     )
     user = DIAGNOSE_USER_TEMPLATE.format(
@@ -190,7 +376,7 @@ def build_solver_diagnose_messages(
         "No problem_statement.md was found in the task store."
     )
     system = DIAGNOSE_SYSTEM_TEMPLATE.format(
-        code_summary=role_code_summary("solver"),
+        role_constraints=SOLVER_DIAGNOSIS_CONSTRAINTS.strip(),
         code=clip_text(code_dump, clips.code_dump_clip_chars),
     )
     user = DIAGNOSE_USER_TEMPLATE.format(
@@ -217,13 +403,42 @@ def parse_diagnose_json(response: str) -> Dict[str, Any]:
         raise SchemaValidationError("Could not parse diagnose LLM response as JSON")
     if not isinstance(data, dict):
         raise SchemaValidationError("Diagnose LLM JSON must be an object")
-    if not str(data.get("implementation_suggestion") or "").strip():
-        raise SchemaValidationError("missing implementation_suggestion")
+
+    # Accept limited legacy aliases.
+    if not str(data.get("primary_root_cause") or "").strip():
+        legacy = data.get("improvement_proposal") or data.get("failure_summary")
+        if legacy:
+            data["primary_root_cause"] = legacy
+    if not str(data.get("single_improvement") or "").strip():
+        legacy = data.get("improvement_proposal")
+        if legacy:
+            data["single_improvement"] = legacy
     if not str(data.get("problem_description") or "").strip():
-        # Accept problem_statement alias.
-        if not str(data.get("problem_statement") or "").strip():
-            raise SchemaValidationError("missing problem_description")
-        data["problem_description"] = data["problem_statement"]
+        if str(data.get("problem_statement") or "").strip():
+            data["problem_description"] = data["problem_statement"]
+
+    required = {
+        "primary_root_cause",
+        "single_improvement",
+        "implementation_suggestion",
+        "expected_behavior_change",
+        "problem_description",
+    }
+    missing = [key for key in required if not str(data.get(key) or "").strip()]
+    if missing:
+        raise SchemaValidationError(
+            "missing required diagnosis fields: " + ", ".join(missing)
+        )
+
+    edit_scope = data.get("edit_scope") or []
+    if not isinstance(edit_scope, list):
+        raise SchemaValidationError("diagnosis edit_scope must be a list")
+    if len(edit_scope) > 4:
+        raise SchemaValidationError(
+            "diagnosis edit_scope must contain at most four focused components"
+        )
+
+    reject_dangerous_diagnosis(data)
     return data
 
 
@@ -248,9 +463,14 @@ class HgmEntryDiagnoser:
         node_id: str,
         entry: ProposerFailureEntry,
         agent_repo: Path,
-    ) -> CycleDiagnosis:
+    ) -> Optional[CycleDiagnosis]:
+        evidence_hints = self._proposer_evidence_hints(entry)
         code = dump_agent_code(
-            agent_repo, "proposer", max_chars=self.clips.code_dump_clip_chars
+            agent_repo,
+            "proposer",
+            max_chars=self.clips.code_dump_clip_chars,
+            max_files=self.clips.max_code_files,
+            evidence_hints=evidence_hints,
         )
         system, user = build_proposer_diagnose_messages(entry, code, self.clips)
         return self._run(
@@ -267,9 +487,14 @@ class HgmEntryDiagnoser:
         node_id: str,
         entry: SolverFailureEntry,
         agent_repo: Path,
-    ) -> CycleDiagnosis:
+    ) -> Optional[CycleDiagnosis]:
+        evidence_hints = self._solver_evidence_hints(entry)
         code = dump_agent_code(
-            agent_repo, "solver", max_chars=self.clips.code_dump_clip_chars
+            agent_repo,
+            "solver",
+            max_chars=self.clips.code_dump_clip_chars,
+            max_files=self.clips.max_code_files,
+            evidence_hints=evidence_hints,
         )
         system, user = build_solver_diagnose_messages(entry, code, self.clips)
         return self._run(
@@ -280,6 +505,48 @@ class HgmEntryDiagnoser:
             evidence_id=entry.task_id,
         )
 
+    def _proposer_evidence_hints(self, entry: ProposerFailureEntry) -> List[str]:
+        blob = " ".join(
+            [
+                entry.reason or "",
+                entry.stdout_log or "",
+                entry.stderr_log or "",
+                json.dumps(entry.validation_report or {}, default=str),
+            ]
+        )
+        hints: List[str] = []
+        for token in re.findall(r"[\w./-]+\.py", blob):
+            if token.startswith(("proposer/", "swesmith/")):
+                hints.append(token)
+        lower = blob.lower()
+        if "statement" in lower or "leak" in lower:
+            hints.append("proposer/")
+        if "causal" in lower or "ablation" in lower:
+            hints.append("swesmith/")
+        if "mutation" in lower or "patch" in lower:
+            hints.append("swesmith/")
+        return hints
+
+    def _solver_evidence_hints(self, entry: SolverFailureEntry) -> List[str]:
+        blob = " ".join(
+            [
+                entry.trajectory_text or "",
+                entry.eval_log or "",
+                entry.failing_test_output or "",
+            ]
+        )
+        hints: List[str] = []
+        for token in re.findall(r"(?:tools|prompts|utils)/[\w./-]+\.py", blob):
+            hints.append(token)
+        lower = blob.lower()
+        if "llm.py" in lower or "model routing" in lower or "context" in lower:
+            hints.append("llm.py")
+        if "prompt" in lower:
+            hints.append("prompts/")
+        if "tool" in lower:
+            hints.append("tools/")
+        return hints
+
     def _run(
         self,
         *,
@@ -288,7 +555,7 @@ class HgmEntryDiagnoser:
         system: str,
         user: str,
         evidence_id: str,
-    ) -> CycleDiagnosis:
+    ) -> Optional[CycleDiagnosis]:
         last_error: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
             try:
@@ -299,26 +566,60 @@ class HgmEntryDiagnoser:
                     implementation_suggestion=str(data["implementation_suggestion"]),
                     problem_description=str(data["problem_description"]),
                 )
-                scopes = (
-                    ["proposer_logic", "proposer_prompt"]
-                    if role == "proposer"
-                    else ["coding_agent", "solver_prompt", "tools"]
-                )
+                edit_scope = data.get("edit_scope") or []
+                if role == "proposer":
+                    default_scopes = ["proposer_logic", "proposer_prompt"]
+                else:
+                    default_scopes = ["coding_agent", "solver_prompt", "tools"]
+                allowed = {
+                    "coding_agent",
+                    "solver_prompt",
+                    "proposer_prompt",
+                    "proposer_logic",
+                    "tools",
+                    "llm_withtools",
+                    "utils",
+                    "requirements",
+                }
+                scopes = []
+                for item in edit_scope:
+                    token = str(item).strip()
+                    if token in allowed:
+                        scopes.append(token)
+                    elif token.startswith("proposer/") or "proposer" in token:
+                        scopes.append("proposer_logic")
+                    elif token.startswith("tools/") or token == "tools":
+                        scopes.append("tools")
+                    elif "prompt" in token:
+                        scopes.append(
+                            "proposer_prompt" if role == "proposer" else "solver_prompt"
+                        )
+                    elif token in {"coding_agent.py", "llm_withtools.py", "llm.py"}:
+                        scopes.append(
+                            "llm_withtools" if "llm" in token else "coding_agent"
+                        )
+                    elif token.startswith("utils/"):
+                        scopes.append("utils")
+                if not scopes:
+                    scopes = default_scopes
+                # Deduplicate while preserving order.
+                scopes = list(dict.fromkeys(scopes))[:4]
                 return CycleDiagnosis(
                     node_id=node_id,
-                    primary_root_cause=str(
-                        data.get("improvement_proposal")
-                        or data.get("problem_description")
-                        or ""
-                    )[:2000],
+                    primary_root_cause=str(data["primary_root_cause"])[:2000],
                     selected_alert_id=None,
                     source_stages=[role],
-                    recommended_edit_scopes=scopes,
+                    recommended_edit_scopes=scopes[:4],
                     evidence_ids=[evidence_id],
-                    expected_effects={},
+                    expected_effects={
+                        "expected_behavior_change": str(
+                            data.get("expected_behavior_change") or ""
+                        )[:2000]
+                    },
                     non_goals=[
                         "Do not hardcode task-specific solutions",
                         "Do not invent unrelated refactors",
+                        "Do not bypass trusted validation",
                     ],
                     validation_plan=[
                         "Re-run the failure class that triggered this diagnosis",
@@ -330,53 +631,8 @@ class HgmEntryDiagnoser:
                 last_error = exc
                 if attempt >= self.max_retries:
                     break
-        # Deterministic fallback so expansion can still attempt a self-edit.
-        return self._fallback(node_id=node_id, role=role, evidence_id=evidence_id, error=last_error)
-
-    def _fallback(
-        self,
-        *,
-        node_id: str,
-        role: str,
-        evidence_id: str,
-        error: Optional[Exception],
-    ) -> CycleDiagnosis:
-        if role == "proposer":
-            description = (
-                f"Improve the Proposer so candidates like {evidence_id} pass validation. "
-                "Focus on mutation planning / patch application / contract grounding. "
-                f"Diagnose LLM fallback reason: {error}"
-            )
-            suggestion = (
-                "Inspect proposer/ and swesmith/ paths that produce invalid chain plans "
-                "or fragile patch application during ablation, and make the mechanism robust."
-            )
-            scopes = ["proposer_logic", "proposer_prompt"]
-        else:
-            description = (
-                f"Improve the Solver so it can resolve failures like task {evidence_id}. "
-                "Focus on localization, editing, and using failing-test evidence. "
-                f"Diagnose LLM fallback reason: {error}"
-            )
-            suggestion = (
-                "Inspect coding_agent.py forward() and tools/ to address the failure mode "
-                "shown in the trajectory without hard-coding this task."
-            )
-            scopes = ["coding_agent", "solver_prompt", "tools"]
-        return CycleDiagnosis(
-            node_id=node_id,
-            primary_root_cause=description[:500],
-            source_stages=[role],
-            recommended_edit_scopes=scopes,
-            evidence_ids=[evidence_id],
-            non_goals=["Do not hardcode task-specific solutions"],
-            validation_plan=["Re-run the originating failure class"],
-            problem_statement=wrap_problem_statement(
-                role=role,
-                implementation_suggestion=suggestion,
-                problem_description=description,
-            ),
-        )
+        # Diagnosis failure aborts the mutation; no generic fallback issue.
+        return None
 
     def _call_chat(self, system: str, user: str) -> str:
         if self.chat_adapter is None or not callable(

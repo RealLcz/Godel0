@@ -12,30 +12,36 @@ DEFAULT_REGRESSION_WEIGHT = 0.5
 DEFAULT_PROPOSER_TARGET_ACCURACY = 0.5
 DEFAULT_MIN_PARENT_SOLVED_TASKS = 3
 
-ALLOWED_PATCH_PREFIXES = (
+# Role-specific allowlists for dual-phase PatchGuard.
+# Proposer must not touch solver/shared runtime paths during its phase.
+PROPOSER_ALLOWED_PATCH_PREFIXES = (
+    "proposer/",
+    "swesmith/",
+)
+
+SOLVER_ALLOWED_PATCH_PREFIXES = (
     "coding_agent.py",
-    "llm_withtools.py",
     "llm.py",
+    "llm_withtools.py",
     "tools/",
     "prompts/",
     "utils/",
-    "proposer/",
-    "swesmith/",
-    "tests/",
     "requirements.txt",
+)
+
+# Union used by the legacy joint path and final cumulative checks.
+ALLOWED_PATCH_PREFIXES = (
+    *PROPOSER_ALLOWED_PATCH_PREFIXES,
+    *SOLVER_ALLOWED_PATCH_PREFIXES,
 )
 
 FORBIDDEN_PATCH_PATTERNS = (
     "../",
     "/.git",
     "symlink",
-    # BUG-25: the proposer transport schema must not be self-edited. The
-    # trusted controller-side schema lives in src/godel0/schemas/ which is
-    # outside the agent repo, but the evolvable proposer/request.py carries
-    # the wire format the child process reads. Protect it from self-edit so
-    # a child node cannot drift the protocol.
+    # Transport wire format is permanently frozen; schemas.py may evolve under
+    # a compatibility gate.
     "proposer/request.py",
-    "proposer/schemas.py",
 )
 
 MAX_PATCH_LINES = 80

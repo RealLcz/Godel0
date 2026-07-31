@@ -90,9 +90,21 @@ class RunPaths:
     def mutation_manifest_path(self, node_id: str) -> Path:
         return self.node_dir(node_id) / "mutation_manifest.json"
 
+    def mutation_attempts_dir(self) -> Path:
+        return self.run_dir / "mutation_attempts"
+
+    def mutation_attempts_jsonl(self, parent_node_id: str) -> Path:
+        return self.node_dir(parent_node_id) / "mutation_attempts.jsonl"
+
     def ensure_dirs(self) -> None:
         """Create all top-level run directories."""
-        for d in [self.run_dir, self.nodes_dir, self.root_dir, self.logs_dir]:
+        for d in [
+            self.run_dir,
+            self.nodes_dir,
+            self.root_dir,
+            self.logs_dir,
+            self.mutation_attempts_dir(),
+        ]:
             d.mkdir(parents=True, exist_ok=True)
 
     def ensure_node_dirs(self, node_id: str) -> None:

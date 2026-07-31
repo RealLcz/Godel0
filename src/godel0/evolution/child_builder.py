@@ -2,24 +2,29 @@
 
 from __future__ import annotations
 
-import uuid
 import os
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
-from ..errors import PatchGuardError
+from ..constants import (
+    PROPOSER_ALLOWED_PATCH_PREFIXES,
+    SOLVER_ALLOWED_PATCH_PREFIXES,
+)
+from ..git.repository import commit as git_commit
+from ..git.repository import diff_vs_commit, restore_runtime_artifacts
+from ..git.worktree import NodeWorktree, commit_child
 from ..schemas.diagnosis import CycleDiagnosis
 from ..schemas.mutation import MutationManifest
 from ..schemas.node import NodeRecord, NodeStatus
-from ..git.repository import commit as git_commit, diff_vs_commit
-from ..git.worktree import NodeWorktree, commit_child
-from .patch_guard import PatchGuard, validate_changed_python_syntax
-from .mutation_manifest import build_mutation_manifest
-from .self_edit import SelfEditRunner, SelfEditResult
 from ..storage.atomic import atomic_write_json, atomic_write_text
+from .gates import validate_proposer_schema_compatibility
+from .mutation_manifest import build_mutation_manifest
+from .patch_guard import PatchGuard, validate_changed_python_syntax
+from .self_edit import SelfEditResult, SelfEditRunner
 
 __all__ = [
     "ChildBuildResult",
@@ -37,6 +42,7 @@ class ChildBuildResult:
     proposer_self_edit_result: Optional[SelfEditResult] = None
     solver_self_edit_result: Optional[SelfEditResult] = None
     errors: list[str] = None
+    failure_stage: Optional[str] = None
 
     def __post_init__(self):
         if self.errors is None:
@@ -102,8 +108,10 @@ class ChildBuilder:
                         passed=False,
                         self_edit_result=self_edit_result,
                         errors=[f"Self-edit failed: {self_edit_result.error}"],
+                        failure_stage="self_edit",
                     )
 
+                restore_runtime_artifacts(worktree, parent_commit)
                 patch = diff_vs_commit(worktree, parent_commit)
                 guard_report = self.patch_guard.check(patch)
                 if not guard_report.passed:
@@ -111,6 +119,7 @@ class ChildBuilder:
                         passed=False,
                         self_edit_result=self_edit_result,
                         errors=[f"Patch guard: {r}" for r in guard_report.reasons],
+                        failure_stage="patch_guard",
                     )
 
                 syntax_errors = validate_changed_python_syntax(worktree, patch)
@@ -119,6 +128,7 @@ class ChildBuilder:
                         passed=False,
                         self_edit_result=self_edit_result,
                         errors=[f"Syntax guard: {error}" for error in syntax_errors],
+                        failure_stage="syntax_guard",
                     )
 
                 manifest = build_mutation_manifest(
@@ -136,7 +146,11 @@ class ChildBuilder:
                         manifest=manifest,
                         self_edit_result=self_edit_result,
                         errors=[f"Child gate: {error}" for error in gate_errors],
+                        failure_stage="child_gates",
                     )
+
+                restore_runtime_artifacts(worktree, parent_commit)
+                patch = diff_vs_commit(worktree, parent_commit)
 
                 diagnosis_dir = output_dir.parent / "diagnosis"
                 diagnosis_dir.mkdir(parents=True, exist_ok=True)
@@ -181,6 +195,7 @@ class ChildBuilder:
             return ChildBuildResult(
                 passed=False,
                 errors=[f"Child build error: {str(e)}"],
+                failure_stage="exception",
             )
 
     def build_dual(
@@ -192,7 +207,7 @@ class ChildBuilder:
         solver_diagnosis: Optional[CycleDiagnosis] = None,
         proposer_entry: Optional[dict] = None,
         solver_entry: Optional[dict] = None,
-        allow_empty_phase: bool = True,
+        allow_empty_phase: bool = False,
     ) -> ChildBuildResult:
         """Build one child via sequential proposer then solver self-edits.
 
@@ -205,6 +220,7 @@ class ChildBuilder:
             return ChildBuildResult(
                 passed=False,
                 errors=["No proposer or solver diagnosis provided for dual self-edit"],
+                failure_stage="no_diagnosis",
             )
 
         child_id = f"node_{uuid.uuid4().hex[:12]}"
@@ -252,23 +268,41 @@ class ChildBuilder:
                         base_commit=phase_base,
                     )
                     last_result = proposer_result
+
+                    restore_runtime_artifacts(worktree, phase_base)
                     phase_patch = diff_vs_commit(worktree, phase_base)
-                    if phase_patch.strip():
-                        # Intermediate commit so solver retries cannot wipe this.
+                    if not phase_patch.strip():
+                        if not allow_empty_phase:
+                            return ChildBuildResult(
+                                passed=False,
+                                self_edit_result=proposer_result,
+                                proposer_self_edit_result=proposer_result,
+                                errors=[
+                                    "Proposer self-edit produced no usable patch: "
+                                    + (proposer_result.error or "empty")
+                                ],
+                                failure_stage="proposer_empty_patch",
+                            )
+                    else:
+                        phase_errors = self._validate_phase_patch(
+                            role="proposer",
+                            worktree=worktree,
+                            patch=phase_patch,
+                            base_commit=phase_base,
+                            gates_dir=node_dir / "gates" / "proposer",
+                        )
+                        if phase_errors:
+                            return ChildBuildResult(
+                                passed=False,
+                                self_edit_result=proposer_result,
+                                proposer_self_edit_result=proposer_result,
+                                errors=phase_errors,
+                                failure_stage="proposer_phase_gate",
+                            )
+                        atomic_write_text(proposer_out / "phase.patch", phase_patch)
                         phase_base = git_commit(
                             worktree,
                             f"godel0: proposer self-edit for {child_id}",
-                        )
-                        atomic_write_text(proposer_out / "phase.patch", phase_patch)
-                    elif not allow_empty_phase:
-                        return ChildBuildResult(
-                            passed=False,
-                            self_edit_result=proposer_result,
-                            proposer_self_edit_result=proposer_result,
-                            errors=[
-                                "Proposer self-edit produced no usable patch: "
-                                + (proposer_result.error or "empty")
-                            ],
                         )
 
                 if solver_diagnosis is not None:
@@ -297,20 +331,42 @@ class ChildBuilder:
                         base_commit=phase_base,
                     )
                     last_result = solver_result
-                    phase_patch = diff_vs_commit(worktree, phase_base)
-                    if phase_patch.strip():
-                        atomic_write_text(solver_out / "phase.patch", phase_patch)
-                    elif not allow_empty_phase and proposer_diagnosis is None:
-                        return ChildBuildResult(
-                            passed=False,
-                            self_edit_result=solver_result,
-                            solver_self_edit_result=solver_result,
-                            errors=[
-                                "Solver self-edit produced no usable patch: "
-                                + (solver_result.error or "empty")
-                            ],
-                        )
 
+                    restore_runtime_artifacts(worktree, phase_base)
+                    phase_patch = diff_vs_commit(worktree, phase_base)
+                    if not phase_patch.strip():
+                        if not allow_empty_phase:
+                            return ChildBuildResult(
+                                passed=False,
+                                self_edit_result=solver_result,
+                                proposer_self_edit_result=proposer_result,
+                                solver_self_edit_result=solver_result,
+                                errors=[
+                                    "Solver self-edit produced no usable patch: "
+                                    + (solver_result.error or "empty")
+                                ],
+                                failure_stage="solver_empty_patch",
+                            )
+                    else:
+                        phase_errors = self._validate_phase_patch(
+                            role="solver",
+                            worktree=worktree,
+                            patch=phase_patch,
+                            base_commit=phase_base,
+                            gates_dir=node_dir / "gates" / "solver",
+                        )
+                        if phase_errors:
+                            return ChildBuildResult(
+                                passed=False,
+                                self_edit_result=solver_result,
+                                proposer_self_edit_result=proposer_result,
+                                solver_self_edit_result=solver_result,
+                                errors=phase_errors,
+                                failure_stage="solver_phase_gate",
+                            )
+                        atomic_write_text(solver_out / "phase.patch", phase_patch)
+
+                restore_runtime_artifacts(worktree, parent_commit)
                 patch = diff_vs_commit(worktree, parent_commit)
                 if not patch.strip():
                     return ChildBuildResult(
@@ -319,6 +375,7 @@ class ChildBuilder:
                         proposer_self_edit_result=proposer_result,
                         solver_self_edit_result=solver_result,
                         errors=["Dual self-edit produced no cumulative patch vs parent"],
+                        failure_stage="empty_cumulative_patch",
                     )
 
                 guard_report = self.patch_guard.check(patch)
@@ -329,6 +386,7 @@ class ChildBuilder:
                         proposer_self_edit_result=proposer_result,
                         solver_self_edit_result=solver_result,
                         errors=[f"Patch guard: {r}" for r in guard_report.reasons],
+                        failure_stage="final_patch_guard",
                     )
 
                 syntax_errors = validate_changed_python_syntax(worktree, patch)
@@ -339,6 +397,7 @@ class ChildBuilder:
                         proposer_self_edit_result=proposer_result,
                         solver_self_edit_result=solver_result,
                         errors=[f"Syntax guard: {error}" for error in syntax_errors],
+                        failure_stage="final_syntax_guard",
                     )
 
                 primary_diagnosis = solver_diagnosis or proposer_diagnosis
@@ -366,7 +425,11 @@ class ChildBuilder:
                         proposer_self_edit_result=proposer_result,
                         solver_self_edit_result=solver_result,
                         errors=[f"Child gate: {error}" for error in gate_errors],
+                        failure_stage="child_gates",
                     )
+
+                restore_runtime_artifacts(worktree, parent_commit)
+                patch = diff_vs_commit(worktree, parent_commit)
 
                 atomic_write_json(
                     diagnosis_dir / "diagnosis.json",
@@ -413,7 +476,93 @@ class ChildBuilder:
                 proposer_self_edit_result=proposer_result,
                 solver_self_edit_result=solver_result,
                 errors=[f"Child build error: {str(e)}"],
+                failure_stage="exception",
             )
+
+    def _validate_phase_patch(
+        self,
+        *,
+        role: str,
+        worktree: Path,
+        patch: str,
+        base_commit: str,
+        gates_dir: Path,
+    ) -> list[str]:
+        """Role-specific PatchGuard + syntax + import/schema checks for one phase."""
+        prefixes = (
+            PROPOSER_ALLOWED_PATCH_PREFIXES
+            if role == "proposer"
+            else SOLVER_ALLOWED_PATCH_PREFIXES
+        )
+        guard = PatchGuard(allowed_prefixes=prefixes)
+        report = guard.check(patch)
+        errors: list[str] = []
+        if not report.passed:
+            errors.extend([f"{role} phase patch guard: {r}" for r in report.reasons])
+
+        syntax_errors = validate_changed_python_syntax(worktree, patch)
+        if syntax_errors:
+            errors.extend([f"{role} phase syntax: {e}" for e in syntax_errors])
+
+        phase_gate_errors = self._run_phase_gates(role, worktree, gates_dir)
+        errors.extend(phase_gate_errors)
+        return errors
+
+    def _run_phase_gates(
+        self, role: str, worktree: Path, gates_dir: Path
+    ) -> list[str]:
+        """Mechanical import/schema gates for a single evolution phase."""
+        gates_dir.mkdir(parents=True, exist_ok=True)
+        errors: list[str] = []
+        env = self._gate_env(worktree)
+
+        if role == "proposer":
+            schema_errors = validate_proposer_schema_compatibility(worktree)
+            if schema_errors:
+                errors.extend(
+                    [f"proposer schema compatibility: {e}" for e in schema_errors]
+                )
+            commands = [
+                (
+                    "proposer_help",
+                    [sys.executable, "-B", "-m", "proposer.proposer_main", "--help"],
+                ),
+            ]
+        else:
+            commands = [
+                (
+                    "coding_agent_help",
+                    [sys.executable, "-B", "coding_agent.py", "--help"],
+                ),
+                (
+                    "import_coding_agent",
+                    [sys.executable, "-B", "-c", "import coding_agent"],
+                ),
+                (
+                    "import_llm_withtools",
+                    [sys.executable, "-B", "-c", "import llm_withtools"],
+                ),
+            ]
+
+        for name, command in commands:
+            completed = subprocess.run(
+                command,
+                cwd=worktree,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=600,
+            )
+            log = (
+                f"command: {' '.join(command)}\n"
+                f"exit_code: {completed.returncode}\n"
+                f"stdout:\n{completed.stdout}\n"
+                f"stderr:\n{completed.stderr}\n"
+            )
+            atomic_write_text(gates_dir / f"{name}.txt", log)
+            if completed.returncode != 0:
+                errors.append(f"{role} phase {name} failed with exit {completed.returncode}")
+        return errors
 
     def _run_self_edit(
         self,
@@ -440,17 +589,24 @@ class ChildBuilder:
                 model=model,
             )
 
+    def _gate_env(self, worktree: Path) -> dict:
+        project_root = Path(__file__).resolve().parents[3]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.pathsep.join([str(worktree), str(project_root)])
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        return env
+
     def _run_child_gates(self, worktree: Path, gates_dir: Path) -> list[str]:
         """Validate the whole joint Agent commit in an isolated process."""
         gates_dir.mkdir(parents=True, exist_ok=True)
         project_root = Path(__file__).resolve().parents[3]
-        env = os.environ.copy()
-        env["PYTHONPATH"] = os.pathsep.join([str(worktree), str(project_root)])
+        env = self._gate_env(worktree)
         commands = [
             (
                 "agent_codebase",
                 [
                     sys.executable,
+                    "-B",
                     str(project_root / "scripts" / "validate_agent_codebase.py"),
                     "--code-dir",
                     str(worktree),
@@ -458,13 +614,13 @@ class ChildBuilder:
             ),
             (
                 "proposer_import",
-                [sys.executable, "-m", "proposer.proposer_main", "--help"],
+                [sys.executable, "-B", "-m", "proposer.proposer_main", "--help"],
+            ),
+            (
+                "solver_import",
+                [sys.executable, "-B", "-c", "import coding_agent"],
             ),
         ]
-        if (worktree / "tests").is_dir():
-            commands.append(
-                ("agent_tests", [sys.executable, "-m", "pytest", "-q", "tests"])
-            )
 
         errors: list[str] = []
         for name, command in commands:
@@ -485,4 +641,9 @@ class ChildBuilder:
             atomic_write_text(gates_dir / f"{name}.txt", log)
             if completed.returncode != 0:
                 errors.append(f"{name} failed with exit {completed.returncode}")
+
+        # Final schema compatibility check on the joint child.
+        schema_errors = validate_proposer_schema_compatibility(worktree)
+        if schema_errors:
+            errors.extend([f"schema compatibility: {e}" for e in schema_errors])
         return errors

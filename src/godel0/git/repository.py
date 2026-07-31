@@ -2,21 +2,121 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
 
 from ..errors import GitRefError, WorkspaceError
 
+TRANSIENT_DIR_NAMES = {
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+}
+
+TRANSIENT_SUFFIXES = (
+    ".pyc",
+    ".pyo",
+    ".backup",
+    ".bak",
+)
+
+
+def is_runtime_artifact(path: str) -> bool:
+    """Return whether a path is a runtime/cache artifact that must not enter patches."""
+    normalized = path.replace("\\", "/")
+    parts = normalized.split("/")
+    return (
+        any(part in TRANSIENT_DIR_NAMES for part in parts)
+        or normalized.endswith(TRANSIENT_SUFFIXES)
+    )
+
 
 def _is_transient_untracked_path(path: str) -> bool:
-    """Return whether an untracked path is a runtime/cache artifact."""
-    parts = Path(path).parts
-    return (
-        "__pycache__" in parts
-        or ".pytest_cache" in parts
-        or path.endswith((".pyc", ".pyo"))
-    )
+    """Backward-compatible alias for :func:`is_runtime_artifact`."""
+    return is_runtime_artifact(path)
+
+
+def restore_runtime_artifacts(repo_path: Path, base_commit: str) -> None:
+    """Remove runtime-only changes before constructing an evolution patch."""
+    repo_path = Path(repo_path)
+
+    tracked = run_git(repo_path, "ls-files", "-z").stdout.split("\0")
+    tracked_runtime = [
+        path for path in tracked if path and is_runtime_artifact(path)
+    ]
+
+    if tracked_runtime:
+        run_git(
+            repo_path,
+            "restore",
+            "--source",
+            base_commit,
+            "--worktree",
+            "--",
+            *tracked_runtime,
+        )
+
+    untracked = run_git(
+        repo_path,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ).stdout.split("\0")
+
+    for relative_path in untracked:
+        if not relative_path or not is_runtime_artifact(relative_path):
+            continue
+
+        path = repo_path / relative_path
+        # Prefer removing the whole transient directory (e.g. __pycache__).
+        transient_root = None
+        for parent in [path, *path.parents]:
+            if parent == repo_path:
+                break
+            if parent.name in TRANSIENT_DIR_NAMES:
+                transient_root = parent
+        if transient_root is not None and transient_root.exists():
+            shutil.rmtree(transient_root, ignore_errors=True)
+            continue
+
+        if path.is_file() or path.is_symlink():
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def remove_runtime_artifacts_from_tree(repo_root: Path) -> None:
+    """Delete runtime artifact files/dirs under an agent tree before root commit."""
+    repo_root = Path(repo_root)
+    if not repo_root.is_dir():
+        return
+
+    for path in sorted(repo_root.rglob("*"), reverse=True):
+        try:
+            rel = path.relative_to(repo_root).as_posix()
+        except ValueError:
+            continue
+        if not is_runtime_artifact(rel):
+            continue
+        if path.is_file() or path.is_symlink():
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def assert_no_tracked_runtime_artifacts(repo_path: Path) -> None:
+    """Raise if tracked files include runtime artifacts."""
+    tracked = run_git(repo_path, "ls-files").stdout.splitlines()
+    bad = [path for path in tracked if path and is_runtime_artifact(path)]
+    if bad:
+        raise WorkspaceError(
+            "Tracked runtime artifacts must be removed before root commit: "
+            + ", ".join(bad[:20])
+        )
 
 
 def run_git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -88,11 +188,13 @@ def diff_vs_commit(repo_path: Path, commit: str) -> str:
     untracked_files = untracked_result.stdout.splitlines()
 
     for f in untracked_files:
-        if _is_transient_untracked_path(f):
+        if is_runtime_artifact(f):
             continue
-        devnull = "/dev/null"
+        # Skip tracked paths that somehow appear as untracked runtime noise.
+        if not f:
+            continue
         result = subprocess.run(
-            ["git", "diff", "--no-index", devnull, f],
+            ["git", "diff", "--no-index", "/dev/null", f],
             cwd=repo_path,
             capture_output=True,
             text=True,

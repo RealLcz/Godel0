@@ -24,13 +24,13 @@ def _make_patch(changed_files: list[str]) -> str:
 
 
 class TestPatchGuardProtectsProposerTransport:
-    """BUG-25: proposer/request.py and proposer/schemas.py must be forbidden."""
+    """proposer/request.py stays frozen; schemas.py may evolve under a gate."""
 
     def test_request_py_is_in_forbidden_patterns(self):
         assert "proposer/request.py" in FORBIDDEN_PATCH_PATTERNS
 
-    def test_schemas_py_is_in_forbidden_patterns(self):
-        assert "proposer/schemas.py" in FORBIDDEN_PATCH_PATTERNS
+    def test_schemas_py_is_not_in_forbidden_patterns(self):
+        assert "proposer/schemas.py" not in FORBIDDEN_PATCH_PATTERNS
 
     def test_guard_rejects_request_py_patch(self):
         guard = PatchGuard()
@@ -39,12 +39,30 @@ class TestPatchGuardProtectsProposerTransport:
         assert not report.passed
         assert "proposer/request.py" in report.rejected_files
 
-    def test_guard_rejects_schemas_py_patch(self):
-        guard = PatchGuard()
+    def test_guard_allows_schemas_py_patch(self):
+        from godel0.constants import PROPOSER_ALLOWED_PATCH_PREFIXES
+
+        guard = PatchGuard(allowed_prefixes=PROPOSER_ALLOWED_PATCH_PREFIXES)
         patch = _make_patch(["proposer/schemas.py"])
         report = guard.check(patch)
+        assert report.passed
+        assert "proposer/schemas.py" in report.allowed_files
+
+    def test_proposer_guard_rejects_coding_agent(self):
+        from godel0.constants import PROPOSER_ALLOWED_PATCH_PREFIXES
+
+        guard = PatchGuard(allowed_prefixes=PROPOSER_ALLOWED_PATCH_PREFIXES)
+        patch = _make_patch(["coding_agent.py"])
+        report = guard.check(patch)
         assert not report.passed
-        assert "proposer/schemas.py" in report.rejected_files
+
+    def test_solver_guard_rejects_proposer(self):
+        from godel0.constants import SOLVER_ALLOWED_PATCH_PREFIXES
+
+        guard = PatchGuard(allowed_prefixes=SOLVER_ALLOWED_PATCH_PREFIXES)
+        patch = _make_patch(["proposer/runner.py"])
+        report = guard.check(patch)
+        assert not report.passed
 
     def test_guard_allows_other_proposer_files(self):
         """Only the transport schema files are forbidden; other proposer/
@@ -64,6 +82,12 @@ class TestPatchGuardProtectsProposerTransport:
     def test_guard_rejects_git_paths(self):
         guard = PatchGuard()
         patch = _make_patch([".git/config"])
+        report = guard.check(patch)
+        assert not report.passed
+
+    def test_guard_rejects_tests_directory(self):
+        guard = PatchGuard()
+        patch = _make_patch(["tests/test_foo.py"])
         report = guard.check(patch)
         assert not report.passed
 

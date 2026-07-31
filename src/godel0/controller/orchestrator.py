@@ -396,7 +396,14 @@ class EvolutionOrchestrator:
         """Create the root agent git repo/ref and archive record if needed."""
         from ..controller.scorer import compute_scores
         from ..git.node_refs import create_node_ref, node_exists
-        from ..git.repository import commit, get_head_sha, init_repo, run_git
+        from ..git.repository import (
+            assert_no_tracked_runtime_artifacts,
+            commit,
+            get_head_sha,
+            init_repo,
+            remove_runtime_artifacts_from_tree,
+            run_git,
+        )
 
         agent_repo = Path(config.paths.agent_repo)
         source = Path("initial_agent/src")
@@ -408,20 +415,34 @@ class EvolutionOrchestrator:
                 source,
                 agent_repo,
                 dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache"),
+                ignore=shutil.ignore_patterns(
+                    "__pycache__",
+                    "*.pyc",
+                    "*.pyo",
+                    ".pytest_cache",
+                    "*.backup",
+                    "*.bak",
+                ),
             )
+
+        remove_runtime_artifacts_from_tree(agent_repo)
 
         if not (agent_repo / ".git").exists():
             init_repo(agent_repo)
+            remove_runtime_artifacts_from_tree(agent_repo)
             root_sha = commit(agent_repo, "root agent")
         else:
             status = run_git(agent_repo, "status", "--porcelain", check=False)
             try:
                 root_sha = get_head_sha(agent_repo)
             except Exception:
+                remove_runtime_artifacts_from_tree(agent_repo)
                 root_sha = commit(agent_repo, "root agent")
             if status.stdout.strip():
+                remove_runtime_artifacts_from_tree(agent_repo)
                 root_sha = commit(agent_repo, "root agent")
+
+        assert_no_tracked_runtime_artifacts(agent_repo)
 
         from ..evolution.gates import (
             ProposerExtensionGate,
@@ -1363,12 +1384,16 @@ class EvolutionOrchestrator:
 
     def _build_dual_hgm_child(self, parent):
         """HGM-style dual expansion: proposer failure then solver failure self-edit."""
+        import uuid
+
         from ..evolution.child_builder import ChildBuildResult
         from ..evolution.entry_selector import (
             choose_proposer_failure,
             choose_solver_failure,
         )
         from ..evolution.hgm_diagnose import HgmDiagnoseClips, HgmEntryDiagnoser
+        from ..schemas.mutation import MutationAttemptRecord
+        from ..storage.jsonl import append_jsonl, read_all_jsonl
 
         if self.child_builder is None:
             return ChildBuildResult(passed=True, node=None)
@@ -1380,6 +1405,9 @@ class EvolutionOrchestrator:
                 self.config.diagnosis.predicted_patch_clip_chars
             ),
             code_dump_clip_chars=int(self.config.diagnosis.code_dump_clip_chars),
+            max_code_files=int(
+                getattr(self.config.diagnosis, "max_code_files", 12) or 12
+            ),
         )
         chat_adapter = None
         diagnose_model = self.config.models.diagnose_model
@@ -1404,7 +1432,30 @@ class EvolutionOrchestrator:
         )
         task_store_root = Path(self.config.paths.task_store)
 
-        proposer_entry = choose_proposer_failure(proposer_dir, rng=random)
+        self.run_context.paths.ensure_node_dirs(parent.node_id)
+        attempt_path = self.run_context.paths.mutation_attempts_jsonl(parent.node_id)
+        prior_attempts = read_all_jsonl(attempt_path)
+        proposer_attempt_counts: dict[str, int] = {}
+        solver_attempt_counts: dict[str, int] = {}
+        for prior in prior_attempts:
+            if not isinstance(prior, dict):
+                continue
+            pid = prior.get("proposer_entry_id")
+            if pid:
+                proposer_attempt_counts[str(pid)] = (
+                    proposer_attempt_counts.get(str(pid), 0) + 1
+                )
+            sid = prior.get("solver_entry_id")
+            if sid:
+                solver_attempt_counts[str(sid)] = (
+                    solver_attempt_counts.get(str(sid), 0) + 1
+                )
+
+        proposer_entry = choose_proposer_failure(
+            proposer_dir,
+            rng=random,
+            attempt_counts=proposer_attempt_counts,
+        )
         solver_entry = choose_solver_failure(
             level2_result_path=(
                 Path(parent.level2_result_path) if parent.level2_result_path else None
@@ -1415,7 +1466,23 @@ class EvolutionOrchestrator:
             scratch_solver_root=scratch_solver_root,
             task_store_root=task_store_root,
             rng=random,
+            attempt_counts=solver_attempt_counts,
         )
+
+        attempt = MutationAttemptRecord(
+            attempt_id=f"attempt_{uuid.uuid4().hex[:12]}",
+            parent_node_id=parent.node_id,
+            proposer_entry_id=proposer_entry.id if proposer_entry else None,
+            solver_entry_id=solver_entry.id if solver_entry else None,
+        )
+
+        def _persist_attempt() -> None:
+            append_jsonl(attempt_path, attempt.model_dump(mode="json"))
+            atomic_write_json(
+                self.run_context.paths.mutation_attempts_dir()
+                / f"{attempt.attempt_id}.json",
+                attempt.model_dump(mode="json"),
+            )
 
         proposer_diagnosis = None
         solver_diagnosis = None
@@ -1429,8 +1496,19 @@ class EvolutionOrchestrator:
                 entry=proposer_entry,
                 agent_repo=agent_repo,
             )
-            # Persist on parent for lineage debugging.
-            self.run_context.paths.ensure_node_dirs(parent.node_id)
+            if proposer_diagnosis is None:
+                print("HGM dual: proposer diagnosis failed; aborting mutation")
+                attempt.failure_stage = "proposer_diagnosis"
+                attempt.failure_reasons = [
+                    "proposer diagnosis parse/validation failed after retries"
+                ]
+                _persist_attempt()
+                return ChildBuildResult(
+                    passed=False,
+                    errors=list(attempt.failure_reasons),
+                    failure_stage=attempt.failure_stage,
+                )
+            attempt.proposer_diagnosis_succeeded = True
             atomic_write_json(
                 self.run_context.paths.diagnosis_dir(parent.node_id)
                 / "hgm_proposer_entry.json",
@@ -1454,7 +1532,19 @@ class EvolutionOrchestrator:
                 entry=solver_entry,
                 agent_repo=agent_repo,
             )
-            self.run_context.paths.ensure_node_dirs(parent.node_id)
+            if solver_diagnosis is None:
+                print("HGM dual: solver diagnosis failed; aborting mutation")
+                attempt.failure_stage = "solver_diagnosis"
+                attempt.failure_reasons = [
+                    "solver diagnosis parse/validation failed after retries"
+                ]
+                _persist_attempt()
+                return ChildBuildResult(
+                    passed=False,
+                    errors=list(attempt.failure_reasons),
+                    failure_stage=attempt.failure_stage,
+                )
+            attempt.solver_diagnosis_succeeded = True
             atomic_write_json(
                 self.run_context.paths.diagnosis_dir(parent.node_id)
                 / "hgm_solver_entry.json",
@@ -1472,18 +1562,35 @@ class EvolutionOrchestrator:
             print(
                 "HGM dual: no failure entries available; falling back to joint diagnosis"
             )
+            attempt.failure_stage = "no_failure_entries"
+            attempt.failure_reasons = ["no proposer/solver failure entries; used joint"]
+            _persist_attempt()
             diagnosis = self._prepare_diagnosis(parent)
             return self._build_child(parent, diagnosis)
 
-        return self.child_builder.build_dual(
+        result = self.child_builder.build_dual(
             parent,
             self.config.models.self_improve_model,
             proposer_diagnosis=proposer_diagnosis,
             solver_diagnosis=solver_diagnosis,
             proposer_entry=proposer_entry.to_dict() if proposer_entry else None,
             solver_entry=solver_entry.to_dict() if solver_entry else None,
-            allow_empty_phase=True,
+            allow_empty_phase=False,
         )
+
+        attempt.proposer_patch_created = bool(
+            result.proposer_self_edit_result and result.proposer_self_edit_result.success
+        )
+        attempt.solver_patch_created = bool(
+            result.solver_self_edit_result and result.solver_self_edit_result.success
+        )
+        if result.passed and result.node is not None:
+            attempt.created_child_node_id = result.node.node_id
+        else:
+            attempt.failure_stage = result.failure_stage or "child_build"
+            attempt.failure_reasons = list(result.errors or [])
+        _persist_attempt()
+        return result
 
     def _run_solver_tasks(self, calls: list[dict]) -> list:
         """Solve every (task, rollout) call, in parallel when configured.

@@ -25,6 +25,10 @@ class ProposerFailureEntry:
     mutation_diff: str = ""
     failing_test_output: str = ""
 
+    @property
+    def id(self) -> str:
+        return self.candidate_id
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "candidate_id": self.candidate_id,
@@ -53,6 +57,10 @@ class SolverFailureEntry:
     trajectory_text: str = ""
     predicted_patch: str = ""
     eval_log: str = ""
+
+    @property
+    def id(self) -> str:
+        return f"L{self.level}:{self.task_id}"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -250,16 +258,33 @@ def list_proposer_failures(proposer_dir: Path) -> List[ProposerFailureEntry]:
     return list(by_id.values())
 
 
+def choose_least_attempted_failure(
+    failures: Sequence[Any],
+    attempt_counts: Optional[Dict[str, int]] = None,
+    rng: Optional[random.Random] = None,
+) -> Optional[Any]:
+    """Prefer never-tried entries, then least-tried, then seeded random."""
+    if not failures:
+        return None
+    counts = attempt_counts or {}
+    chooser = rng.choice if rng is not None else random.choice
+    minimum = min(counts.get(getattr(failure, "id", ""), 0) for failure in failures)
+    candidates = [
+        failure
+        for failure in failures
+        if counts.get(getattr(failure, "id", ""), 0) == minimum
+    ]
+    return chooser(candidates)
+
+
 def choose_proposer_failure(
     proposer_dir: Path,
     rng: Optional[random.Random] = None,
+    attempt_counts: Optional[Dict[str, int]] = None,
 ) -> Optional[ProposerFailureEntry]:
     """Pick one proposer failure case (HGM choose_entry analog)."""
     failures = list_proposer_failures(proposer_dir)
-    if not failures:
-        return None
-    chooser = rng.choice if rng is not None else random.choice
-    return chooser(failures)
+    return choose_least_attempted_failure(failures, attempt_counts, rng)
 
 
 def _solver_rollout_dir(scratch_solver_root: Path, task_id: str, level: int) -> Optional[Path]:
@@ -352,10 +377,10 @@ def choose_solver_failure(
     scratch_solver_root: Path,
     task_store_root: Optional[Path] = None,
     rng: Optional[random.Random] = None,
+    attempt_counts: Optional[Dict[str, int]] = None,
 ) -> Optional[SolverFailureEntry]:
     """Prefer Level2 failed tasks; fall back to Level1 forgotten tasks."""
     scratch_solver_root = Path(scratch_solver_root)
-    chooser = rng.choice if rng is not None else random.choice
 
     failed_ids: List[str] = []
     if level2_result_path is not None and Path(level2_result_path).is_file():
@@ -370,7 +395,7 @@ def choose_solver_failure(
         task_store_root=task_store_root,
     )
     if entries:
-        return chooser(entries)
+        return choose_least_attempted_failure(entries, attempt_counts, rng)
 
     forgotten: List[str] = []
     if level1_result_path is not None and Path(level1_result_path).is_file():
@@ -385,5 +410,5 @@ def choose_solver_failure(
         task_store_root=task_store_root,
     )
     if entries:
-        return chooser(entries)
+        return choose_least_attempted_failure(entries, attempt_counts, rng)
     return None

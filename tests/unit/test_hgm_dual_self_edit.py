@@ -36,11 +36,13 @@ def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
 
 
-def test_edit_protocol_is_hgm_aligned_not_minimal():
+def test_edit_protocol_prefers_focused_live_path_changes():
     assert "smallest change" not in EDIT_PROTOCOL.lower()
     assert "at most 2 files" not in EDIT_PROTOCOL.lower()
-    assert "HGM-style" in EDIT_PROTOCOL
-    assert "class* of failures" in EDIT_PROTOCOL or "*class* of failures" in EDIT_PROTOCOL
+    assert "do not stop at a cosmetic" not in EDIT_PROTOCOL.lower()
+    assert "class of failures" not in EDIT_PROTOCOL.lower()
+    assert "simplest coherent" in EDIT_PROTOCOL.lower()
+    assert "breadth is not evidence of quality" in EDIT_PROTOCOL.lower()
 
 
 def test_clip_text_keeps_head_and_tail():
@@ -177,13 +179,23 @@ def test_wrap_and_parse_diagnose_json():
     assert "GENERALIZATION" in role_code_summary("solver") or "coding_agent" in wrapped.lower() or "To Implement" in wrapped
 
     raw = """```json
-{"implementation_suggestion": "extend tools", "problem_description": "do X", "improvement_proposal": "Y"}
+{
+  "failure_summary": "agent stopped early",
+  "primary_root_cause": "weak localization loop",
+  "generalization": "affects many localization failures",
+  "single_improvement": "retry localization with failing tests",
+  "edit_scope": ["coding_agent.py", "tools/"],
+  "implementation_suggestion": "extend tools",
+  "expected_behavior_change": "agent re-reads failing tests before editing",
+  "problem_description": "do X"
+}
 ```"""
     data = parse_diagnose_json(raw)
     assert data["implementation_suggestion"] == "extend tools"
+    assert data["primary_root_cause"] == "weak localization loop"
 
 
-def test_hgm_diagnoser_fallback_without_adapter(tmp_path: Path):
+def test_hgm_diagnoser_returns_none_without_adapter(tmp_path: Path):
     repo = tmp_path / "agent"
     (repo / "proposer").mkdir(parents=True)
     (repo / "proposer" / "planner.py").write_text("x=1\n", encoding="utf-8")
@@ -192,9 +204,41 @@ def test_hgm_diagnoser_fallback_without_adapter(tmp_path: Path):
     diagnosis = diagnoser.diagnose_proposer(
         node_id="root", entry=entry, agent_repo=repo
     )
-    assert diagnosis.problem_statement
-    assert "proposer" in diagnosis.source_stages
-    assert "c1" in diagnosis.evidence_ids
+    assert diagnosis is None
+
+
+def test_parse_diagnose_json_rejects_dangerous_bypass():
+    raw = """```json
+{
+  "failure_summary": "validation exception",
+  "primary_root_cause": "validator too strict",
+  "generalization": "all candidates",
+  "single_improvement": "mark passed=True after exception",
+  "edit_scope": ["proposer/"],
+  "implementation_suggestion": "accept on exception in validator adapter",
+  "expected_behavior_change": "more candidates pass",
+  "problem_description": "bypass validation on exception"
+}
+```"""
+    with pytest.raises(Exception):
+        parse_diagnose_json(raw)
+
+
+def test_parse_diagnose_json_rejects_large_edit_scope():
+    raw = """```json
+{
+  "failure_summary": "x",
+  "primary_root_cause": "y",
+  "generalization": "z",
+  "single_improvement": "a",
+  "edit_scope": ["a", "b", "c", "d", "e"],
+  "implementation_suggestion": "extend tools",
+  "expected_behavior_change": "better",
+  "problem_description": "do X"
+}
+```"""
+    with pytest.raises(Exception):
+        parse_diagnose_json(raw)
 
 
 def test_dump_agent_code_role_scoped(tmp_path: Path):
@@ -255,9 +299,10 @@ def test_child_builder_dual_runs_both_phases(agent_repo: Path, tmp_path: Path):
         self_edit_runner=SelfEditRunner(agent_adapter=adapter, max_attempts=1),
         output_root=tmp_path / "nodes",
     )
-    # Bypass heavy child gates for unit test.
+    # Bypass heavy child/phase gates for unit test.
     builder._run_child_gates = lambda worktree, gates_dir: []  # type: ignore[method-assign]
-    # Patch guard may reject unknown paths depending on allowlist; stub it.
+    builder._run_phase_gates = lambda role, worktree, gates_dir: []  # type: ignore[method-assign]
+    # Patch guard may reject unknown paths depending on allowlist; stub final check.
     builder.patch_guard.check = lambda patch: SimpleNamespace(passed=True, reasons=[])  # type: ignore
 
     parent = NodeRecord(
@@ -309,6 +354,7 @@ def test_child_builder_dual_skips_missing_phase(agent_repo: Path, tmp_path: Path
         output_root=tmp_path / "nodes",
     )
     builder._run_child_gates = lambda worktree, gates_dir: []  # type: ignore[method-assign]
+    builder._run_phase_gates = lambda role, worktree, gates_dir: []  # type: ignore[method-assign]
     builder.patch_guard.check = lambda patch: SimpleNamespace(passed=True, reasons=[])  # type: ignore
     parent = NodeRecord(
         node_id="root",

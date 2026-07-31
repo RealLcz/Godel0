@@ -116,10 +116,9 @@ def test_retry_prompt_carries_the_editing_protocol_and_prior_failure(
 
     first, second = adapter.problem_statements
     assert "Fix the planner" in first
-    assert "Editing protocol" in first
-    assert "HGM-style" in first
-    assert "*class* of failures" in first
-    assert "previous attempt" in second
+    assert "Implement the improvement task" in first
+    assert "simplest coherent" in first.lower()
+    assert "previous attempt was discarded" in second.lower()
     assert "empty patch" in second
 
 

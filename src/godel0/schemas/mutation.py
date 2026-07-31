@@ -44,3 +44,24 @@ class MutationManifest(BaseModel):
 
     tool_edits: List[ToolEdit] = Field(default_factory=list)
     summary: str = ""
+
+
+class MutationAttemptRecord(BaseModel):
+    """Structured record of one dual-evolution mutation attempt."""
+
+    attempt_id: str
+    parent_node_id: str
+
+    proposer_entry_id: Optional[str] = None
+    solver_entry_id: Optional[str] = None
+
+    proposer_diagnosis_succeeded: bool = False
+    solver_diagnosis_succeeded: bool = False
+
+    proposer_patch_created: bool = False
+    solver_patch_created: bool = False
+
+    failure_stage: Optional[str] = None
+    failure_reasons: List[str] = Field(default_factory=list)
+
+    created_child_node_id: Optional[str] = None

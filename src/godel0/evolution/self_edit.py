@@ -7,28 +7,33 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from ..git.repository import diff_vs_commit, run_git
+from ..git.repository import diff_vs_commit, restore_runtime_artifacts, run_git
 from ..schemas.diagnosis import CycleDiagnosis
 from .patch_guard import validate_changed_python_syntax
 
-# HGM-aligned self-improve protocol: improve the agent for a *class* of
-# failures (not a one-line hotfix). Keep regional reads to protect context,
-# but do not force minimal/single-file edits.
 EDIT_PROTOCOL = """
-Editing protocol (HGM-style self-improve):
-- Implement the diagnosis fully enough to address this *class* of failures.
-  Multiple related files are allowed when needed; do not stop at a cosmetic
-  one-line change if the diagnosis calls for a real mechanism.
-- Prefer extending existing tools / workflows and wiring them into the live
-  path (`forward()`, proposer planners, swesmith helpers) over dead helpers.
-- Locate code with `grep -n` / `sed -n 'A,Bp'`. Prefer reading only the regions
-  you need; avoid dumping entire huge files into context.
-- Do NOT hard-code task-specific repo/file/module/instance names as constants.
-  Concrete names in the issue are illustrative examples only.
-- Do not edit frozen transport schemas (`proposer/request.py`,
-  `proposer/schemas.py`) or unrelated documentation.
-- After editing, re-read the changed regions to confirm they are syntactically
-  intact and actually invoked from the live path.
+Implement the improvement task in the current agent repository.
+
+Inspect the existing implementation before editing. Make the simplest coherent
+change that implements the requested capability improvement in the live runtime
+path.
+
+Do not hard-code identifiers or behavior from the observed failure instance.
+Do not modify trusted evaluation code, frozen transport protocols, generated
+artifacts, documentation, backup files, or unrelated tests.
+
+Prefer modifying an existing workflow, prompt, or tool over introducing a new
+subsystem when both would address the issue.
+
+Multiple production files may be modified only when they are directly required
+by the same improvement. Breadth is not evidence of quality.
+
+Before finishing:
+
+- inspect the final diff;
+- confirm the changed code is reachable from the live runtime path;
+- run the most relevant available import or test command;
+- leave the repository with a non-empty source-code diff.
 """
 
 
@@ -86,7 +91,7 @@ class SelfEditRunner:
 
         for attempt in range(1, self.max_attempts + 1):
             if attempt > 1:
-                self._reset_worktree(worktree)
+                self._reset_worktree(worktree, base_commit)
             attempt_dir = (
                 output_dir if attempt == 1 else output_dir / f"retry_{attempt:03d}"
             )
@@ -165,28 +170,31 @@ class SelfEditRunner:
         if previous_errors:
             history = "\n".join(f"- {error}" for error in previous_errors)
             parts.append(
-                "A previous attempt on this same problem was discarded:\n"
+                "The previous attempt was discarded because:\n"
                 f"{history}\n"
-                "Start from the unmodified repository and make the edit early "
-                "so it survives."
+                "Start from the clean phase base and implement the same "
+                "improvement without changing frozen protocols or generated "
+                "artifacts."
             )
         return "\n\n".join(parts)
 
     def _patch_problem(self, worktree: Path, base_commit: str) -> Optional[str]:
         """Return why the worktree diff is unusable, or None when it is fine."""
+        worktree = Path(worktree)
         try:
-            patch = diff_vs_commit(Path(worktree), base_commit)
+            restore_runtime_artifacts(worktree, base_commit)
+            patch = diff_vs_commit(worktree, base_commit)
         except Exception as exc:  # pragma: no cover - git failure is fatal anyway
             return f"could not diff worktree: {exc}"
         if not patch.strip():
             return "empty patch (agent finished without changing any file)"
-        syntax_errors = validate_changed_python_syntax(Path(worktree), patch)
+        syntax_errors = validate_changed_python_syntax(worktree, patch)
         if syntax_errors:
             return "; ".join(syntax_errors)
         return None
 
-    def _reset_worktree(self, worktree: Path) -> None:
-        """Discard a failed attempt so the retry starts from the base commit."""
+    def _reset_worktree(self, worktree: Path, base_commit: str = "HEAD") -> None:
+        """Discard a failed attempt so the retry starts from the phase base."""
         worktree = Path(worktree)
-        run_git(worktree, "reset", "--hard", "HEAD")
+        run_git(worktree, "reset", "--hard", base_commit)
         run_git(worktree, "clean", "-fd")

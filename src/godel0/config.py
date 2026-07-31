@@ -142,7 +142,8 @@ class DiagnosisConfig:
     md_log_clip_chars: int = 60000
     eval_log_clip_chars: int = 30000
     predicted_patch_clip_chars: int = 20000
-    code_dump_clip_chars: int = 200000
+    code_dump_clip_chars: int = 80000
+    max_code_files: int = 12
 
 
 @dataclass(frozen=True)
