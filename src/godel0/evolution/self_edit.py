@@ -28,12 +28,23 @@ subsystem when both would address the issue.
 Multiple production files may be modified only when they are directly required
 by the same improvement. Breadth is not evidence of quality.
 
+Editing rules (critical):
+- Prefer the editor `str_replace` command (exact old_str → new_str) or small
+  bash surgical edits. The final patch is taken from the worktree git diff;
+  you do not need to regenerate whole files.
+- Do NOT use editor `edit` to overwrite large existing modules. That truncates
+  files and often ends as an empty evolution patch after revert.
+- Prefer creating a small new helper plus a few-line wire-in over rewriting a
+  large file. Use `view` with `view_range` when you only need a slice.
+
 Before finishing:
 
 - inspect the final diff;
 - confirm the changed code is reachable from the live runtime path;
 - run the most relevant available import or test command;
-- leave the repository with a non-empty source-code diff.
+- leave the repository with a non-empty source-code diff;
+- do not git checkout / restore files you just edited unless recovering from a
+  failed truncated overwrite, and in that case redo the change with str_replace.
 """
 
 

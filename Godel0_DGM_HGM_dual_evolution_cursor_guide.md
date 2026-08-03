@@ -2,7 +2,7 @@
 
 > 目标读者：Cursor / Codex 等代码代理  
 > 目标仓库：`RealLcz/Godel0`  
-> 核心目标：保留 Godel0 当前的 **Proposer → Solver 双阶段进化**，但让每个阶段尽量遵循 DGM/HGM 的 self-improvement 范式：
+> 核心目标：保留 Godel0 的 **Solver → Proposer 双阶段进化**，但让每个阶段尽量遵循 DGM/HGM 的 self-improvement 范式：
 >
 > **一个真实失败 entry → 一个聚焦 diagnosis → 一次通用代码修改 → 仅做机械合法性检查 → 用真实评估决定修改优劣。**
 
@@ -10,25 +10,25 @@
 
 ## 1. 总体目标
 
-当前 Godel0 已经具备：
+当前 Godel0 已经具备 dual self-edit 骨架；目标顺序为：
 
 ```text
 选择 parent
-→ 选择 proposer failure
-→ proposer diagnosis
-→ proposer self-edit
 → 选择 solver failure
-→ solver diagnosis
-→ solver self-edit
+→ solver diagnosis（parent 原码）
+→ solver self-edit + intermediate commit
+→ 选择 proposer failure
+→ proposer diagnosis（parent proposer 代码 + companion solver To Implement / phase.diff）
+→ proposer self-edit
 → 创建 child
 → Level 1 / Proposer / Level 2 评估
 ```
 
-整体方向正确，但当前实现存在四类问题：
+整体方向正确，但实现上需注意：
 
 1. **基础设施问题导致所有 child 被机械拒绝**
    - tracked `__pycache__/*.pyc` 被写入累计 diff；
-   - proposer phase 的非法修改要等 solver phase 完成后才被发现；
+   - 各 phase 的非法修改必须在本 phase gate 内立即发现；
    - `allow_empty_phase=True` 允许某个阶段没有真正进化。
 
 2. **Diagnosis prompt 过度诱导大规模重构**
@@ -60,27 +60,29 @@
 
 # 2. 目标 Dual-HGM 流程
 
-最终流程应调整为：
+最终流程应调整为 **solver-first**：
 
 ```text
 Parent node
 │
-├── Proposer phase
-│   ├── 选择一个未优先尝试过的 proposer failure entry
-│   ├── 只诊断一个 primary failure mechanism
-│   ├── 生成一个聚焦、通用的 improvement issue
-│   ├── coding agent 修改 proposer
-│   ├── 清理 runtime artifacts
-│   ├── proposer-specific mechanical gates
-│   └── intermediate commit
-│
 ├── Solver phase
 │   ├── 选择一个未优先尝试过的 solver failure entry
-│   ├── 基于 proposer intermediate commit 读取当前代码
-│   ├── 只诊断一个 primary failure mechanism
+│   ├── 基于 parent agent_repo 诊断 solver（只看 parent 原码 + failure trajectory）
+│   ├── 生成一个聚焦、通用的 improvement issue
 │   ├── coding agent 修改 solver
 │   ├── 清理 runtime artifacts
 │   ├── solver-specific mechanical gates
+│   └── intermediate commit
+│
+├── Proposer phase
+│   ├── 选择一个未优先尝试过的 proposer failure entry
+│   ├── 诊断 proposer：parent 上的 proposer/swesmith 代码 dump
+│   │   + 本次 solver To Implement
+│   │   + 本次 solver phase.diff（截断）
+│   ├── 生成能锻炼本次 solver 改进能力的任务生成改进
+│   ├── coding agent 修改 proposer
+│   ├── 清理 runtime artifacts
+│   ├── proposer-specific mechanical gates
 │   └── final commit
 │
 └── Child evaluation
@@ -102,12 +104,14 @@ Parent node
 更合理的顺序是：
 
 ```text
-proposer diagnose
-→ proposer edit
-→ intermediate commit
-→ solver diagnose 当前 intermediate code
+solver diagnose（parent 原码）
 → solver edit
+→ intermediate commit
+→ proposer diagnose（parent proposer 代码 + companion solver To Implement / phase.diff）
+→ proposer edit
 ```
+
+Solver phase 失败则不跑 proposer（`allow_empty_phase=False`）。若只有一侧 failure entry，只跑对应 phase；proposer 无 companion solver context 时退化为仅基于自身 failure。
 
 ---
 
@@ -1074,75 +1078,86 @@ unrelated tests
 
 ---
 
-# 15. P1-9：Solver Diagnosis 必须基于 Intermediate Commit
+# 15. P1-9：Proposer Diagnosis 在 Solver Intermediate 之后（Companion Context）
 
-## 当前问题
+## 目标
 
-当前 `_build_dual_hgm_child()` 在 self-edit 之前就同时生成：
+Dual evolution 采用 **solver-first**：
 
-```text
-proposer_diagnosis
-solver_diagnosis
-```
+1. 在 parent 上诊断并完成 solver phase + intermediate commit；
+2. 再诊断 proposer，并注入本次 solver 的 companion context。
 
-然后交给 `build_dual()`。
+## 实现
 
-这意味着 solver diagnosis 看到的是 parent code，而不是 proposer edit 后的 intermediate code。
-
-## 推荐重构
-
-将 dual orchestration 迁移为 staged callback。
-
-一种实现方式：
+`ChildBuilder.build_dual()` 顺序为 solver → intermediate → proposer。支持：
 
 ```python
 ChildBuilder.build_dual(
     parent=parent,
-    proposer_diagnosis=...,
-    solver_diagnosis_factory=...,
+    solver_diagnosis=diagS,
+    proposer_diagnosis_factory=...,
+)
+```
+
+`proposer_diagnosis_factory` 签名：
+
+```python
+factory(
+    *,
+    worktree: Path,
+    intermediate_commit: str,
+    solver_diagnosis: CycleDiagnosis | None,
+    solver_phase_patch: str,
+) -> CycleDiagnosis | None
+```
+
+调用时机：solver intermediate commit 成功后（若无 solver phase，则在 parent worktree 上、proposer edit 前调用，且 `solver_*` 为空）。若调用方传入预计算的 `proposer_diagnosis`（单测），优先用它。
+
+Orchestrator (`_build_dual_hgm_child`)：
+
+```text
+select entries
+diagS on parent agent_repo
+build_dual(
+  solver_diagnosis=diagS,
+  proposer_diagnosis_factory=lambda ctx: diagnose_proposer(
+      entry=proposer_entry,
+      agent_repo=parent_agent_repo,          # 原 proposer 代码
+      companion_solver_improvement=diagS,    # 本次 To Implement
+      companion_solver_patch=ctx.solver_phase_patch,
+  ),
 )
 ```
 
 流程：
 
-```python
-proposer edit
+```text
+solver diagnose on parent
+→ solver edit
 → phase gate
 → intermediate commit
-
-solver_diagnosis = solver_diagnosis_factory(
-    worktree=worktree,
-    intermediate_commit=phase_base,
-)
-
-solver edit
+→ proposer_diagnosis_factory(...)
+→ proposer edit
+→ final cumulative child
 ```
 
-更清晰的方式是由 orchestrator 控制两个阶段：
-
-```python
-proposer_phase_result = child_builder.build_proposer_phase(...)
-solver_diagnosis = diagnoser.diagnose_solver(
-    agent_repo=proposer_phase_result.worktree,
-    ...
-)
-final_result = child_builder.build_solver_phase(...)
-```
-
-但要注意 worktree 生命周期。
-
-## 最低成本替代方案
-
-如果暂时不重构 diagnosis 时序，则必须严格保证：
+Proposer diagnosis prompt 增加：
 
 ```text
-proposer phase 只能修改 proposer/ 和 swesmith/
-solver phase 只能修改 solver paths
+# Companion Solver Improvement (this mutation)
+----- Solver To Implement Start -----
+{solver_problem_statement}
+----- Solver To Implement End -----
+
+# Solver Phase Diff (this mutation)
+----- Solver Patch Start -----
+{clipped_phase_patch}
+----- Solver Patch End -----
 ```
 
-这样 solver diagnosis 对 solver code 仍然有效。
+约束：proposer 应生成/规划能锻炼本次 solver 改进能力的任务；仍只修一个 proposer primary failure；禁止把 solver 代码抄进 proposer、禁止绕过 trusted validator。
 
-本次建议先完成严格 role isolation，再在下一次重构中移动 solver diagnosis 时序。
+Solver phase 失败时不调用 factory、不跑 proposer。
 
 ---
 
@@ -1419,11 +1434,12 @@ diagnosis 连续解析失败：返回 None，不生成 fallback。
 测试：
 
 ```text
-proposer phase empty：整个 mutation 失败，不运行 solver；
-proposer phase frozen-file violation：失败，不运行 solver；
-proposer phase valid：创建 intermediate commit；
-solver phase empty：整个 mutation 失败；
-两个 phase valid：final patch 同时包含 proposer 和 solver 修改。
+solver phase 先于 proposer phase 执行；
+solver phase empty / gate 失败：整个 mutation 失败，不调用 proposer factory，不运行 proposer；
+solver phase valid：创建 intermediate commit，再调用 proposer_diagnosis_factory（可读到非空 solver_phase_patch）；
+proposer diagnosis prompt 包含 companion Solver To Implement / Solver Phase Diff；
+两个 phase valid：final patch 同时包含 solver 和 proposer 修改；
+combined problem_statement 中 Solver phase 在 Proposer phase 之前。
 ```
 
 ## 20.6 Entry selection tests

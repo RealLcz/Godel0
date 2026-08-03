@@ -8,7 +8,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from ..constants import (
     PROPOSER_ALLOWED_PATCH_PREFIXES,
@@ -31,6 +31,8 @@ __all__ = [
     "ChildBuilder",
     "validate_changed_python_syntax",
 ]
+
+ProposerDiagnosisFactory = Callable[..., Optional[CycleDiagnosis]]
 
 
 @dataclass
@@ -208,15 +210,22 @@ class ChildBuilder:
         proposer_entry: Optional[dict] = None,
         solver_entry: Optional[dict] = None,
         allow_empty_phase: bool = False,
+        proposer_diagnosis_factory: Optional[ProposerDiagnosisFactory] = None,
     ) -> ChildBuildResult:
-        """Build one child via sequential proposer then solver self-edits.
+        """Build one child via sequential solver then proposer self-edits.
 
-        Each provided diagnosis triggers one self-edit on the same worktree.
-        After a successful proposer phase, an intermediate commit is created so
-        solver-phase retries cannot wipe proposer edits. The final patch is
-        always the cumulative diff versus the parent commit.
+        Solver runs first on the parent commit. After a successful solver phase,
+        an intermediate commit is created, then proposer diagnosis may be
+        produced via ``proposer_diagnosis_factory`` (seeing the solver To
+        Implement / phase patch). Precomputed ``proposer_diagnosis`` wins over
+        the factory. The final patch is always the cumulative diff versus the
+        parent commit.
         """
-        if proposer_diagnosis is None and solver_diagnosis is None:
+        if (
+            proposer_diagnosis is None
+            and solver_diagnosis is None
+            and proposer_diagnosis_factory is None
+        ):
             return ChildBuildResult(
                 passed=False,
                 errors=["No proposer or solver diagnosis provided for dual self-edit"],
@@ -235,75 +244,14 @@ class ChildBuilder:
         solver_result: Optional[SelfEditResult] = None
         last_result: Optional[SelfEditResult] = None
         combined_statement_parts: list[str] = []
+        solver_phase_patch = ""
+        resolved_proposer_diagnosis = proposer_diagnosis
 
         try:
             with NodeWorktree(
                 self.agent_repo, self.scratch_root, child_id, parent_commit
             ) as worktree:
                 phase_base = parent_commit
-
-                if proposer_diagnosis is not None:
-                    if proposer_entry is not None:
-                        atomic_write_json(
-                            diagnosis_dir / "proposer_entry.json", proposer_entry
-                        )
-                    atomic_write_json(
-                        diagnosis_dir / "proposer_diagnosis.json",
-                        proposer_diagnosis.model_dump(mode="json"),
-                    )
-                    atomic_write_text(
-                        diagnosis_dir / "proposer_problem_statement.md",
-                        proposer_diagnosis.problem_statement.rstrip() + "\n",
-                    )
-                    combined_statement_parts.append(
-                        "## Proposer phase\n\n" + proposer_diagnosis.problem_statement.strip()
-                    )
-                    proposer_out = output_dir / "proposer"
-                    proposer_out.mkdir(parents=True, exist_ok=True)
-                    proposer_result = self._run_self_edit(
-                        diagnosis=proposer_diagnosis,
-                        worktree=worktree,
-                        output_dir=proposer_out,
-                        model=model,
-                        base_commit=phase_base,
-                    )
-                    last_result = proposer_result
-
-                    restore_runtime_artifacts(worktree, phase_base)
-                    phase_patch = diff_vs_commit(worktree, phase_base)
-                    if not phase_patch.strip():
-                        if not allow_empty_phase:
-                            return ChildBuildResult(
-                                passed=False,
-                                self_edit_result=proposer_result,
-                                proposer_self_edit_result=proposer_result,
-                                errors=[
-                                    "Proposer self-edit produced no usable patch: "
-                                    + (proposer_result.error or "empty")
-                                ],
-                                failure_stage="proposer_empty_patch",
-                            )
-                    else:
-                        phase_errors = self._validate_phase_patch(
-                            role="proposer",
-                            worktree=worktree,
-                            patch=phase_patch,
-                            base_commit=phase_base,
-                            gates_dir=node_dir / "gates" / "proposer",
-                        )
-                        if phase_errors:
-                            return ChildBuildResult(
-                                passed=False,
-                                self_edit_result=proposer_result,
-                                proposer_self_edit_result=proposer_result,
-                                errors=phase_errors,
-                                failure_stage="proposer_phase_gate",
-                            )
-                        atomic_write_text(proposer_out / "phase.patch", phase_patch)
-                        phase_base = git_commit(
-                            worktree,
-                            f"godel0: proposer self-edit for {child_id}",
-                        )
 
                 if solver_diagnosis is not None:
                     if solver_entry is not None:
@@ -365,6 +313,111 @@ class ChildBuilder:
                                 failure_stage="solver_phase_gate",
                             )
                         atomic_write_text(solver_out / "phase.patch", phase_patch)
+                        solver_phase_patch = phase_patch
+                        phase_base = git_commit(
+                            worktree,
+                            f"godel0: solver self-edit for {child_id}",
+                        )
+
+                # Resolve proposer diagnosis after solver intermediate (or on
+                # parent worktree when there was no solver phase).
+                wants_proposer = (
+                    resolved_proposer_diagnosis is not None
+                    or proposer_diagnosis_factory is not None
+                    or proposer_entry is not None
+                )
+                if wants_proposer and resolved_proposer_diagnosis is None:
+                    if proposer_diagnosis_factory is None:
+                        return ChildBuildResult(
+                            passed=False,
+                            self_edit_result=last_result,
+                            proposer_self_edit_result=proposer_result,
+                            solver_self_edit_result=solver_result,
+                            errors=[
+                                "Proposer phase requested but no diagnosis or "
+                                "proposer_diagnosis_factory provided"
+                            ],
+                            failure_stage="proposer_diagnosis",
+                        )
+                    resolved_proposer_diagnosis = proposer_diagnosis_factory(
+                        worktree=worktree,
+                        intermediate_commit=phase_base,
+                        solver_diagnosis=solver_diagnosis,
+                        solver_phase_patch=solver_phase_patch,
+                    )
+                    if resolved_proposer_diagnosis is None:
+                        return ChildBuildResult(
+                            passed=False,
+                            self_edit_result=last_result,
+                            proposer_self_edit_result=proposer_result,
+                            solver_self_edit_result=solver_result,
+                            errors=[
+                                "proposer diagnosis parse/validation failed after retries"
+                            ],
+                            failure_stage="proposer_diagnosis",
+                        )
+
+                if resolved_proposer_diagnosis is not None:
+                    if proposer_entry is not None:
+                        atomic_write_json(
+                            diagnosis_dir / "proposer_entry.json", proposer_entry
+                        )
+                    atomic_write_json(
+                        diagnosis_dir / "proposer_diagnosis.json",
+                        resolved_proposer_diagnosis.model_dump(mode="json"),
+                    )
+                    atomic_write_text(
+                        diagnosis_dir / "proposer_problem_statement.md",
+                        resolved_proposer_diagnosis.problem_statement.rstrip() + "\n",
+                    )
+                    combined_statement_parts.append(
+                        "## Proposer phase\n\n"
+                        + resolved_proposer_diagnosis.problem_statement.strip()
+                    )
+                    proposer_out = output_dir / "proposer"
+                    proposer_out.mkdir(parents=True, exist_ok=True)
+                    proposer_result = self._run_self_edit(
+                        diagnosis=resolved_proposer_diagnosis,
+                        worktree=worktree,
+                        output_dir=proposer_out,
+                        model=model,
+                        base_commit=phase_base,
+                    )
+                    last_result = proposer_result
+
+                    restore_runtime_artifacts(worktree, phase_base)
+                    phase_patch = diff_vs_commit(worktree, phase_base)
+                    if not phase_patch.strip():
+                        if not allow_empty_phase:
+                            return ChildBuildResult(
+                                passed=False,
+                                self_edit_result=proposer_result,
+                                proposer_self_edit_result=proposer_result,
+                                solver_self_edit_result=solver_result,
+                                errors=[
+                                    "Proposer self-edit produced no usable patch: "
+                                    + (proposer_result.error or "empty")
+                                ],
+                                failure_stage="proposer_empty_patch",
+                            )
+                    else:
+                        phase_errors = self._validate_phase_patch(
+                            role="proposer",
+                            worktree=worktree,
+                            patch=phase_patch,
+                            base_commit=phase_base,
+                            gates_dir=node_dir / "gates" / "proposer",
+                        )
+                        if phase_errors:
+                            return ChildBuildResult(
+                                passed=False,
+                                self_edit_result=proposer_result,
+                                proposer_self_edit_result=proposer_result,
+                                solver_self_edit_result=solver_result,
+                                errors=phase_errors,
+                                failure_stage="proposer_phase_gate",
+                            )
+                        atomic_write_text(proposer_out / "phase.patch", phase_patch)
 
                 restore_runtime_artifacts(worktree, parent_commit)
                 patch = diff_vs_commit(worktree, parent_commit)
@@ -400,7 +453,9 @@ class ChildBuilder:
                         failure_stage="final_syntax_guard",
                     )
 
-                primary_diagnosis = solver_diagnosis or proposer_diagnosis
+                primary_diagnosis = (
+                    solver_diagnosis or resolved_proposer_diagnosis
+                )
                 assert primary_diagnosis is not None
                 combined_statement = "\n\n".join(combined_statement_parts).strip()
                 if combined_statement:

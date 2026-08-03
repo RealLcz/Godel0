@@ -1383,7 +1383,7 @@ class EvolutionOrchestrator:
         )
 
     def _build_dual_hgm_child(self, parent):
-        """HGM-style dual expansion: proposer failure then solver failure self-edit."""
+        """HGM-style dual expansion: solver failure then proposer failure self-edit."""
         import uuid
 
         from ..evolution.child_builder import ChildBuildResult
@@ -1484,44 +1484,7 @@ class EvolutionOrchestrator:
                 attempt.model_dump(mode="json"),
             )
 
-        proposer_diagnosis = None
         solver_diagnosis = None
-        if proposer_entry is not None:
-            print(
-                f"HGM dual: proposer failure entry={proposer_entry.candidate_id} "
-                f"reason={proposer_entry.reason[:120]!r}"
-            )
-            proposer_diagnosis = diagnoser.diagnose_proposer(
-                node_id=parent.node_id,
-                entry=proposer_entry,
-                agent_repo=agent_repo,
-            )
-            if proposer_diagnosis is None:
-                print("HGM dual: proposer diagnosis failed; aborting mutation")
-                attempt.failure_stage = "proposer_diagnosis"
-                attempt.failure_reasons = [
-                    "proposer diagnosis parse/validation failed after retries"
-                ]
-                _persist_attempt()
-                return ChildBuildResult(
-                    passed=False,
-                    errors=list(attempt.failure_reasons),
-                    failure_stage=attempt.failure_stage,
-                )
-            attempt.proposer_diagnosis_succeeded = True
-            atomic_write_json(
-                self.run_context.paths.diagnosis_dir(parent.node_id)
-                / "hgm_proposer_entry.json",
-                proposer_entry.to_dict(),
-            )
-            atomic_write_json(
-                self.run_context.paths.diagnosis_dir(parent.node_id)
-                / "hgm_proposer_diagnosis.json",
-                proposer_diagnosis.model_dump(mode="json"),
-            )
-        else:
-            print("HGM dual: no proposer failure entry; skipping proposer phase")
-
         if solver_entry is not None:
             print(
                 f"HGM dual: solver failure entry={solver_entry.task_id} "
@@ -1558,7 +1521,7 @@ class EvolutionOrchestrator:
         else:
             print("HGM dual: no solver failure entry; skipping solver phase")
 
-        if proposer_diagnosis is None and solver_diagnosis is None:
+        if proposer_entry is None and solver_diagnosis is None:
             print(
                 "HGM dual: no failure entries available; falling back to joint diagnosis"
             )
@@ -1568,14 +1531,59 @@ class EvolutionOrchestrator:
             diagnosis = self._prepare_diagnosis(parent)
             return self._build_child(parent, diagnosis)
 
+        proposer_diagnosis_factory = None
+        if proposer_entry is not None:
+            print(
+                f"HGM dual: proposer failure entry={proposer_entry.candidate_id} "
+                f"reason={proposer_entry.reason[:120]!r} "
+                "(diagnosis deferred until after solver intermediate)"
+            )
+
+            def proposer_diagnosis_factory(
+                *,
+                worktree,
+                intermediate_commit: str,
+                solver_diagnosis,
+                solver_phase_patch: str = "",
+            ):
+                # Diagnose against parent agent_repo (original proposer code).
+                # Companion context carries this mutation's solver To Implement
+                # and solver phase.diff so proposer tasks can exercise it.
+                _ = (worktree, intermediate_commit)  # reserved for future staged dumps
+                diagnosis = diagnoser.diagnose_proposer(
+                    node_id=parent.node_id,
+                    entry=proposer_entry,
+                    agent_repo=agent_repo,
+                    companion_solver_improvement=solver_diagnosis,
+                    companion_solver_patch=solver_phase_patch or "",
+                )
+                if diagnosis is None:
+                    print("HGM dual: proposer diagnosis failed; aborting mutation")
+                    return None
+                attempt.proposer_diagnosis_succeeded = True
+                atomic_write_json(
+                    self.run_context.paths.diagnosis_dir(parent.node_id)
+                    / "hgm_proposer_entry.json",
+                    proposer_entry.to_dict(),
+                )
+                atomic_write_json(
+                    self.run_context.paths.diagnosis_dir(parent.node_id)
+                    / "hgm_proposer_diagnosis.json",
+                    diagnosis.model_dump(mode="json"),
+                )
+                return diagnosis
+        else:
+            print("HGM dual: no proposer failure entry; skipping proposer phase")
+
         result = self.child_builder.build_dual(
             parent,
             self.config.models.self_improve_model,
-            proposer_diagnosis=proposer_diagnosis,
+            proposer_diagnosis=None,
             solver_diagnosis=solver_diagnosis,
             proposer_entry=proposer_entry.to_dict() if proposer_entry else None,
             solver_entry=solver_entry.to_dict() if solver_entry else None,
             allow_empty_phase=False,
+            proposer_diagnosis_factory=proposer_diagnosis_factory,
         )
 
         attempt.proposer_patch_created = bool(

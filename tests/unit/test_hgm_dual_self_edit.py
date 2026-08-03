@@ -43,6 +43,8 @@ def test_edit_protocol_prefers_focused_live_path_changes():
     assert "class of failures" not in EDIT_PROTOCOL.lower()
     assert "simplest coherent" in EDIT_PROTOCOL.lower()
     assert "breadth is not evidence of quality" in EDIT_PROTOCOL.lower()
+    assert "str_replace" in EDIT_PROTOCOL.lower()
+    assert "do not use editor `edit` to overwrite large" in EDIT_PROTOCOL.lower()
 
 
 def test_clip_text_keeps_head_and_tail():
@@ -151,6 +153,7 @@ def test_diagnose_prompt_contains_code_logs_and_failure():
     assert "generated plan" in user
     assert "diff --git" in user
     assert "3 failed" in user
+    assert "Companion Solver Improvement" not in user
 
     solver = SolverFailureEntry(
         task_id="task_1",
@@ -167,6 +170,40 @@ def test_diagnose_prompt_contains_code_logs_and_failure():
     assert "Issue text" in user2
     assert "tool: editor" in user2
     assert "+fix" in user2
+
+
+def test_proposer_diagnose_prompt_includes_companion_solver_context():
+    entry = ProposerFailureEntry(
+        candidate_id="cand_y",
+        reason="no_f2p",
+        stdout_log="plan",
+        bug_patch="diff --git a/b b/b\n",
+        problem_statement="Make Y fail",
+        failing_test_output="failed",
+    )
+    companion = CycleDiagnosis(
+        node_id="root",
+        primary_root_cause="weak localization",
+        source_stages=["solver"],
+        problem_statement=(
+            "# To Implement\n\nImprove localization retry before editing.\n"
+        ),
+    )
+    patch = "diff --git a/coding_agent.py b/coding_agent.py\n+retry\n"
+    _system, user = build_proposer_diagnose_messages(
+        entry,
+        code_dump="def plan():\n    pass\n",
+        clips=HgmDiagnoseClips(),
+        companion_solver_improvement=companion,
+        companion_solver_patch=patch,
+    )
+    assert "Companion Solver Improvement (this mutation)" in user
+    assert "----- Solver To Implement Start -----" in user
+    assert "Improve localization retry before editing" in user
+    assert "Solver Phase Diff (this mutation)" in user
+    assert "----- Solver Patch Start -----" in user
+    assert "coding_agent.py" in user
+    assert "+retry" in user
 
 
 def test_wrap_and_parse_diagnose_json():
@@ -291,21 +328,14 @@ def agent_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def test_child_builder_dual_runs_both_phases(agent_repo: Path, tmp_path: Path):
-    adapter = _PhaseAdapter()
-    builder = ChildBuilder(
-        agent_repo=agent_repo,
-        scratch_root=tmp_path / "scratch",
-        self_edit_runner=SelfEditRunner(agent_adapter=adapter, max_attempts=1),
-        output_root=tmp_path / "nodes",
-    )
-    # Bypass heavy child/phase gates for unit test.
+def _stub_builder_gates(builder: ChildBuilder) -> None:
     builder._run_child_gates = lambda worktree, gates_dir: []  # type: ignore[method-assign]
     builder._run_phase_gates = lambda role, worktree, gates_dir: []  # type: ignore[method-assign]
-    # Patch guard may reject unknown paths depending on allowlist; stub final check.
     builder.patch_guard.check = lambda patch: SimpleNamespace(passed=True, reasons=[])  # type: ignore
 
-    parent = NodeRecord(
+
+def _parent_from_repo(agent_repo: Path) -> NodeRecord:
+    return NodeRecord(
         node_id="root",
         parent_node_id=None,
         code_commit=subprocess.check_output(
@@ -314,6 +344,19 @@ def test_child_builder_dual_runs_both_phases(agent_repo: Path, tmp_path: Path):
         code_ref="refs/godel0/nodes/root",
         status=NodeStatus.COMPLETE,
     )
+
+
+def test_child_builder_dual_runs_solver_before_proposer(agent_repo: Path, tmp_path: Path):
+    adapter = _PhaseAdapter()
+    builder = ChildBuilder(
+        agent_repo=agent_repo,
+        scratch_root=tmp_path / "scratch",
+        self_edit_runner=SelfEditRunner(agent_adapter=adapter, max_attempts=1),
+        output_root=tmp_path / "nodes",
+    )
+    _stub_builder_gates(builder)
+
+    parent = _parent_from_repo(agent_repo)
     proposer_diag = CycleDiagnosis(
         node_id="root",
         primary_root_cause="proposer",
@@ -337,12 +380,136 @@ def test_child_builder_dual_runs_both_phases(agent_repo: Path, tmp_path: Path):
     assert result.passed, result.errors
     assert result.node is not None
     assert len(adapter.calls) == 2
+    assert "SOLVER_MARK" in adapter.calls[0]
+    assert "PROPOSER_MARK" in adapter.calls[1]
     child_diag = tmp_path / "nodes" / result.node.node_id / "diagnosis"
     assert (child_diag / "proposer_problem_statement.md").is_file()
     assert (child_diag / "solver_problem_statement.md").is_file()
-    assert (child_diag / "problem_statement.md").is_file()
-    final_patch = (tmp_path / "nodes" / result.node.node_id / "self_evolve" / "final.patch").read_text()
+    combined = (child_diag / "problem_statement.md").read_text()
+    assert combined.index("## Solver phase") < combined.index("## Proposer phase")
+    final_patch = (
+        tmp_path / "nodes" / result.node.node_id / "self_evolve" / "final.patch"
+    ).read_text()
     assert "planner.py" in final_patch or "coding_agent.py" in final_patch
+    solver_phase = (
+        tmp_path
+        / "nodes"
+        / result.node.node_id
+        / "self_evolve"
+        / "solver"
+        / "phase.patch"
+    )
+    assert solver_phase.is_file()
+    assert solver_phase.read_text().strip()
+
+
+def test_child_builder_dual_factory_after_solver_intermediate(
+    agent_repo: Path, tmp_path: Path
+):
+    adapter = _PhaseAdapter()
+    builder = ChildBuilder(
+        agent_repo=agent_repo,
+        scratch_root=tmp_path / "scratch",
+        self_edit_runner=SelfEditRunner(agent_adapter=adapter, max_attempts=1),
+        output_root=tmp_path / "nodes",
+    )
+    _stub_builder_gates(builder)
+    parent = _parent_from_repo(agent_repo)
+    factory_calls = []
+
+    def factory(*, worktree, intermediate_commit, solver_diagnosis, solver_phase_patch):
+        factory_calls.append(
+            {
+                "intermediate_commit": intermediate_commit,
+                "solver_phase_patch": solver_phase_patch,
+                "solver_ps": (
+                    solver_diagnosis.problem_statement if solver_diagnosis else None
+                ),
+            }
+        )
+        assert intermediate_commit
+        assert solver_phase_patch.strip()
+        assert "coding_agent.py" in solver_phase_patch
+        return CycleDiagnosis(
+            node_id="root",
+            primary_root_cause="proposer",
+            source_stages=["proposer"],
+            problem_statement="PROPOSER_MARK from factory",
+        )
+
+    result = builder.build_dual(
+        parent,
+        model="test-model",
+        proposer_diagnosis=None,
+        solver_diagnosis=CycleDiagnosis(
+            node_id="root",
+            primary_root_cause="solver",
+            source_stages=["solver"],
+            problem_statement="SOLVER_MARK improve solver",
+        ),
+        proposer_entry={"candidate_id": "c1"},
+        solver_entry={"task_id": "t1"},
+        proposer_diagnosis_factory=factory,
+    )
+    assert result.passed, result.errors
+    assert len(factory_calls) == 1
+    assert "SOLVER_MARK" in factory_calls[0]["solver_ps"]
+    assert len(adapter.calls) == 2
+    assert "SOLVER_MARK" in adapter.calls[0]
+    assert "PROPOSER_MARK" in adapter.calls[1]
+
+
+def test_child_builder_dual_solver_failure_skips_factory(
+    agent_repo: Path, tmp_path: Path
+):
+    class _EmptySolverAdapter:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, agent_src, request):
+            self.calls.append(request.problem_statement)
+            # Intentionally leave worktree unchanged so solver phase is empty.
+            return SimpleNamespace(success=True, patch_path=None, error=None)
+
+    adapter = _EmptySolverAdapter()
+    builder = ChildBuilder(
+        agent_repo=agent_repo,
+        scratch_root=tmp_path / "scratch",
+        self_edit_runner=SelfEditRunner(agent_adapter=adapter, max_attempts=1),
+        output_root=tmp_path / "nodes",
+    )
+    _stub_builder_gates(builder)
+    parent = _parent_from_repo(agent_repo)
+    factory_calls = []
+
+    def factory(**_kwargs):
+        factory_calls.append(_kwargs)
+        return CycleDiagnosis(
+            node_id="root",
+            primary_root_cause="proposer",
+            source_stages=["proposer"],
+            problem_statement="PROPOSER_MARK should not run",
+        )
+
+    result = builder.build_dual(
+        parent,
+        model="test-model",
+        proposer_diagnosis=None,
+        solver_diagnosis=CycleDiagnosis(
+            node_id="root",
+            primary_root_cause="solver",
+            source_stages=["solver"],
+            problem_statement="SOLVER_MARK empty",
+        ),
+        proposer_entry={"candidate_id": "c1"},
+        allow_empty_phase=False,
+        proposer_diagnosis_factory=factory,
+    )
+    assert not result.passed
+    assert result.failure_stage == "solver_empty_patch"
+    assert factory_calls == []
+    assert len(adapter.calls) == 1
+    assert "SOLVER_MARK" in adapter.calls[0]
 
 
 def test_child_builder_dual_skips_missing_phase(agent_repo: Path, tmp_path: Path):
@@ -353,18 +520,8 @@ def test_child_builder_dual_skips_missing_phase(agent_repo: Path, tmp_path: Path
         self_edit_runner=SelfEditRunner(agent_adapter=adapter, max_attempts=1),
         output_root=tmp_path / "nodes",
     )
-    builder._run_child_gates = lambda worktree, gates_dir: []  # type: ignore[method-assign]
-    builder._run_phase_gates = lambda role, worktree, gates_dir: []  # type: ignore[method-assign]
-    builder.patch_guard.check = lambda patch: SimpleNamespace(passed=True, reasons=[])  # type: ignore
-    parent = NodeRecord(
-        node_id="root",
-        parent_node_id=None,
-        code_commit=subprocess.check_output(
-            ["git", "-C", str(agent_repo), "rev-parse", "HEAD"], text=True
-        ).strip(),
-        code_ref="refs/godel0/nodes/root",
-        status=NodeStatus.COMPLETE,
-    )
+    _stub_builder_gates(builder)
+    parent = _parent_from_repo(agent_repo)
     result = builder.build_dual(
         parent,
         model="test-model",

@@ -76,12 +76,19 @@ Never propose or implement any of the following:
 - changing trusted pass/fail semantics;
 - hiding answer leakage through superficial lexical rewriting alone;
 - editing proposer/request.py;
-- editing trusted-controller code.
+- editing trusted-controller code;
+- copying solver implementation code into the Proposer;
+- weakening, bypassing, or imitating trusted validation to inflate acceptance.
 
 A rejected candidate is negative evidence about upstream generation. Improve
 target selection, planning, patch construction, mutation execution, issue
 generation, or candidate robustness so that future candidates genuinely satisfy
 the existing validation contract.
+
+When companion solver-improvement context is provided for this mutation, the
+Proposer should plan/generate tasks that exercise the Solver capability being
+improved in this mutation, while still fixing exactly one primary Proposer
+failure mechanism grounded in the failure entry.
 
 Choose one primary failure mechanism. If the candidate has multiple rejection
 reasons, select the earliest causal reason that explains the later failures.
@@ -89,13 +96,13 @@ reasons, select the earliest causal reason that explains the later failures.
 
 SOLVER_DIAGNOSIS_CONSTRAINTS = """You are diagnosing the Solver.
 
-Improve the Solver's general coding behavior. Relevant edit surfaces may include:
+Improve the Solver's general coding behavior. Relevant edit surfaces may include but not limited to:
 
 - the live workflow in coding_agent.py;
 - prompts used by the live forward path;
 - existing tool descriptions or implementations;
 - context management and tool-loop behavior;
-- verification or testing behavior already present in the agent.
+- skills or tools already present in the agent.
 
 Do not:
 
@@ -308,6 +315,9 @@ def build_proposer_diagnose_messages(
     entry: ProposerFailureEntry,
     code_dump: str,
     clips: HgmDiagnoseClips,
+    *,
+    companion_solver_improvement: Optional[CycleDiagnosis] = None,
+    companion_solver_patch: str = "",
 ) -> tuple[str, str]:
     reasons = []
     if entry.validation_report:
@@ -363,6 +373,30 @@ def build_proposer_diagnose_messages(
         predicted_patch=clip_text(predicted, clips.predicted_patch_clip_chars),
         eval_log=clip_text(eval_log, clips.eval_log_clip_chars),
     )
+
+    companion_sections: list[str] = []
+    solver_to_implement = ""
+    if companion_solver_improvement is not None:
+        solver_to_implement = (
+            companion_solver_improvement.problem_statement or ""
+        ).strip()
+    if solver_to_implement:
+        companion_sections.append(
+            "# Companion Solver Improvement (this mutation)\n"
+            "----- Solver To Implement Start -----\n"
+            f"{clip_text(solver_to_implement, clips.md_log_clip_chars)}\n"
+            "----- Solver To Implement End -----"
+        )
+    patch_text = (companion_solver_patch or "").strip()
+    if patch_text:
+        companion_sections.append(
+            "# Solver Phase Diff (this mutation)\n"
+            "----- Solver Patch Start -----\n"
+            f"{clip_text(patch_text, clips.predicted_patch_clip_chars)}\n"
+            "----- Solver Patch End -----"
+        )
+    if companion_sections:
+        user = user.rstrip() + "\n\n" + "\n\n".join(companion_sections) + "\n"
     return system, user
 
 
@@ -463,6 +497,8 @@ class HgmEntryDiagnoser:
         node_id: str,
         entry: ProposerFailureEntry,
         agent_repo: Path,
+        companion_solver_improvement: Optional[CycleDiagnosis] = None,
+        companion_solver_patch: str = "",
     ) -> Optional[CycleDiagnosis]:
         evidence_hints = self._proposer_evidence_hints(entry)
         code = dump_agent_code(
@@ -472,7 +508,13 @@ class HgmEntryDiagnoser:
             max_files=self.clips.max_code_files,
             evidence_hints=evidence_hints,
         )
-        system, user = build_proposer_diagnose_messages(entry, code, self.clips)
+        system, user = build_proposer_diagnose_messages(
+            entry,
+            code,
+            self.clips,
+            companion_solver_improvement=companion_solver_improvement,
+            companion_solver_patch=companion_solver_patch,
+        )
         return self._run(
             node_id=node_id,
             role="proposer",
