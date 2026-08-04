@@ -139,7 +139,11 @@ def test_batch_retries_rejections_until_k_valid_tasks(tmp_path):
 
     assert result.complete
     assert len(result.tasks) == 2
+    assert result.plans_attempted == 3
+    assert result.candidates_emitted == 3
     assert result.candidates_generated == 3
+    assert result.candidates_validated == 3
+    assert result.tasks_accepted == 2
     assert result.rejection_reasons == {"no_f2p": 1}
     assert [request.generation_attempt for request in runner.requests] == [0, 1, 2]
     assert [request.target_batch_size for request in runner.requests] == [2, 2, 1]
@@ -215,5 +219,73 @@ def test_engine_zero_yield_plan_uses_remaining_generation_budget(tmp_path):
     )
 
     assert result.complete
-    assert result.candidates_generated == 2
+    assert result.plans_attempted == 2
+    assert result.candidates_emitted == 1
+    assert result.candidates_generated == 1
+    assert result.candidates_validated == 1
+    assert result.tasks_accepted == 1
     assert len(runner.requests) == 2
+
+
+def test_repeated_engine_failure_fingerprint_trips_batch_fuse(tmp_path):
+    class HomogeneousFailureRunner:
+        def __init__(self):
+            self.requests = []
+
+        def generate_batch(self, request):
+            self.requests.append(request)
+            result = ProposerResult(run_id=request.run_id, node_id=request.node_id)
+            result.plans.append(
+                {
+                    "plan_id": f"failed-{len(self.requests)}",
+                    "target_file": "module.py",
+                    "target_symbol": "missing_symbol",
+                    "task_blueprint": {
+                        "last_rejection": "unknown_symbol: missing_symbol",
+                        "last_rejection_stage": "invalid_symbol",
+                    },
+                }
+            )
+            return result
+
+    runner = HomogeneousFailureRunner()
+    result = TaskBatchBuilder(
+        batch_size=1,
+        max_candidates=20,
+        homogeneous_failure_limit=3,
+    ).build_for_node(
+        node_id="node",
+        repo_pool=_RepoPool(),
+        validator=SimpleNamespace(),
+        task_committer=None,
+        proposer_runner=runner,
+        output_dir=tmp_path / "proposer",
+    )
+
+    assert result.plans_attempted == 3
+    assert result.candidates_emitted == 0
+    assert result.candidates_validated == 0
+    assert result.tasks_accepted == 0
+    assert len(runner.requests) == 3
+    assert result.proposer_error.startswith(
+        "homogeneous_failure_circuit_breaker:"
+    )
+
+
+def test_failure_fingerprint_prefers_invalid_site_from_engine_reason():
+    fingerprint = TaskBatchBuilder._failure_fingerprint(
+        {
+            "target_file": "lib/ansible/__main__.py",
+            "target_symbol": "_short_name",
+        },
+        (
+            "invalid_chain_plan:planned mutation symbols must exist exactly: "
+            "lib/ansible/cli/adhoc.py::AdHocCLI.name: symbol resolved 0 times"
+        ),
+    )
+
+    assert fingerprint == (
+        "lib/ansible/cli/adhoc.py",
+        "AdHocCLI.name",
+        "invalid_chain_plan",
+    )

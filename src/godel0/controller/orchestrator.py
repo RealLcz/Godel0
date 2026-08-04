@@ -1780,8 +1780,11 @@ class EvolutionOrchestrator:
                 complete=bool(legacy.complete),
                 rejected_candidates=legacy.rejected_candidates,
                 rejection_reasons=dict(legacy.rejection_reasons),
+                plans_attempted=legacy.plans_attempted,
+                candidates_emitted=legacy.candidates_emitted,
                 candidates_generated=legacy.candidates_generated,
                 candidates_validated=legacy.candidates_validated,
+                tasks_accepted=legacy.tasks_accepted,
                 validation_reports=list(legacy.validation_reports),
                 proposer_error=legacy.proposer_error,
                 engine_rejections=list(legacy.engine_rejections),
@@ -1809,8 +1812,17 @@ class EvolutionOrchestrator:
                 "task_ids": [t.task_id for t in result.tasks],
                 "rejected_candidates": result.rejected_candidates,
                 "rejection_reasons": result.rejection_reasons,
+                "plans_attempted": int(
+                    getattr(result, "plans_attempted", 0) or 0
+                ),
+                "candidates_emitted": int(
+                    getattr(result, "candidates_emitted", 0) or 0
+                ),
                 "candidates_generated": result.candidates_generated,
                 "candidates_validated": result.candidates_validated,
+                "tasks_accepted": int(
+                    getattr(result, "tasks_accepted", len(result.tasks)) or 0
+                ),
                 "validation_reports": result.validation_reports,
                 "proposer_error": result.proposer_error,
                 "engine_rejections": result.engine_rejections,

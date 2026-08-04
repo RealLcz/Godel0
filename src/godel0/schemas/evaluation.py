@@ -77,6 +77,9 @@ class CandidateValidationReport(BaseModel):
     timeout_valid: bool = False
     safety_valid: bool = False
     duplicate_valid: bool = False
+    duplicate_classification: str = "not_checked"
+    duplicate_component_overlap_ratio: float = 0.0
+    novelty_score: float = 1.0
     relevance_valid: bool = False
 
     rejection_reasons: list[str] = []

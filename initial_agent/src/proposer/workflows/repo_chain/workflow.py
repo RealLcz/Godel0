@@ -258,6 +258,7 @@ class RepoChainWorkflow:
         max_candidates: Optional[int] = None,
         plan_offset: int = 0,
         plan_limit: Optional[int] = None,
+        validation_feedback: Optional[List] = None,
     ) -> tuple:
         """Root bootstrap mode: generate T_0 without solver trajectory conditioning.
 
@@ -291,6 +292,39 @@ class RepoChainWorkflow:
             code_locator=self.code_locator,
         )
         plans = all_plans[offset : offset + chunk_size]
+        feedback_rows = list(validation_feedback or [])
+        if feedback_rows:
+            from proposer.candidate_feedback import CandidateFeedbackProcessor
+
+            processor = CandidateFeedbackProcessor()
+            for plan in plans:
+                context_files = list(getattr(plan, "target_files", None) or [])
+                records = processor.scoped_rejections(
+                    feedback_rows,
+                    repo_id=str(getattr(plan, "target_repo_id", "") or ""),
+                    base_commit=str(getattr(plan, "target_base_commit", "") or ""),
+                    context_files=context_files,
+                )[-20:]
+                if records:
+                    blueprint = getattr(plan, "task_blueprint", None)
+                    if isinstance(blueprint, dict):
+                        blueprint["trusted_validation_feedback"] = records
+                        blueprint["forbidden_mutation_sites"] = [
+                            {
+                                key: row[key]
+                                for key in (
+                                    "file",
+                                    "symbol",
+                                    "symbol_id",
+                                    "reason_code",
+                                )
+                                if row.get(key)
+                            }
+                            for row in records
+                            if row.get("file")
+                            or row.get("symbol")
+                            or row.get("symbol_id")
+                        ]
         candidates: List = []
         emit_limit = (
             int(max_candidates)

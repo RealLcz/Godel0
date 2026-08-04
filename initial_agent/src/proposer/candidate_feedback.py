@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -79,6 +80,92 @@ class CandidateFeedbackProcessor:
                 cand.status = "rejected"
                 rejected.append(cand)
         return {"accepted": accepted, "rejected": rejected}
+
+    def scoped_rejections(
+        self,
+        feedbacks: List[ValidationFeedback],
+        *,
+        repo_id: str = "",
+        base_commit: str = "",
+        context_files: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return structured rejections relevant to the current repo context."""
+        context = set(context_files or [])
+        records: List[Dict[str, Any]] = []
+        for feedback in feedbacks:
+            if feedback.accepted:
+                continue
+            notes = dict(feedback.notes or {})
+            feedback_repo = str(notes.get("repo") or notes.get("repo_id") or "")
+            feedback_commit = str(notes.get("base_commit") or "")
+            if repo_id and feedback_repo and feedback_repo != repo_id:
+                continue
+            if base_commit and feedback_commit and feedback_commit != base_commit:
+                continue
+            file_path = str(
+                notes.get("file")
+                or notes.get("file_path")
+                or notes.get("target_file")
+                or ""
+            )
+            reason_code = str(
+                notes.get("reason_code")
+                or self._reason_code(feedback.reason)
+            )
+            symbol = str(
+                notes.get("symbol")
+                or notes.get("qualified_name")
+                or notes.get("target_symbol")
+                or ""
+            )
+            parsed_sites = (
+                [(file_path, symbol)]
+                if file_path or symbol
+                else self._sites_from_reason(feedback.reason)
+            )
+            if not parsed_sites:
+                parsed_sites = [("", "")]
+            for parsed_file, parsed_symbol in parsed_sites:
+                if context and parsed_file and parsed_file not in context:
+                    continue
+                records.append(
+                    {
+                        "candidate_id": feedback.candidate_id,
+                        "repo": feedback_repo,
+                        "base_commit": feedback_commit,
+                        "file": parsed_file,
+                        "symbol": parsed_symbol,
+                        "symbol_id": str(notes.get("symbol_id") or ""),
+                        "reason_code": reason_code,
+                        "reason": feedback.reason,
+                        "notes": notes,
+                    }
+                )
+        return records
+
+    @staticmethod
+    def _sites_from_reason(reason: str) -> List[tuple[str, str]]:
+        """Recover exact Python sites from legacy engine rejection text."""
+        return list(
+            dict.fromkeys(
+                re.findall(
+                    r"([\w./-]+\.py)::"
+                    r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)",
+                    str(reason or ""),
+                )
+            )
+        )
+
+    @staticmethod
+    def _reason_code(reason: str) -> str:
+        text = str(reason or "").strip()
+        if not text:
+            return "validation_rejected"
+        prefix = text.split(":", 1)[0].strip().lower()
+        normalized = "".join(
+            char if char.isalnum() else "_" for char in prefix
+        ).strip("_")
+        return normalized or "validation_rejected"
 
     def summarize(
         self,

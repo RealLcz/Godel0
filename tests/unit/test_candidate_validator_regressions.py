@@ -238,7 +238,7 @@ def test_failed_validation_does_not_poison_duplicate_detector(toy_repo, tmp_path
     assert accepted.passed
 
 
-def test_multifile_duplicate_detection_uses_components_not_anchor_signature():
+def test_multifile_partial_component_reuse_is_reported_but_allowed():
     detector = DuplicateDetector()
     first = """diff --git a/a.py b/a.py
 --- a/a.py
@@ -288,13 +288,71 @@ diff --git a/c.py b/c.py
         "",
         "repo_compose",
     )
-    assert not detector.check(
+    assessment = detector.assess(
         reused_component,
         "repo",
         "a.py",
         "",
         "repo_compose",
     )
+    assert assessment.is_unique
+    assert assessment.classification == "partial_component_reuse"
+    assert assessment.component_overlap_ratio == 0.5
+    assert assessment.novelty_score == 0.5
+
+
+def test_multifile_near_duplicate_is_rejected():
+    detector = DuplicateDetector()
+    shared = {
+        name: (
+            f"diff --git a/{name}.py b/{name}.py\n"
+            f"--- a/{name}.py\n"
+            f"+++ b/{name}.py\n"
+            "@@ -1 +1 @@\n"
+            f"-old_{name}\n"
+            f"+new_{name}\n"
+        )
+        for name in ("a", "b", "c", "d")
+    }
+    first = "".join(shared.values())
+    near = "".join(
+        [
+            shared["a"],
+            shared["b"],
+            shared["c"],
+            (
+                "diff --git a/d.py b/d.py\n"
+                "--- a/d.py\n"
+                "+++ b/d.py\n"
+                "@@ -5 +5 @@\n"
+                "-other_d\n"
+                "+changed_d\n"
+            ),
+        ]
+    )
+
+    assert detector.record(first, "repo", "a.py", "", "repo_compose")
+    assessment = detector.assess(near, "repo", "a.py", "", "repo_compose")
+    assert not assessment.is_unique
+    assert assessment.classification == "near_duplicate"
+    assert assessment.component_overlap_ratio == 0.75
+
+
+def test_full_patch_duplicate_is_hard_rejected():
+    detector = DuplicateDetector()
+    patch = (
+        "diff --git a/a.py b/a.py\n"
+        "--- a/a.py\n"
+        "+++ b/a.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+
+    assert detector.record(patch, "repo")
+    assessment = detector.assess(patch, "repo")
+    assert not assessment.is_unique
+    assert assessment.classification == "full_duplicate"
 
 
 def test_pytest_parser_preserves_parameter_spaces_and_normalizes_workspace(tmp_path):

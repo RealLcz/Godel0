@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import ast
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .schemas import CodeTarget, FailureSignature
+from .symbol_identity import extract_canonical_symbols
 
 
 @dataclass
@@ -56,7 +56,7 @@ class RepoIndex:
                         continue
                     fpath = os.path.join(root, fname)
                     rel = os.path.relpath(fpath, repo_dir)
-                    for sym in _extract_symbols(fpath):
+                    for sym in _extract_symbols(fpath, rel):
                         sym["file_path"] = rel
                         symbols.append(sym)
         return cls(
@@ -68,39 +68,17 @@ class RepoIndex:
         )
 
 
-def _extract_symbols(fpath: str) -> List[Dict[str, Any]]:
+def _extract_symbols(fpath: str, file_path: str = "") -> List[Dict[str, Any]]:
     try:
         with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
             source = f.read()
-        tree = ast.parse(source, filename=fpath)
-    except (SyntaxError, ValueError):
+    except OSError:
         return []
-    out: List[Dict[str, Any]] = []
-    lines = source.splitlines()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            kind = "function"
-        elif isinstance(node, ast.ClassDef):
-            kind = "class"
-        else:
-            continue
-        line_start = getattr(node, "lineno", 0)
-        line_end = getattr(node, "end_lineno", line_start)
-        snippet = ""
-        if line_start and line_end and lines:
-            lo = max(0, line_start - 1)
-            hi = min(len(lines), line_end)
-            snippet = "\n".join(lines[lo:hi])
-        out.append(
-            {
-                "symbol_name": node.name,
-                "symbol_type": kind,
-                "line_start": line_start,
-                "line_end": line_end,
-                "source": snippet,
-            }
-        )
-    return out
+    return extract_canonical_symbols(
+        source,
+        file_path=file_path,
+        include_source=True,
+    )
 
 
 @dataclass
@@ -170,6 +148,8 @@ class CodeLocator:
             if _is_test_path(file_path):
                 continue
             name = str(sym.get("symbol_name", ""))
+            identity = str(sym.get("symbol_id") or "")
+            qualified_name = str(sym.get("qualified_name") or name)
             source = str(sym.get("source", ""))
             score = 0.0
             symbol_type = str(sym.get("symbol_type", "")).lower()
@@ -199,13 +179,21 @@ class CodeLocator:
                 score += 0.5
             elif line_span > 200:
                 score -= 0.5
-            if name in used:
+            if name in used or qualified_name in used or identity in used:
                 score -= 1.0
-            novelty = max(0.0, 1.0 - (1.0 if name in used else 0.0))
+            novelty = max(
+                0.0,
+                1.0
+                - (
+                    1.0
+                    if name in used or qualified_name in used or identity in used
+                    else 0.0
+                ),
+            )
             target = CodeTarget(
                 repo_id=repo_index.repo_id,
                 file_path=file_path,
-                symbol_name=name,
+                symbol_name=qualified_name,
                 symbol_type=str(sym.get("symbol_type", "function")),
                 line_start=int(sym.get("line_start", 0)),
                 line_end=int(sym.get("line_end", 0)),

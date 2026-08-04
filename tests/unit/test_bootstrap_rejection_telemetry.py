@@ -35,9 +35,18 @@ class _FakeRepoPool:
 class _RejectingRunner:
     """A chunk that yields nothing and reports the engine's reason."""
 
-    def __init__(self, reason: str, stage: str = ""):
+    def __init__(
+        self,
+        reason: str,
+        stage: str = "",
+        *,
+        target_file: str = "",
+        target_symbol: str = "",
+    ):
         self.reason = reason
         self.stage = stage
+        self.target_file = target_file
+        self.target_symbol = target_symbol
 
     def generate_batch(self, request):
         blueprint = {"last_rejection": self.reason}
@@ -47,7 +56,15 @@ class _RejectingRunner:
             accepted_candidates=[],
             rejected_candidates=[],
             pending_candidates=[],
-            plans=[{"plan_id": "bootstrap-cross_file-0", "task_blueprint": blueprint}],
+            plans=[
+                {
+                    "plan_id": "bootstrap-cross_file-0",
+                    "target_repo_id": "ansible",
+                    "target_file": self.target_file,
+                    "target_symbol": self.target_symbol,
+                    "task_blueprint": blueprint,
+                }
+            ],
             completed=True,
             error="",
         )
@@ -97,6 +114,31 @@ def test_engine_rejection_is_written_to_trusted_feedback(tmp_path: Path):
     payload = json.loads(feedback[0].read_text())
     assert payload["accepted"] is False
     assert "edits count" in payload["reason"]
+
+
+def test_engine_feedback_carries_scoped_repair_identity(tmp_path: Path):
+    _run(
+        tmp_path,
+        _RejectingRunner(
+            "invalid_chain_plan:unknown symbol",
+            target_file="lib/ansible/cli/adhoc.py",
+            target_symbol="AdHocCLI.name",
+        ),
+    )
+
+    feedback = sorted((tmp_path / "proposer" / "trusted_feedback").glob("engine-*.json"))
+    payload = json.loads(feedback[0].read_text())
+    assert payload["notes"] == {
+        "attempt": 0,
+        "plan_id": "bootstrap-cross_file-0",
+        "reason": "invalid_chain_plan:unknown symbol",
+        "stage": "contract_generation_failure",
+        "reason_code": "invalid_chain_plan",
+        "repo": "ansible",
+        "base_commit": "HEAD",
+        "file": "lib/ansible/cli/adhoc.py",
+        "symbol": "AdHocCLI.name",
+    }
 
 
 def test_stage_is_inferred_when_the_engine_omits_it(tmp_path: Path):

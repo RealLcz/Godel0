@@ -152,11 +152,16 @@ class CandidateValidator:
             "target_symbol": target_symbol,
             "operator": operator,
         }
-        report.duplicate_valid = self.duplicate_detector.is_unique(
+        duplicate_assessment = self.duplicate_detector.assess(
             **duplicate_args,
         )
+        self._apply_duplicate_assessment(report, duplicate_assessment)
         if not report.duplicate_valid:
-            self._add_rejection(report, "duplicate", stage="duplicate")
+            self._add_rejection(
+                report,
+                duplicate_assessment.classification,
+                stage="duplicate",
+            )
             return report
 
         workspace = self.workspace_root / f"validate_{candidate_id}"
@@ -229,12 +234,17 @@ class CandidateValidator:
                         )
 
             if report.passed:
-                report.duplicate_valid = self.duplicate_detector.record(
+                duplicate_assessment = self.duplicate_detector.record_assessment(
                     **duplicate_args,
                 )
+                self._apply_duplicate_assessment(report, duplicate_assessment)
                 if not report.duplicate_valid:
                     report.passed = False
-                    self._add_rejection(report, "duplicate", stage="duplicate")
+                    self._add_rejection(
+                        report,
+                        duplicate_assessment.classification,
+                        stage="duplicate",
+                    )
 
             if not report.passed and not report.rejection_reasons:
                 if not report.f2p_tests:
@@ -261,6 +271,15 @@ class CandidateValidator:
         code = str(stage or "").strip()
         if code and code not in report.failure_stages:
             report.failure_stages.append(code)
+
+    @staticmethod
+    def _apply_duplicate_assessment(report, assessment) -> None:
+        report.duplicate_valid = bool(assessment.is_unique)
+        report.duplicate_classification = str(assessment.classification)
+        report.duplicate_component_overlap_ratio = float(
+            assessment.component_overlap_ratio
+        )
+        report.novelty_score = float(assessment.novelty_score)
 
     def _run_trusted_causal_ablation(
         self,

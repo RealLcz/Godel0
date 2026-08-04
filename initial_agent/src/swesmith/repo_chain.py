@@ -27,6 +27,7 @@ from .repo_level import (
     split_patch_by_file,
     validate_repository_patch,
 )
+from proposer.symbol_identity import build_canonical_catalog
 
 
 CHAIN_SYSTEM_PROMPT = """\
@@ -53,7 +54,7 @@ Allowed production paths (this is an exhaustive whitelist):
 {allowed_production_paths}
 ```
 
-Allowed AST mutation symbols by production path (also exhaustive):
+Allowed canonical AST mutation symbols (also exhaustive):
 ```json
 {allowed_symbols}
 ```
@@ -75,8 +76,7 @@ Return one JSON object and no prose:
     "context_files": ["paths actually used"],
     "mutation_sites": [
       {{
-        "file": "production path",
-        "symbol": "symbol",
+        "symbol_id": "exact canonical symbol ID",
         "role": "producer|carrier|identity|consumer|error-boundary",
         "change": "specific behavior to corrupt"
       }}
@@ -103,9 +103,9 @@ Requirements:
 - Plan {min_sites} to {max_sites} mutation sites in {min_files} to {max_files}
   production files selected from the exhaustive whitelist. A path not present
   in that list makes the response invalid.
-- Every mutation-site `symbol` must be copied exactly from the AST symbol
-  whitelist for its file. Fields, conceptual helpers, and invented methods are
-  invalid mutation symbols.
+- Every mutation site must contain only a `symbol_id` copied exactly from the
+  canonical whitelist. The materializer owns file and qualified-name lookup.
+  Fields, conceptual helpers, invented methods, and hand-written IDs are invalid.
 - Transfer only the solver's abstract capability gap from trajectory evidence.
   Do not reuse its repository subsystem, bug story, symbols, or domain nouns.
 - Obey every `forbidden_copy` value in the blueprint. Do not mention or test
@@ -157,7 +157,7 @@ Allowed production paths (this is an exhaustive whitelist):
 {allowed_production_paths}
 ```
 
-Allowed AST mutation symbols by production path (also exhaustive):
+Allowed canonical AST mutation symbols (also exhaustive):
 ```json
 {allowed_symbols}
 ```
@@ -182,8 +182,7 @@ Return one JSON object and no prose:
     "context_files": ["paths actually used"],
     "mutation_sites": [
       {{
-        "file": "production path",
-        "symbol": "symbol",
+        "symbol_id": "exact canonical symbol ID",
         "role": "producer|carrier|identity|consumer|error-boundary",
         "change": "specific behavior to corrupt so the existing tests fail"
       }}
@@ -198,8 +197,8 @@ Return one JSON object and no prose:
 Requirements:
 - Plan {min_sites} to {max_sites} mutation sites in {min_files} to {max_files}
   production files selected from the exhaustive whitelist.
-- Every mutation-site `symbol` must be copied exactly from the AST symbol
-  whitelist for its file.
+- Every mutation site must contain only a `symbol_id` copied exactly from the
+  canonical whitelist. File and qualified symbol names are materialized from it.
 - Transfer only the solver's abstract capability gap from trajectory evidence.
   Do not reuse forbidden trajectory domain nouns from the blueprint.
 - Do NOT generate new tests, rewrite existing tests, or change test paths.
@@ -344,10 +343,24 @@ class RepoChainGenerator:
         production_context = [
             path for path in context_files if not is_test_path(path)
         ]
+        symbol_catalog = self._available_symbol_catalog(
+            Path(source_repo),
+            production_context,
+            blueprint=blueprint,
+        )
+        if len({row["file_path"] for row in symbol_catalog}) < min_files:
+            self._reject_detail("insufficient_allowed_canonical_symbols")
+            return []
         existing_test_grounding, grounding_tests = self._existing_test_grounding(
             Path(source_repo),
             production_context,
         )
+        if require_generated and grounding_tests:
+            grounded_catalog = self._symbols_grounded_by_tests(
+                Path(source_repo), grounding_tests, symbol_catalog
+            )
+            if len({row["file_path"] for row in grounded_catalog}) >= min_files:
+                symbol_catalog = grounded_catalog
 
         output_root = Path(output_dir or source_repo)
         output_root.mkdir(parents=True, exist_ok=True)
@@ -399,6 +412,18 @@ class RepoChainGenerator:
                         )
                         return []
                     test_files = list(selected)
+                    grounded_catalog = self._symbols_grounded_by_tests(
+                        Path(workspace), test_files, symbol_catalog
+                    )
+                    if len(
+                        {row["file_path"] for row in grounded_catalog}
+                    ) < min_files:
+                        self._reject(
+                            "contract_generation_failure",
+                            "selected_tests_do_not_ground_enough_mutation_files",
+                        )
+                        return []
+                    symbol_catalog = grounded_catalog
                     test_command = self._contract_test_command(
                         plan, repo_spec, test_files
                     )
@@ -428,7 +453,7 @@ class RepoChainGenerator:
                             indent=2,
                         ),
                         allowed_symbols=json.dumps(
-                            self._symbol_catalog(Path(source_repo), context_files),
+                            symbol_catalog,
                             indent=2,
                         ),
                         context_count=len(context_files),
@@ -460,8 +485,9 @@ class RepoChainGenerator:
                             if isinstance(contract_response, dict)
                             else str(contract_response or "")
                         )
-                        contract_payload = self._parse_contract_payload(
-                            contract_response
+                        contract_payload = self._ground_contract_symbols(
+                            self._parse_contract_payload(contract_response),
+                            symbol_catalog,
                         )
                         contract_payload["contract_source"] = "existing_tests"
                         contract_payload["tests"] = []
@@ -527,7 +553,7 @@ class RepoChainGenerator:
                             indent=2,
                         ),
                         allowed_symbols=json.dumps(
-                            self._symbol_catalog(Path(source_repo), context_files),
+                            symbol_catalog,
                             indent=2,
                         ),
                         context_count=len(context_files),
@@ -561,7 +587,10 @@ class RepoChainGenerator:
                             if isinstance(contract_response, dict)
                             else str(contract_response or "")
                         )
-                        contract_payload = self._parse_contract_payload(contract_response)
+                        contract_payload = self._ground_contract_symbols(
+                            self._parse_contract_payload(contract_response),
+                            symbol_catalog,
+                        )
                         stored_contract = json.dumps(
                             contract_payload
                             if contract_payload
@@ -787,7 +816,10 @@ class RepoChainGenerator:
                     self._reject_detail(f"invalid_bug_patch:{summary.rejection_reason}")
                     return []
                 if not self._plan_matches_patch(
-                    contract_payload["chain_plan"], summary.changed_files, min_sites
+                    contract_payload["chain_plan"],
+                    summary.changed_files,
+                    min_sites,
+                    accepted_edits,
                 ):
                     self._reject_detail("mutation_patch_does_not_match_plan")
                     return []
@@ -795,10 +827,22 @@ class RepoChainGenerator:
                     workspace, test_command, constraints.generation_timeout_sec
                 )
                 if bugged_result.returncode == 0:
-                    self._reject_detail(
+                    failure_code = (
                         "existing_contract_did_not_fail"
                         if not require_generated
                         else "generated_contract_did_not_fail"
+                    )
+                    failed_sites = ",".join(
+                        str(site.get("symbol_id") or "")
+                        for site in contract_payload["chain_plan"].get(
+                            "mutation_sites", []
+                        )
+                        if isinstance(site, dict)
+                    )
+                    self._reject_detail(
+                        f"{failure_code}:sites={failed_sites}:"
+                        f"operator={getattr(plan, 'operator', '') or ''}:"
+                        f"tests={','.join(test_files)}"
                     )
                     return []
                 provisional_taxonomy = self._contract_test_taxonomy(
@@ -1131,8 +1175,46 @@ class RepoChainGenerator:
         chain = payload.get("chain_plan")
         if not isinstance(chain, dict):
             return shape_error
+        identity_error = self._canonical_identity_rejection(
+            workspace, chain, context_files
+        )
         symbol_error = self._mutation_symbols_rejection(workspace, chain)
-        return "; ".join(part for part in (shape_error, symbol_error) if part)
+        return "; ".join(
+            part for part in (shape_error, identity_error, symbol_error) if part
+        )
+
+    def _canonical_identity_rejection(
+        self,
+        root: Path,
+        chain: Dict[str, Any],
+        context_files: Sequence[str],
+    ) -> str:
+        catalog = self._symbol_catalog(root, context_files)
+        by_id = {str(row["symbol_id"]): row for row in catalog}
+        errors: List[str] = []
+        for index, site in enumerate(chain.get("mutation_sites") or []):
+            if not isinstance(site, dict):
+                continue
+            symbol_id = str(site.get("symbol_id") or "")
+            entry = by_id.get(symbol_id)
+            if entry is None:
+                errors.append(f"site {index} has unknown canonical symbol_id {symbol_id!r}")
+                continue
+            observed = (
+                str(site.get("file") or ""),
+                str(site.get("symbol") or ""),
+            )
+            expected = (
+                str(entry["file_path"]),
+                str(entry["qualified_name"]),
+            )
+            if observed != expected:
+                errors.append(
+                    f"site {index} identity mismatch: {observed!r} != {expected!r}"
+                )
+        if not errors:
+            return ""
+        return "canonical symbol identity invalid: " + "; ".join(errors)
 
     def _chain_plan_rejection(
         self,
@@ -1469,10 +1551,37 @@ class RepoChainGenerator:
         selected = " ".join(shlex.quote(test_id) for test_id in test_ids)
         return f"{base.strip()} {selected}".strip()
 
-    def _plan_matches_patch(self, chain: Dict[str, Any], changed_files: Sequence[str], min_sites: int) -> bool:
-        sites = list(chain.get("mutation_sites") or [])
-        planned_files = {str(site.get("file") or "") for site in sites if isinstance(site, dict)}
-        return len(sites) >= min_sites and set(changed_files).issubset(planned_files)
+    def _plan_matches_patch(
+        self,
+        chain: Dict[str, Any],
+        changed_files: Sequence[str],
+        min_sites: int,
+        materialized_edits: Sequence[Dict[str, str]] = (),
+    ) -> bool:
+        sites = [
+            site
+            for site in chain.get("mutation_sites") or []
+            if isinstance(site, dict)
+        ]
+        planned = {
+            (str(site.get("file") or ""), str(site.get("symbol") or ""))
+            for site in sites
+        }
+        planned_files = {file_path for file_path, _ in planned if file_path}
+        if (
+            len(sites) < min_sites
+            or len(planned) != len(sites)
+            or set(changed_files) != planned_files
+        ):
+            return False
+        if materialized_edits:
+            materialized = {
+                (str(edit.get("file") or ""), str(edit.get("symbol") or ""))
+                for edit in materialized_edits
+                if isinstance(edit, dict)
+            }
+            return materialized == planned and len(materialized_edits) == len(planned)
+        return True
 
     def _causal_ablation(self, workspace: str, bug_patch: str, command: str, timeout: int) -> Dict[str, Any]:
         blocks = split_patch_by_file(bug_patch)
@@ -1633,33 +1742,180 @@ class RepoChainGenerator:
             test_roots=test_roots,
         )
 
-    def _symbol_catalog(
-        self, root: Path, files: Sequence[str]
-    ) -> Dict[str, List[str]]:
-        catalog: Dict[str, List[str]] = {}
-        for relative in files:
-            if is_test_path(relative):
-                continue
-            path = root / relative
-            if not path.is_file() or path.suffix != ".py":
-                continue
+    def _symbols_grounded_by_tests(
+        self,
+        root: Path,
+        test_files: Sequence[str],
+        catalog: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Keep symbols in production modules statically reachable from tests."""
+        file_entries: Dict[str, List[Dict[str, Any]]] = {}
+        module_to_file: Dict[str, str] = {}
+        for row in catalog:
+            relative = str(row.get("file_path") or "")
+            file_entries.setdefault(relative, []).append(row)
+            if relative.endswith(".py"):
+                module = relative[:-3].replace("/", ".")
+                if module.endswith(".__init__"):
+                    module = module[: -len(".__init__")]
+                module_to_file[module] = relative
+
+        def imported_modules(path: Path) -> set[str]:
             try:
                 tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
-            except SyntaxError:
+            except (OSError, SyntaxError):
+                return set()
+            modules: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    modules.add(str(node.module))
+                elif isinstance(node, ast.Import):
+                    modules.update(str(alias.name) for alias in node.names)
+            return modules
+
+        reachable_files: set[str] = set()
+        queue: List[str] = []
+        for test_file in test_files:
+            for module in imported_modules(root / test_file):
+                for candidate, relative in module_to_file.items():
+                    if module == candidate or module.startswith(candidate + "."):
+                        if relative not in reachable_files:
+                            reachable_files.add(relative)
+                            queue.append(relative)
+        while queue:
+            relative = queue.pop(0)
+            for module in imported_modules(root / relative):
+                for candidate, imported_file in module_to_file.items():
+                    if module == candidate or module.startswith(candidate + "."):
+                        if imported_file not in reachable_files:
+                            reachable_files.add(imported_file)
+                            queue.append(imported_file)
+        return [
+            row
+            for relative in file_entries
+            if relative in reachable_files
+            for row in file_entries[relative]
+        ]
+
+    def _symbol_catalog(
+        self, root: Path, files: Sequence[str]
+    ) -> List[Dict[str, Any]]:
+        return build_canonical_catalog(
+            root,
+            [path for path in files if not is_test_path(path)],
+        )
+
+    def _available_symbol_catalog(
+        self,
+        root: Path,
+        files: Sequence[str],
+        *,
+        blueprint: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        catalog = self._symbol_catalog(root, files)
+        forbidden_ids: set[str] = set()
+        forbidden_pairs: set[tuple[str, str]] = set()
+        failure_counts: Counter[tuple[str, str, str]] = Counter()
+        for row in blueprint.get("trusted_validation_feedback") or []:
+            if not isinstance(row, dict):
                 continue
-            symbols: List[str] = []
+            symbol_id = str(row.get("symbol_id") or "")
+            file_path = str(row.get("file") or "")
+            symbol = str(row.get("symbol") or "")
+            reason = str(row.get("reason_code") or row.get("reason") or "")
+            if symbol_id:
+                forbidden_ids.add(symbol_id)
+            if file_path and symbol:
+                forbidden_pairs.add((file_path, symbol))
+            failure_counts[(file_path, symbol_id or symbol, reason)] += 1
+        for row in blueprint.get("forbidden_mutation_sites") or []:
+            if not isinstance(row, dict):
+                continue
+            if row.get("symbol_id"):
+                forbidden_ids.add(str(row["symbol_id"]))
+            if row.get("file") and row.get("symbol"):
+                forbidden_pairs.add((str(row["file"]), str(row["symbol"])))
+        available = [
+            row
+            for row in catalog
+            if row["symbol_id"] not in forbidden_ids
+            and (row["file_path"], row["qualified_name"]) not in forbidden_pairs
+        ]
+        blueprint["feedback_repair"] = {
+            "forbidden_symbol_ids": sorted(forbidden_ids),
+            "forbidden_sites": [
+                {"file": file_path, "symbol": symbol}
+                for file_path, symbol in sorted(forbidden_pairs)
+            ],
+            "failure_fingerprints": [
+                {
+                    "file": key[0],
+                    "symbol": key[1],
+                    "reason_code": key[2],
+                    "count": count,
+                    "circuit_broken": count >= 2,
+                }
+                for key, count in sorted(failure_counts.items())
+            ],
+            "required_action": (
+                "choose a different canonical symbol, mutation operator, and test family"
+                if any(count >= 2 for count in failure_counts.values())
+                else "repair the rejected site using a listed canonical alternative"
+            ),
+        }
+        return available
 
-            def visit(body: Sequence[ast.stmt], parents: List[str]) -> None:
-                for node in body:
-                    if isinstance(node, ast.ClassDef):
-                        visit(node.body, parents + [node.name])
-                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        symbols.append(".".join(parents + [node.name]))
-                        visit(node.body, parents + [node.name])
-
-            visit(tree.body, [])
-            catalog[relative] = symbols
-        return catalog
+    def _ground_contract_symbols(
+        self,
+        payload: Dict[str, Any],
+        catalog: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Resolve model-owned IDs to trusted file/qualified-name identities."""
+        chain = payload.get("chain_plan")
+        if not isinstance(chain, dict):
+            return payload
+        by_id = {str(row["symbol_id"]): row for row in catalog}
+        by_pair: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+        for row in catalog:
+            by_pair.setdefault(
+                (str(row["file_path"]), str(row["qualified_name"])), []
+            ).append(row)
+        sites = chain.get("mutation_sites")
+        if not isinstance(sites, list):
+            return payload
+        grounded: List[Any] = []
+        for site in sites:
+            if not isinstance(site, dict):
+                grounded.append(site)
+                continue
+            symbol_id = str(site.get("symbol_id") or "")
+            entry = by_id.get(symbol_id)
+            if entry is None and not symbol_id:
+                # Compatibility for deterministic adapters/tests: accept only an
+                # already exact, unambiguous canonical file/qualified-name pair.
+                matches = by_pair.get(
+                    (
+                        str(site.get("file") or ""),
+                        str(site.get("symbol") or ""),
+                    ),
+                    [],
+                )
+                entry = matches[0] if len(matches) == 1 else None
+            normalized = dict(site)
+            if entry is not None:
+                normalized.update(
+                    {
+                        "symbol_id": entry["symbol_id"],
+                        "file": entry["file_path"],
+                        "symbol": entry["qualified_name"],
+                        "kind": entry["symbol_type"],
+                        "line_start": entry["line_start"],
+                        "line_end": entry["line_end"],
+                    }
+                )
+            grounded.append(normalized)
+        chain["mutation_sites"] = grounded
+        return payload
 
     def _mutation_source_bundle(self, root: Path, chain: Dict[str, Any]) -> str:
         requested: List[tuple[str, str]] = []
@@ -1887,7 +2143,7 @@ class RepoChainGenerator:
             for node in body:
                 if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
                     qualified = ".".join(parents + [node.name])
-                    if requested == node.name or requested == qualified or requested.endswith("." + qualified):
+                    if requested == qualified:
                         matches.append(node)
                     visit(getattr(node, "body", []), parents + [node.name])
 

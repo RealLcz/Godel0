@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import uuid
 from dataclasses import dataclass, field, replace
@@ -89,8 +90,11 @@ class TaskBatchResult:
     complete: bool = False
     rejected_candidates: int = 0
     rejection_reasons: dict = field(default_factory=dict)
+    plans_attempted: int = 0
+    candidates_emitted: int = 0
     candidates_generated: int = 0
     candidates_validated: int = 0
+    tasks_accepted: int = 0
     validation_reports: List[dict] = field(default_factory=list)
     proposer_error: str = ""
     engine_rejections: List[dict] = field(default_factory=list)
@@ -121,6 +125,7 @@ class TaskBatchBuilder:
         allow_workflow_fallback: bool = False,
         allow_human_curated_data: bool = False,
         max_concurrent_attempts: int = 1,
+        homogeneous_failure_limit: int = 3,
     ):
         self.batch_size = batch_size
         self.max_candidates = max_candidates
@@ -134,6 +139,9 @@ class TaskBatchBuilder:
         self.allow_workflow_fallback = bool(allow_workflow_fallback)
         self.allow_human_curated_data = bool(allow_human_curated_data)
         self.max_concurrent_attempts = max(1, int(max_concurrent_attempts or 1))
+        self.homogeneous_failure_limit = max(
+            1, int(homogeneous_failure_limit or 1)
+        )
 
     def _generate_wave(
         self,
@@ -240,7 +248,12 @@ class TaskBatchBuilder:
         if seed_tasks:
             result.tasks = list(seed_tasks)
             result.candidates_validated = len(result.tasks)
-        result.candidates_generated = max(0, int(resume_candidates_generated or 0))
+            result.tasks_accepted = len(result.tasks)
+        # Compatibility: persisted ``candidates_generated`` historically meant
+        # generation budget consumed, which was actually plan attempts.
+        result.plans_attempted = max(
+            0, int(resume_candidates_generated or 0)
+        )
         if result.tasks and task_store_dir:
             from .store import TaskStore as _TaskStore
 
@@ -409,9 +422,12 @@ class TaskBatchBuilder:
         )
 
         plans_per_call = self._plans_per_call()
+        failure_fingerprints: dict[tuple[str, str, str], int] = {}
+        circuit_breaker_reason = ""
         while (
             len(result.tasks) < self.batch_size
-            and result.candidates_generated < self.max_candidates
+            and result.plans_attempted < self.max_candidates
+            and not circuit_breaker_reason
         ):
             # Build one wave of independent generation chunks. Chunk size still
             # obeys plans_per_call; only the waiting is parallel. A single vLLM
@@ -419,7 +435,7 @@ class TaskBatchBuilder:
             # clock per accepted task was dominated by serialization.
             wave: list[tuple[int, int, Any]] = []
             planned_tasks = len(result.tasks)
-            planned_candidates = result.candidates_generated
+            planned_candidates = result.plans_attempted
             # Chunks in one wave are built before any of them commits, so the
             # per-source budget has to be reserved here too. Sizing every chunk
             # off the same committed source_counts would point the whole wave at
@@ -489,7 +505,7 @@ class TaskBatchBuilder:
                     # root bootstrap after 6 candidates had already been
                     # validated). Consume this attempt's budget and continue.
                     result.proposer_error = gen_error
-                    result.candidates_generated += max(1, attempt_target)
+                    result.plans_attempted += max(1, attempt_target)
                     continue
                 completed_in_wave += 1
                 proposer_error = str(getattr(proposer_result, "error", "") or "")
@@ -499,20 +515,20 @@ class TaskBatchBuilder:
                 candidates_to_validate = (
                     list(proposer_result.accepted_candidates) + list(pending_candidates)
                 )
-                generated_this_attempt = (
+                emitted_this_attempt = (
                     len(proposer_result.accepted_candidates)
                     + len(proposer_result.rejected_candidates)
                     + len(pending_candidates)
                 )
-                # A plan consumed generation budget even when the evolvable engine
-                # rejected it before emitting a candidate. Counting only emitted
-                # artifacts made a zero-yield attempt terminate the whole batch
-                # immediately instead of using the configured retry budget.
-                generated_this_attempt = max(
-                    generated_this_attempt,
+                plans_this_attempt = max(
+                    emitted_this_attempt,
                     len(getattr(proposer_result, "plans", []) or []),
                 )
-                result.candidates_generated += generated_this_attempt
+                result.plans_attempted += plans_this_attempt
+                result.candidates_emitted += emitted_this_attempt
+                # Deprecated compatibility field now truthfully means emitted
+                # candidate artifacts, not plans that failed before emission.
+                result.candidates_generated = result.candidates_emitted
 
                 if validator is None:
                     result.complete = bool(proposer_result.completed)
@@ -530,13 +546,69 @@ class TaskBatchBuilder:
                         stage = str(blueprint.get("last_rejection_stage") or "")
                         if not stage:
                             stage = stage_for_engine_rejection(rejection)
+                        target_file, target_symbol, reason_code = (
+                            self._failure_fingerprint(plan, rejection)
+                        )
+                        target_repo_id = str(
+                            plan.get("target_repo_id")
+                            or blueprint.get("repo")
+                            or blueprint.get("repo_id")
+                            or ""
+                        )
+                        repo_spec = next(
+                            (
+                                spec
+                                for spec in repo_specs
+                                if spec["repo_id"] == target_repo_id
+                            ),
+                            repo_specs[0] if len(repo_specs) == 1 else None,
+                        )
+                        base_commit = str(
+                            plan.get("target_base_commit")
+                            or blueprint.get("base_commit")
+                            or (
+                                repo_spec.get("base_commit", "")
+                                if repo_spec is not None
+                                else ""
+                            )
+                        )
                         rejection_record = {
                             "attempt": attempt_no,
                             "plan_id": plan.get("plan_id"),
                             "reason": rejection,
                             "stage": stage,
+                            "reason_code": reason_code,
+                            "repo": target_repo_id
+                            or (
+                                str(repo_spec.get("repo_id", ""))
+                                if repo_spec is not None
+                                else ""
+                            ),
+                            "base_commit": base_commit,
+                            "file": target_file,
+                            "symbol": target_symbol,
                         }
+                        symbol_id = str(
+                            plan.get("target_symbol_id")
+                            or blueprint.get("target_symbol_id")
+                            or blueprint.get("symbol_id")
+                            or ""
+                        )
+                        if symbol_id:
+                            rejection_record["symbol_id"] = symbol_id
                         result.engine_rejections.append(rejection_record)
+                        fingerprint = (target_file, target_symbol, reason_code)
+                        failure_fingerprints[fingerprint] = (
+                            failure_fingerprints.get(fingerprint, 0) + 1
+                        )
+                        if (
+                            failure_fingerprints[fingerprint]
+                            >= self.homogeneous_failure_limit
+                        ):
+                            circuit_breaker_reason = (
+                                "homogeneous_failure_circuit_breaker:"
+                                f"{fingerprint[0]}:{fingerprint[1]}:{fingerprint[2]}"
+                            )
                         increment_stage(result.repo_chain_stats, stage)
                         feedback_id = f"engine-{attempt_no}-{plan.get('plan_id') or 'plan'}"
                         atomic_write_json(
@@ -733,14 +805,21 @@ class TaskBatchBuilder:
                             source_failure_stage=source_failure_stage,
                         )
                         result.tasks.append(task)
+                        result.tasks_accepted = len(result.tasks)
                         source_counts[source_type] = source_counts.get(source_type, 0) + 1
                     else:
                         result.rejected_candidates += 1
                         for reason in report.rejection_reasons:
                             result.rejection_reasons[reason] = result.rejection_reasons.get(reason, 0) + 1
 
-                generated_in_wave += generated_this_attempt
+                # A returned plan is generation progress even if the engine
+                # rejects it before candidate emission. This keeps retries and
+                # the homogeneous-failure fuse active for zero-yield plans.
+                generated_in_wave += plans_this_attempt
 
+            if circuit_breaker_reason:
+                result.proposer_error = circuit_breaker_reason
+                break
             if completed_in_wave and generated_in_wave == 0:
                 # Every chunk that actually returned came back without even a
                 # plan, so the proposer is broken rather than merely unlucky. A
@@ -764,6 +843,32 @@ class TaskBatchBuilder:
         except Exception:
             pass
         return result
+
+    @staticmethod
+    def _failure_fingerprint(plan: dict, rejection: str) -> tuple[str, str, str]:
+        """Return the batch-local anchor/reason fingerprint for fuse counting."""
+        blueprint = dict(plan.get("task_blueprint") or {})
+        parsed_sites = re.findall(
+            r"([\w./-]+\.py)::"
+            r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)",
+            str(rejection or ""),
+        )
+        target_file = str(
+            (parsed_sites[0][0] if parsed_sites else "")
+            or plan.get("target_file")
+            or blueprint.get("target_file")
+            or blueprint.get("file_path")
+            or ""
+        )
+        target_symbol = str(
+            (parsed_sites[0][1] if parsed_sites else "")
+            or plan.get("target_symbol")
+            or blueprint.get("target_symbol")
+            or blueprint.get("symbol_name")
+            or ""
+        )
+        reason_code = str(rejection or "").split(":", 1)[0].strip()
+        return target_file, target_symbol, reason_code
 
     def _normalize_candidate(
         self,

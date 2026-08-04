@@ -191,9 +191,12 @@ class ProposerRunner:
                 parent_sigs, child_sigs = [], []
                 parent_traces, child_traces = [], []
 
+            feedbacks = self.feedback_processor.load_feedback(request.feedback_dir)
             if not signatures:
                 if getattr(request, "bootstrap", False):
-                    candidates, plans = self._bootstrap_candidates(request)
+                    candidates, plans = self._bootstrap_candidates(
+                        request, feedbacks=feedbacks
+                    )
                     self._write_candidates(request, candidates, plans)
                     # Bootstrap emissions are pending until trusted validation.
                     # Do NOT mark accepted=True here (avoids double validation).
@@ -212,7 +215,6 @@ class ProposerRunner:
                 return result
 
             repo_index = self._build_repo_index(request)
-            feedbacks = self.feedback_processor.load_feedback(request.feedback_dir)
             self.planner.configure_strategy_policy(
                 request.strategy_weights,
                 offset=request.generation_attempt * max(1, request.target_batch_size),
@@ -416,16 +418,37 @@ class ProposerRunner:
         _ = proposer_node_id
 
     def _attach_validation_feedback(self, plan: BugGenerationPlan, feedbacks: list) -> None:
-        rejected_feedback = [
-            {
-                "candidate_id": feedback.candidate_id,
-                "reason": feedback.reason,
-            }
-            for feedback in feedbacks
-            if not feedback.accepted
-        ][-20:]
+        blueprint = (
+            getattr(plan, "task_blueprint", None)
+            if isinstance(getattr(plan, "task_blueprint", None), dict)
+            else {}
+        )
+        plan.task_blueprint = blueprint
+        context_files = list(
+            dict.fromkeys(
+                list(getattr(plan, "target_files", None) or [])
+                + [str(getattr(plan, "target_file", "") or "")]
+            )
+        )
+        rejected_feedback = self.feedback_processor.scoped_rejections(
+            feedbacks,
+            repo_id=str(getattr(plan, "target_repo_id", "") or ""),
+            base_commit=str(getattr(plan, "target_base_commit", "") or ""),
+            context_files=[path for path in context_files if path],
+        )[-20:]
         if rejected_feedback:
-            plan.task_blueprint["trusted_validation_feedback"] = rejected_feedback
+            blueprint["trusted_validation_feedback"] = rejected_feedback
+            forbidden_sites = [
+                {
+                    key: row[key]
+                    for key in ("file", "symbol", "symbol_id", "reason_code")
+                    if row.get(key)
+                }
+                for row in rejected_feedback
+                if row.get("file") or row.get("symbol") or row.get("symbol_id")
+            ]
+            if forbidden_sites:
+                blueprint["forbidden_mutation_sites"] = forbidden_sites
 
     def _enforce_human_data_policy(self, request: ProposerRequest) -> None:
         """P0-23: refuse PR-replay / human-curated data in the main setting."""
@@ -569,7 +592,7 @@ class ProposerRunner:
         return outcomes
 
     def _bootstrap_candidates(
-        self, request: ProposerRequest
+        self, request: ProposerRequest, *, feedbacks: Optional[list] = None
     ) -> tuple:
         """Generate bootstrap candidates from a capability prior.
 
@@ -637,15 +660,23 @@ class ProposerRunner:
         plan_offset = int(getattr(request, "generation_attempt", 0) or 0) * plans_per_call
         target = min(int(request.target_batch_size or 1), plans_per_call)
 
-        boot_result = workflow.bootstrap(
-            repo_spec=repo_spec,
-            output_dir=cand_dir,
-            capability_prior=BOOTSTRAP_CAPABILITY_PRIOR,
-            target_count=target,
-            max_candidates=plans_per_call,
-            plan_offset=plan_offset,
-            plan_limit=plans_per_call,
-        )
+        bootstrap_kwargs = {
+            "repo_spec": repo_spec,
+            "output_dir": cand_dir,
+            "capability_prior": BOOTSTRAP_CAPABILITY_PRIOR,
+            "target_count": target,
+            "max_candidates": plans_per_call,
+            "plan_offset": plan_offset,
+            "plan_limit": plans_per_call,
+            "validation_feedback": list(feedbacks or []),
+        }
+        try:
+            boot_result = workflow.bootstrap(**bootstrap_kwargs)
+        except TypeError as exc:
+            if "validation_feedback" not in str(exc):
+                raise
+            bootstrap_kwargs.pop("validation_feedback")
+            boot_result = workflow.bootstrap(**bootstrap_kwargs)
         if isinstance(boot_result, tuple):
             candidates, plans = boot_result
         else:
@@ -653,6 +684,9 @@ class ProposerRunner:
             candidates, plans = list(boot_result or []), []
         # Stamp each candidate with the request model / plan id metadata so the
         # downstream commit step has the provenance it expects.
+        for plan in plans:
+            self._stamp_repo_chain_constraints(plan)
+            self._attach_validation_feedback(plan, list(feedbacks or []))
         plan_by_id = {getattr(p, "plan_id", ""): p for p in plans}
         normalized: List[CandidateArtifact] = []
         for index, cand in enumerate(candidates):

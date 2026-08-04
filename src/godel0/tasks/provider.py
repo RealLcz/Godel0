@@ -72,8 +72,11 @@ class TaskBatch:
     complete: bool = False
     rejected_candidates: int = 0
     rejection_reasons: dict = field(default_factory=dict)
+    plans_attempted: int = 0
+    candidates_emitted: int = 0
     candidates_generated: int = 0
     candidates_validated: int = 0
+    tasks_accepted: int = 0
     validation_reports: List[dict] = field(default_factory=list)
     proposer_error: str = ""
     engine_rejections: List[dict] = field(default_factory=list)

@@ -2,9 +2,28 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from threading import RLock
 
 from ..git.patch import patch_hash, extract_changed_files
+
+
+@dataclass(frozen=True)
+class DuplicateAssessment:
+    """Structured duplicate result for admission and novelty reporting."""
+
+    is_unique: bool
+    classification: str = "unique"
+    component_overlap_ratio: float = 0.0
+    novelty_score: float = 1.0
+
+
+@dataclass(frozen=True)
+class _PatchIdentity:
+    patch_fingerprint: str
+    signature: str
+    component_hashes: frozenset[str]
+    changed_files: frozenset[str]
 
 
 class DuplicateDetector:
@@ -13,7 +32,7 @@ class DuplicateDetector:
     def __init__(self):
         self._seen_hashes: set[str] = set()
         self._seen_signatures: set[str] = set()
-        self._seen_component_hashes: set[str] = set()
+        self._seen_patches: list[_PatchIdentity] = []
         self._lock = RLock()
 
     def is_unique(
@@ -25,6 +44,24 @@ class DuplicateDetector:
         operator: str = "",
     ) -> bool:
         """Return whether a candidate is unique without registering it."""
+        assessment = self.assess(
+            patch,
+            repo_id=repo_id,
+            target_file=target_file,
+            target_symbol=target_symbol,
+            operator=operator,
+        )
+        return assessment.is_unique
+
+    def assess(
+        self,
+        patch: str,
+        repo_id: str = "",
+        target_file: str = "",
+        target_symbol: str = "",
+        operator: str = "",
+    ) -> DuplicateAssessment:
+        """Classify exact, near, and partial component overlap."""
         identity = self._identity(
             patch,
             repo_id=repo_id,
@@ -33,7 +70,7 @@ class DuplicateDetector:
             operator=operator,
         )
         with self._lock:
-            return self._is_unique_unlocked(identity)
+            return self._assess_unlocked(identity)
 
     def record(
         self,
@@ -52,14 +89,33 @@ class DuplicateDetector:
             operator=operator,
         )
         with self._lock:
-            if not self._is_unique_unlocked(identity):
+            assessment = self._assess_unlocked(identity)
+            if not assessment.is_unique:
                 return False
-            patch_fingerprint, signature, component_hashes = identity
-            self._seen_hashes.add(patch_fingerprint)
-            if signature:
-                self._seen_signatures.add(signature)
-            self._seen_component_hashes.update(component_hashes)
+            self._record_unlocked(identity)
             return True
+
+    def record_assessment(
+        self,
+        patch: str,
+        repo_id: str = "",
+        target_file: str = "",
+        target_symbol: str = "",
+        operator: str = "",
+    ) -> DuplicateAssessment:
+        """Atomically assess and register a unique candidate."""
+        identity = self._identity(
+            patch,
+            repo_id=repo_id,
+            target_file=target_file,
+            target_symbol=target_symbol,
+            operator=operator,
+        )
+        with self._lock:
+            assessment = self._assess_unlocked(identity)
+            if assessment.is_unique:
+                self._record_unlocked(identity)
+            return assessment
 
     def seed_from_patches(
         self,
@@ -110,7 +166,7 @@ class DuplicateDetector:
         target_file: str,
         target_symbol: str,
         operator: str,
-    ) -> tuple[str, str, frozenset[str]]:
+    ) -> _PatchIdentity:
         changed_files = extract_changed_files(patch)
         component_hashes = frozenset(
             patch_hash(block) for block in _split_diff_components(patch)
@@ -128,27 +184,74 @@ class DuplicateDetector:
             signature = (
                 f"{repo_id}|{effective_target}|{target_symbol}|{operator}"
             )
-        return patch_hash(patch), signature, component_hashes
+        return _PatchIdentity(
+            patch_fingerprint=patch_hash(patch),
+            signature=signature,
+            component_hashes=component_hashes,
+            changed_files=frozenset(changed_files),
+        )
 
-    def _is_unique_unlocked(
+    def _assess_unlocked(
         self,
-        identity: tuple[str, str, frozenset[str]],
-    ) -> bool:
-        patch_fingerprint, signature, component_hashes = identity
-        if patch_fingerprint in self._seen_hashes:
-            return False
-        if signature and signature in self._seen_signatures:
-            return False
-        if component_hashes & self._seen_component_hashes:
-            return False
-        return True
+        identity: _PatchIdentity,
+    ) -> DuplicateAssessment:
+        if identity.patch_fingerprint in self._seen_hashes:
+            return DuplicateAssessment(False, "full_duplicate", 1.0, 0.0)
+        if identity.signature and identity.signature in self._seen_signatures:
+            return DuplicateAssessment(False, "signature_duplicate", 1.0, 0.0)
+
+        highest_overlap = 0.0
+        near_duplicate = False
+        for seen in self._seen_patches:
+            shared = identity.component_hashes & seen.component_hashes
+            if not shared:
+                continue
+            denominator = max(
+                len(identity.component_hashes),
+                len(seen.component_hashes),
+                1,
+            )
+            overlap = len(shared) / denominator
+            highest_overlap = max(highest_overlap, overlap)
+            file_union = identity.changed_files | seen.changed_files
+            file_similarity = (
+                len(identity.changed_files & seen.changed_files) / len(file_union)
+                if file_union
+                else 0.0
+            )
+            # Component reuse is only a hard rejection when most of both
+            # multi-file patches and their file sets are the same.
+            if overlap >= 0.75 and file_similarity >= 0.75:
+                near_duplicate = True
+
+        if near_duplicate:
+            return DuplicateAssessment(
+                False,
+                "near_duplicate",
+                highest_overlap,
+                max(0.0, 1.0 - highest_overlap),
+            )
+        if highest_overlap > 0.0:
+            return DuplicateAssessment(
+                True,
+                "partial_component_reuse",
+                highest_overlap,
+                max(0.0, 1.0 - highest_overlap),
+            )
+        return DuplicateAssessment(True)
+
+    def _record_unlocked(self, identity: _PatchIdentity) -> None:
+        self._seen_hashes.add(identity.patch_fingerprint)
+        if identity.signature:
+            self._seen_signatures.add(identity.signature)
+        self._seen_patches.append(identity)
 
     def reset(self) -> None:
         """Clear all seen entries."""
         with self._lock:
             self._seen_hashes.clear()
             self._seen_signatures.clear()
-            self._seen_component_hashes.clear()
+            self._seen_patches.clear()
 
 
 def _split_diff_components(patch: str) -> list[str]:

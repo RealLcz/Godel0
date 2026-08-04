@@ -68,5 +68,7 @@ def test_proposer_chunk_crash_consumes_budget_and_continues(tmp_path: Path):
     # to the next chunk instead of raising.
     assert "RuntimeError" in (result.proposer_error or "")
     assert runner.calls >= 2
-    assert result.candidates_generated >= 2
+    assert result.plans_attempted >= 2
+    assert result.candidates_generated == 0
+    assert result.candidates_emitted == 0
     assert result.complete is False
